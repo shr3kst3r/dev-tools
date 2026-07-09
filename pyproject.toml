@@ -1,5 +1,5 @@
 [project]
-name = "spg"
+name = "dev-tools"
 version = "0.1.0"
 description = "Personal developer tools — a single uv project, one tool per directory under tools/."
 readme = "README.md"

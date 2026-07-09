@@ -10,7 +10,7 @@
 # pyproject.toml and a `just <recipe>` recipe in the justfile.
 
 [project]
-name = "spg"
+name = "dev-tools"
 description = "Personal developer tools — one uv project, one tool per directory under tools/."
 tools_dir = "tools"
 

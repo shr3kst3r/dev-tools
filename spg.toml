@@ -1,22 +1,23 @@
-# spg.toml — the tool registry for this repo.
+# spg.toml — publishes this repo's tools as commands on your $PATH.
 #
-# One catalog entry per tool, pointing at where it lives and how it runs.
-# This is deliberately separate from pyproject.toml: pyproject owns
-# *packaging* (deps, build, entry points, tool config); spg.toml owns the
-# *catalog* — a single place that answers "what tools are in here, where do
-# they live, and how do I invoke each one?".
+# `spg` (https://github.com/… / ~/goblin/spg) reads this file and, on
+# `spg install`, writes a `~/bin/<name>` wrapper for each [commands.*] entry
+# plus zsh tab completion driven by the declared args. It is unrelated to
+# packaging: pyproject.toml owns deps/build/entry points; this file only says
+# "which of those tools should be on my machine as a command, and how do they
+# complete?".
 #
-# Invariant: every [[tool]] here has a matching `[project.scripts]` entry in
-# pyproject.toml and a `just <recipe>` recipe in the justfile.
+# Each wrapper cd's into the repo root and runs the command, so `uv run` picks
+# up this project's venv regardless of where you invoke it from.
 
 [project]
 name = "dev-tools"
-description = "Personal developer tools — one uv project, one tool per directory under tools/."
-tools_dir = "tools"
 
-[[tool]]
-name = "pr-watch"
-package = "tools.pr_watch"
-entry = "tools.pr_watch.cli:main"
-recipe = "pr-watch"
-description = "Live, auto-refreshing Rich TUI of the current branch's GitHub PR: check statuses and unresolved review threads. Uses the gh CLI for auth."
+[commands.pr-watch]
+run = "uv run pr-watch"
+description = "Live, auto-refreshing Rich TUI of a repo's current-branch GitHub PR: statuses and unresolved review threads. Uses the gh CLI for auth."
+args = [
+    { name = "directory", description = "repo directory to watch (default: current dir)", type = "directories" },
+    { name = "--interval", description = "seconds between refreshes (default: 30)" },
+    { name = "--once", description = "render a single snapshot and exit" },
+]

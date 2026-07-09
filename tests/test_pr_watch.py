@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+from tools.pr_watch.cli import _parse_args
 from tools.pr_watch.github import parse_pull_request
 from tools.pr_watch.models import CheckState, RepoContext
 from tools.pr_watch.ui import format_relative
@@ -186,3 +187,20 @@ def test_format_relative() -> None:
     assert ago(days=60) == "2mo ago"
     # A future timestamp clamps to "just now" rather than going negative.
     assert format_relative(now + timedelta(hours=1), now) == "just now"
+
+
+def test_default_directory_uses_spg_invocation_dir(monkeypatch) -> None:
+    # When launched via an spg wrapper (which cd's into the repo), the caller's
+    # directory arrives in $SPG_INVOCATION_DIR and becomes the default target.
+    monkeypatch.setenv("SPG_INVOCATION_DIR", "/some/where")
+    assert _parse_args([]).directory == "/some/where"
+
+
+def test_default_directory_falls_back_to_cwd(monkeypatch) -> None:
+    monkeypatch.delenv("SPG_INVOCATION_DIR", raising=False)
+    assert _parse_args([]).directory == "."
+
+
+def test_explicit_directory_overrides_spg_invocation_dir(monkeypatch) -> None:
+    monkeypatch.setenv("SPG_INVOCATION_DIR", "/some/where")
+    assert _parse_args(["/other/place"]).directory == "/other/place"

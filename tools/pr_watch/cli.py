@@ -7,6 +7,7 @@ and refreshes a live full-screen view every N seconds (default 30).
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from datetime import datetime
@@ -25,11 +26,16 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         prog="pr-watch",
         description="Live-watch the GitHub PR for a directory's current branch.",
     )
+    # When launched via an spg-installed `~/bin` wrapper, the wrapper cd's into
+    # this repo before running the tool, so a bare "." would resolve here rather
+    # than where the user actually is. spg exports $SPG_INVOCATION_DIR (the
+    # caller's directory) for exactly this — fall back to it, then to ".".
+    default_directory = os.environ.get("SPG_INVOCATION_DIR") or "."
     parser.add_argument(
         "directory",
         nargs="?",
-        default=".",
-        help="Repo directory to watch (default: current directory).",
+        default=default_directory,
+        help="Repo directory to watch (default: the directory you ran this from).",
     )
     parser.add_argument(
         "-i",

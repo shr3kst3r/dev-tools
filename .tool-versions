@@ -1,0 +1,7 @@
+# asdf-managed bootstrap tools. Run `asdf install` to get these versions.
+#
+# Python is intentionally NOT pinned here: uv owns the interpreter
+# (see .python-version) and the venv tools (ty, pytest, pre-commit).
+# asdf pins only the CLIs that bootstrap the project.
+uv 0.8.3
+just 1.40.0

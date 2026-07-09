@@ -39,3 +39,7 @@ hooks:
 # Watch the GitHub PR for the repo in DIR (default: current dir).
 pr-watch dir="." *args:
     uv run pr-watch {{dir}} {{args}}
+
+# Send yourself a Slack message via the webhook in ~/.slack-me.toml.
+slack-me *args:
+    uv run slack-me {{args}}

@@ -21,3 +21,11 @@ args = [
     { name = "--interval", description = "seconds between refreshes (default: 30)" },
     { name = "--once", description = "render a single snapshot and exit" },
 ]
+
+[commands.slack-me]
+run = "uv run slack-me"
+description = "Send yourself a Slack message via a webhook configured in ~/.slack-me.toml. Message comes from args or stdin: `slack-me \"done\"` or `long-job | slack-me`."
+args = [
+    { name = "message", description = "the message to send (default: read from stdin)" },
+    { name = "--quiet", description = "send silently, no confirmation output" },
+]

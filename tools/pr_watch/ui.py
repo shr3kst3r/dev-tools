@@ -77,6 +77,30 @@ def format_relative(then: datetime | None, now: datetime) -> str:
     return f"{int(days / 30)}mo ago"
 
 
+def format_duration(seconds: float) -> str:
+    """Compact 'how long' string, e.g. '45s', '3m 20s', '1h 05m' (pure)."""
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total}s"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m {secs:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
+
+
+def _check_duration(check: Check, now: datetime) -> Text:
+    """How long the check has run — live while pending, total once finished."""
+    start = check.started_at
+    if start is None:
+        return Text("—", style="dim")
+    if check.state is CheckState.PENDING or check.completed_at is None:
+        elapsed = (now - start).total_seconds()
+        return Text(format_duration(elapsed), style="yellow")
+    took = (check.completed_at - start).total_seconds()
+    return Text(format_duration(took), style="dim")
+
+
 def _review_text(m: PRMetrics) -> Text:
     mapping = {
         "APPROVED": ("✔ approved", "bold green"),
@@ -126,7 +150,7 @@ def _metrics_panel(m: PRMetrics, now: datetime) -> Panel:
     return Panel(grid, title=Text("Metrics"), border_style="magenta", padding=(0, 1))
 
 
-def _checks_table(checks: list[Check]) -> RenderableType:
+def _checks_table(checks: list[Check], now: datetime) -> RenderableType:
     if not checks:
         return Panel(
             Align.center(Text("No checks reported yet.", style="dim")),
@@ -142,6 +166,7 @@ def _checks_table(checks: list[Check]) -> RenderableType:
     )
     table.add_column("", width=3, no_wrap=True)
     table.add_column("Check", ratio=3)
+    table.add_column("Elapsed", justify="right", no_wrap=True)
     table.add_column("Result", ratio=1, no_wrap=True)
 
     # Failures first, then pending, then the rest — most actionable on top.
@@ -157,6 +182,7 @@ def _checks_table(checks: list[Check]) -> RenderableType:
         table.add_row(
             Text(icon, style=style),
             Text(check.name),
+            _check_duration(check, now),
             Text((check.detail or check.state.value).lower(), style=style),
         )
 
@@ -232,10 +258,11 @@ def render_pull_request(
     seconds_to_refresh: int,
     interval: int,
 ) -> RenderableType:
+    now = datetime.now(timezone.utc)
     return Group(
         _header(pr, ctx),
-        _metrics_panel(pr.metrics, datetime.now(timezone.utc)),
-        _checks_table(pr.checks),
+        _metrics_panel(pr.metrics, now),
+        _checks_table(pr.checks, now),
         _threads_panel(pr),
         _footer(updated, seconds_to_refresh, interval),
     )

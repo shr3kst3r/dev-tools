@@ -61,11 +61,14 @@ query($owner: String!, $repo: String!, $branch: String!) {
                       status
                       conclusion
                       detailsUrl
+                      startedAt
+                      completedAt
                     }
                     ... on StatusContext {
                       context
                       state
                       targetUrl
+                      createdAt
                     }
                   }
                 }
@@ -211,14 +214,18 @@ def _parse_check(node: dict) -> Check:
             state=_checkrun_state(status, conclusion),
             url=node.get("detailsUrl"),
             detail=conclusion or status,
+            started_at=_parse_dt(node.get("startedAt")),
+            completed_at=_parse_dt(node.get("completedAt")),
         )
-    # StatusContext (legacy commit statuses).
+    # StatusContext (legacy commit statuses). These carry only a createdAt, so
+    # we treat that as the start; there's no completion timestamp to report.
     raw_state = (node.get("state") or "").upper()
     return Check(
         name=node.get("context") or "(status)",
         state=_ROLLUP_STATE.get(raw_state, CheckState.UNKNOWN),
         url=node.get("targetUrl"),
         detail=raw_state or None,
+        started_at=_parse_dt(node.get("createdAt")),
     )
 
 

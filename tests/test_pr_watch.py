@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from tools.pr_watch.cli import _parse_args
 from tools.pr_watch.github import parse_pull_request
 from tools.pr_watch.models import CheckState, RepoContext
-from tools.pr_watch.ui import format_relative
+from tools.pr_watch.ui import format_duration, format_relative
 
 
 def _node() -> dict:
@@ -47,6 +47,8 @@ def _node() -> dict:
                                         "status": "COMPLETED",
                                         "conclusion": "SUCCESS",
                                         "detailsUrl": "https://ci/1",
+                                        "startedAt": "2026-07-09T00:00:00Z",
+                                        "completedAt": "2026-07-09T00:03:20Z",
                                     },
                                     {
                                         "__typename": "CheckRun",
@@ -54,12 +56,15 @@ def _node() -> dict:
                                         "status": "IN_PROGRESS",
                                         "conclusion": None,
                                         "detailsUrl": "https://ci/2",
+                                        "startedAt": "2026-07-09T00:00:00Z",
+                                        "completedAt": None,
                                     },
                                     {
                                         "__typename": "StatusContext",
                                         "context": "legacy/deploy",
                                         "state": "ERROR",
                                         "targetUrl": "https://ci/3",
+                                        "createdAt": "2026-07-09T00:00:00Z",
                                     },
                                 ]
                             },
@@ -133,6 +138,31 @@ def test_check_states_normalized() -> None:
     assert by_name["unit-tests"] is CheckState.SUCCESS
     assert by_name["lint"] is CheckState.PENDING  # in_progress -> pending
     assert by_name["legacy/deploy"] is CheckState.FAILURE  # ERROR status ctx
+
+
+def test_check_timing_parsed() -> None:
+    pr = parse_pull_request(_node())
+    by_name = {c.name: c for c in pr.checks}
+    start = datetime(2026, 7, 9, tzinfo=timezone.utc)
+    # Finished CheckRun keeps both timestamps (duration = completed - started).
+    assert by_name["unit-tests"].started_at == start
+    assert by_name["unit-tests"].completed_at == start + timedelta(minutes=3, seconds=20)
+    # Running CheckRun has a start but no completion yet.
+    assert by_name["lint"].started_at == start
+    assert by_name["lint"].completed_at is None
+    # StatusContext createdAt is treated as the start; no completion timestamp.
+    assert by_name["legacy/deploy"].started_at == start
+    assert by_name["legacy/deploy"].completed_at is None
+
+
+def test_format_duration() -> None:
+    assert format_duration(0) == "0s"
+    assert format_duration(45) == "45s"
+    assert format_duration(200) == "3m 20s"
+    assert format_duration(3600) == "1h 00m"
+    assert format_duration(3660) == "1h 01m"
+    # Negative (clock skew / future start) clamps to zero rather than going negative.
+    assert format_duration(-5) == "0s"
 
 
 def test_only_unresolved_threads_kept() -> None:

@@ -42,6 +42,10 @@ class Check:
     url: str | None = None
     # Raw GitHub label, e.g. "IN_PROGRESS", "FAILURE" — handy for tooltips.
     detail: str | None = None
+    # When the check began, and (if finished) when it ended. Together these give
+    # "how long it's been running" (still going) or "how long it took" (done).
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)

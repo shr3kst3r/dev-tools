@@ -176,6 +176,74 @@ def test_format_duration() -> None:
     assert format_duration(-5) == "0s"
 
 
+def _checkrun(name: str, conclusion: str, started_at: str | None) -> dict:
+    return {
+        "__typename": "CheckRun",
+        "name": name,
+        "status": "COMPLETED",
+        "conclusion": conclusion,
+        "detailsUrl": "https://ci/x",
+        "startedAt": started_at,
+        "completedAt": started_at,
+    }
+
+
+def _node_with_checks(rollup_state: str, check_nodes: list[dict]) -> dict:
+    node = _node()
+    node["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = {
+        "state": rollup_state,
+        "contexts": {"nodes": check_nodes},
+    }
+    return node
+
+
+def test_rerun_checks_deduped_to_latest_run() -> None:
+    # A re-run workflow leaves one CheckRun per suite in the rollup contexts:
+    # older failed runs must give way to the newest run of the same name.
+    pr = parse_pull_request(
+        _node_with_checks(
+            "FAILURE",  # GitHub's rollup still counts the stale failures
+            [
+                _checkrun("linear / Check Linear Link", "FAILURE", "2026-07-09T00:00:00Z"),
+                _checkrun("linear / Check Linear Link", "SUCCESS", "2026-07-09T00:05:00Z"),
+                _checkrun("linear / Check Linear Link", "FAILURE", "2026-07-09T00:02:00Z"),
+                _checkrun("build", "SUCCESS", "2026-07-09T00:00:00Z"),
+            ],
+        )
+    )
+    assert len(pr.checks) == 2
+    by_name = {c.name: c for c in pr.checks}
+    assert by_name["linear / Check Linear Link"].state is CheckState.SUCCESS
+    # The rollup is recomputed from the surviving runs, not GitHub's stale state.
+    assert pr.rollup is CheckState.SUCCESS
+
+
+def test_dedupe_ties_and_missing_timestamps_keep_later_entry() -> None:
+    pr = parse_pull_request(
+        _node_with_checks(
+            "FAILURE",
+            [
+                _checkrun("flaky", "FAILURE", None),
+                _checkrun("flaky", "SUCCESS", None),
+            ],
+        )
+    )
+    assert [c.state for c in pr.checks] == [CheckState.SUCCESS]
+    assert pr.rollup is CheckState.SUCCESS
+
+
+def test_rollup_trusted_when_nothing_deduped() -> None:
+    # With no duplicate runs, GitHub's rollup state wins — it knows about
+    # required checks that haven't reported yet (absent from contexts).
+    pr = parse_pull_request(
+        _node_with_checks(
+            "PENDING",
+            [_checkrun("build", "SUCCESS", "2026-07-09T00:00:00Z")],
+        )
+    )
+    assert pr.rollup is CheckState.PENDING
+
+
 def test_only_unresolved_threads_kept() -> None:
     pr = parse_pull_request(_node())
     assert len(pr.threads) == 1

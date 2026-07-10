@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .models import (
@@ -229,6 +229,35 @@ def _parse_check(node: dict) -> Check:
     )
 
 
+_EPOCH = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _dedupe_latest_runs(checks: list[Check]) -> list[Check]:
+    """Keep only the newest run of each check name.
+
+    The rollup contexts hold one CheckRun per check *suite*, so a re-run
+    workflow leaves its older (typically failed) runs in the list. GitHub's
+    own checks UI collapses these by name to the latest run; do the same.
+    Ties (or missing timestamps) go to the later entry in the list.
+    """
+    latest: dict[str, Check] = {}
+    for check in checks:
+        prior = latest.get(check.name)
+        if prior is None or (check.started_at or _EPOCH) >= (prior.started_at or _EPOCH):
+            latest[check.name] = check
+    return list(latest.values())
+
+
+def _rollup_from_checks(checks: list[Check]) -> CheckState:
+    """Recompute the overall state from individual checks (GitHub's rollup
+    `state` counts stale runs, so it can't be trusted after deduping)."""
+    states = {c.state for c in checks}
+    for decisive in (CheckState.FAILURE, CheckState.PENDING, CheckState.SUCCESS):
+        if decisive in states:
+            return decisive
+    return CheckState.SKIPPED if CheckState.SKIPPED in states else CheckState.UNKNOWN
+
+
 def _parse_thread(node: dict) -> ReviewThread | None:
     comments = node.get("comments", {}) or {}
     comment_nodes = comments.get("nodes") or []
@@ -285,7 +314,17 @@ def parse_pull_request(node: dict) -> PullRequest:
         )
         or {}
     )
-    checks = [_parse_check(c) for c in (rollup.get("contexts", {}).get("nodes") or [])]
+    all_runs = [_parse_check(c) for c in (rollup.get("contexts", {}).get("nodes") or [])]
+    checks = _dedupe_latest_runs(all_runs)
+    # GitHub's rollup state counts the stale runs we just dropped, so it only
+    # stays authoritative when nothing was deduped (it also knows about
+    # required checks that haven't reported yet, which we can't see here).
+    if len(checks) < len(all_runs):
+        rollup_state = _rollup_from_checks(checks)
+    else:
+        rollup_state = _ROLLUP_STATE.get(
+            (rollup.get("state") or "").upper(), CheckState.UNKNOWN
+        )
 
     threads: list[ReviewThread] = []
     for t in node.get("reviewThreads", {}).get("nodes") or []:
@@ -301,9 +340,7 @@ def parse_pull_request(node: dict) -> PullRequest:
         url=node.get("url") or "",
         is_draft=bool(node.get("isDraft")),
         author=(node.get("author") or {}).get("login") or "unknown",
-        rollup=_ROLLUP_STATE.get(
-            (rollup.get("state") or "").upper(), CheckState.UNKNOWN
-        ),
+        rollup=rollup_state,
         checks=checks,
         threads=threads,
         metrics=_parse_metrics(node),

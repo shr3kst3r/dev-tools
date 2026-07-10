@@ -4,10 +4,21 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+from rich.console import Console
+from textual.containers import VerticalScroll
+
+from tools.pr_watch.app import PrWatchApp
 from tools.pr_watch.cli import _parse_args
 from tools.pr_watch.github import parse_pull_request
-from tools.pr_watch.models import CheckState, RepoContext
-from tools.pr_watch.ui import format_duration, format_relative
+from tools.pr_watch.models import (
+    Check,
+    CheckState,
+    PRMetrics,
+    PullRequest,
+    RepoContext,
+    ReviewThread,
+)
+from tools.pr_watch.ui import format_duration, format_relative, render_body
 
 
 def _node() -> dict:
@@ -234,3 +245,104 @@ def test_default_directory_falls_back_to_cwd(monkeypatch) -> None:
 def test_explicit_directory_overrides_spg_invocation_dir(monkeypatch) -> None:
     monkeypatch.setenv("SPG_INVOCATION_DIR", "/some/where")
     assert _parse_args(["/other/place"]).directory == "/other/place"
+
+
+# --- rendering + scrolling ----------------------------------------------------
+# The live view is a Textual app whose body sits in a scrollable viewport, so
+# the renderer never truncates: everything is reachable by scrolling.
+
+
+def _make_pr(n_checks: int, n_threads: int, n_failures: int = 0) -> PullRequest:
+    checks = [
+        Check(name=f"fail-{i}", state=CheckState.FAILURE) for i in range(n_failures)
+    ] + [
+        Check(name=f"pass-{i:03d}", state=CheckState.SUCCESS)
+        for i in range(n_checks - n_failures)
+    ]
+    threads = [
+        ReviewThread(
+            author=f"reviewer{i}",
+            body=f"comment number {i} " * 20,
+            path=f"src/file_{i}.py",
+            line=i + 1,
+            url=None,
+            comment_count=2,
+            is_outdated=False,
+        )
+        for i in range(n_threads)
+    ]
+    metrics = PRMetrics(
+        additions=1,
+        deletions=1,
+        changed_files=1,
+        commits=1,
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+        review_decision=None,
+        mergeable="MERGEABLE",
+        approvals=0,
+        changes_requested=0,
+    )
+    return PullRequest(
+        number=1,
+        title="A title",
+        url="https://github.com/o/r/pull/1",
+        is_draft=False,
+        author="octocat",
+        rollup=CheckState.FAILURE if n_failures else CheckState.SUCCESS,
+        metrics=metrics,
+        checks=checks,
+        threads=threads,
+    )
+
+
+def _render_text(pr: PullRequest, width: int = 100) -> str:
+    console = Console(width=width)
+    view = render_body(pr, None, RepoContext("o", "r", "branch"))
+    with console.capture() as capture:
+        console.print(view)
+    return capture.get()
+
+
+def test_render_body_never_truncates() -> None:
+    pr = _make_pr(n_checks=60, n_threads=25, n_failures=2)
+    output = _render_text(pr)
+    assert "fail-0" in output and "fail-1" in output
+    assert "pass-057" in output  # last check alphabetically — nothing dropped
+    assert "@reviewer24" in output  # last thread — nothing dropped
+
+
+def test_render_body_states() -> None:
+    ctx = RepoContext("o", "r", "branch")
+    console = Console(width=80)
+
+    def text_of(view) -> str:
+        with console.capture() as capture:
+            console.print(view)
+        return capture.get()
+
+    assert "Contacting GitHub" in text_of(render_body(None, None, ctx, loading=True))
+    assert "boom" in text_of(render_body(None, "boom", ctx))
+    assert "No open PR" in text_of(render_body(None, None, ctx))
+
+
+async def test_live_app_scrolls_long_content() -> None:
+    # The whole point of the Textual rewrite: content taller than the screen
+    # must be reachable by scrolling instead of being cropped.
+    pr = _make_pr(n_checks=60, n_threads=25, n_failures=2)
+    app = PrWatchApp(
+        ctx=RepoContext("o", "r", "branch"),
+        poll=lambda: (pr, None),
+        interval=30,
+    )
+    async with app.run_test(size=(100, 30)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        viewport = app.query_one(VerticalScroll)
+        assert viewport.max_scroll_y > 0, "long content should overflow the viewport"
+        assert viewport.scroll_y == 0
+
+        viewport.scroll_end(animate=False)
+        await pilot.pause()
+        assert viewport.scroll_y == viewport.max_scroll_y

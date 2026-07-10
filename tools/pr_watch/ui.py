@@ -1,7 +1,9 @@
 """Rich rendering for pr-watch.
 
 Everything here is a pure function of the data + a clock value, so the layout
-can be snapshotted in `--once` mode and (in principle) in tests.
+can be snapshotted in `--once` mode and in tests. The live app (see app.py)
+puts `render_body` in a scrollable viewport and docks `render_footer` at the
+bottom, so nothing here needs to worry about fitting the terminal height.
 """
 
 from __future__ import annotations
@@ -14,7 +16,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from .models import Check, CheckState, PRMetrics, PullRequest, RepoContext
+from .models import Check, CheckState, PRMetrics, PullRequest, RepoContext, ReviewThread
 
 # state -> (icon, rich style)
 _STATE_STYLE: dict[CheckState, tuple[str, str]] = {
@@ -23,6 +25,15 @@ _STATE_STYLE: dict[CheckState, tuple[str, str]] = {
     CheckState.PENDING: ("●", "bold yellow"),
     CheckState.SKIPPED: ("○", "dim"),
     CheckState.UNKNOWN: ("?", "magenta"),
+}
+
+# Failures first, then pending, then the rest — most actionable on top.
+_STATE_ORDER: dict[CheckState, int] = {
+    CheckState.FAILURE: 0,
+    CheckState.PENDING: 1,
+    CheckState.UNKNOWN: 2,
+    CheckState.SUCCESS: 3,
+    CheckState.SKIPPED: 4,
 }
 
 
@@ -169,15 +180,7 @@ def _checks_table(checks: list[Check], now: datetime) -> RenderableType:
     table.add_column("Elapsed", justify="right", no_wrap=True)
     table.add_column("Result", ratio=1, no_wrap=True)
 
-    # Failures first, then pending, then the rest — most actionable on top.
-    order = {
-        CheckState.FAILURE: 0,
-        CheckState.PENDING: 1,
-        CheckState.UNKNOWN: 2,
-        CheckState.SUCCESS: 3,
-        CheckState.SKIPPED: 4,
-    }
-    for check in sorted(checks, key=lambda c: (order[c.state], c.name.lower())):
+    for check in sorted(checks, key=lambda c: (_STATE_ORDER[c.state], c.name.lower())):
         icon, style = _STATE_STYLE[check.state]
         table.add_row(
             Text(icon, style=style),
@@ -201,8 +204,8 @@ def _checks_table(checks: list[Check], now: datetime) -> RenderableType:
     )
 
 
-def _threads_panel(pr: PullRequest) -> Panel:
-    if not pr.threads:
+def _threads_panel(threads: list[ReviewThread]) -> Panel:
+    if not threads:
         return Panel(
             Align.center(Text("No unresolved review threads 🎉", style="green")),
             title="Open comments",
@@ -220,10 +223,10 @@ def _threads_panel(pr: PullRequest) -> Panel:
     table.add_column("Where", style="cyan", no_wrap=True)
     table.add_column("Comment", ratio=1)
 
-    for thread in pr.threads:
+    for thread in threads:
         snippet = " ".join(thread.body.split())
-        if len(snippet) > 200:
-            snippet = snippet[:197] + "…"
+        if len(snippet) > 500:
+            snippet = snippet[:497] + "…"
         where = Text(thread.location)
         if thread.is_outdated:
             where.append("\n(outdated)", style="dim yellow")
@@ -234,64 +237,71 @@ def _threads_panel(pr: PullRequest) -> Panel:
 
     return Panel(
         table,
-        title=Text(f"Open comments ({len(pr.threads)} unresolved)"),
+        title=Text(f"Open comments ({len(threads)} unresolved)"),
         border_style="yellow",
     )
 
 
-def _footer(updated: datetime, seconds_to_refresh: int, interval: int) -> Text:
-    footer = Text(justify="center")
-    footer.append("updated ", style="dim")
-    footer.append(updated.strftime("%H:%M:%S"), style="bold")
-    footer.append("   ·   ", style="dim")
-    footer.append(f"refresh in {seconds_to_refresh:>2}s", style="bold cyan")
-    footer.append(f" (every {interval}s)", style="dim")
-    footer.append("   ·   ", style="dim")
-    footer.append("Ctrl-C to quit", style="dim")
-    return footer
-
-
-def render_pull_request(
-    pr: PullRequest,
+def render_body(
+    pr: PullRequest | None,
+    error: str | None,
     ctx: RepoContext,
-    updated: datetime,
-    seconds_to_refresh: int,
-    interval: int,
+    *,
+    loading: bool = False,
 ) -> RenderableType:
+    """Everything above the status bar. Height-unconstrained — the caller puts
+    this in a scrollable viewport (live app) or plain stdout (--once)."""
+    if loading:
+        return Panel(
+            Align.center(Text("Contacting GitHub…", style="dim italic")),
+            title="pr-watch",
+            border_style="cyan",
+            padding=(1, 2),
+        )
+    if error is not None:
+        return Panel(
+            Text(error, style="red"),
+            title="Error (retrying)",
+            border_style="red",
+            padding=(1, 2),
+        )
+    if pr is None:
+        body = Text(justify="center")
+        body.append("No open PR for branch ", style="dim")
+        body.append(ctx.branch, style="bold")
+        body.append(f" in {ctx.name_with_owner}.\n\n", style="dim")
+        body.append(
+            "Waiting — this will update automatically when a PR is opened.",
+            style="dim italic",
+        )
+        return Panel(body, title="pr-watch", border_style="cyan", padding=(1, 2))
+
     now = datetime.now(timezone.utc)
     return Group(
         _header(pr, ctx),
         _metrics_panel(pr.metrics, now),
         _checks_table(pr.checks, now),
-        _threads_panel(pr),
-        _footer(updated, seconds_to_refresh, interval),
+        _threads_panel(pr.threads),
     )
 
 
-def render_no_pr(
-    ctx: RepoContext,
+def render_footer(
     updated: datetime,
     seconds_to_refresh: int,
     interval: int,
-) -> RenderableType:
-    body = Text(justify="center")
-    body.append(f"No open PR for branch ", style="dim")
-    body.append(ctx.branch, style="bold")
-    body.append(f" in {ctx.name_with_owner}.\n\n", style="dim")
-    body.append("Waiting — this will update automatically when a PR is opened.", style="dim italic")
-    return Group(
-        Panel(body, title="pr-watch", border_style="cyan", padding=(1, 2)),
-        _footer(updated, seconds_to_refresh, interval),
-    )
-
-
-def render_error(message: str, updated: datetime, seconds_to_refresh: int, interval: int) -> RenderableType:
-    return Group(
-        Panel(
-            Text(message, style="red"),
-            title="Error (retrying)",
-            border_style="red",
-            padding=(1, 2),
-        ),
-        _footer(updated, seconds_to_refresh, interval),
-    )
+    *,
+    refreshing: bool = False,
+    quit_hint: str = "Ctrl-C to quit",
+) -> Text:
+    footer = Text(justify="center")
+    footer.append("updated ", style="dim")
+    footer.append(updated.strftime("%H:%M:%S"), style="bold")
+    footer.append("   ·   ", style="dim")
+    if refreshing:
+        footer.append("refreshing…", style="bold cyan")
+    else:
+        footer.append(f"refresh in {seconds_to_refresh:>2}s", style="bold cyan")
+    footer.append(f" (every {interval}s)", style="dim")
+    footer.append("   ·   ", style="dim")
+    footer.append(quit_hint, style="dim")
+    return footer

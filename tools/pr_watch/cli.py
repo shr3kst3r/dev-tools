@@ -1,7 +1,9 @@
 """Entry point for `pr-watch`.
 
 Runs in a specific directory, finds the open PR for that repo's current branch,
-and refreshes a live full-screen view every N seconds (default 30).
+and shows a live view refreshing every N seconds (default 30). The live view is
+a Textual app with a scrollable body, so long check lists and comment threads
+can be scrolled instead of being cropped by the terminal height.
 """
 
 from __future__ import annotations
@@ -9,16 +11,15 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 
-from rich.console import Console
-from rich.live import Live
+from rich.console import Console, Group
 
 from . import ui
+from .app import PrWatchApp
 from .github import GitHubError, fetch_pull_request, get_repo_context
-from .models import PullRequest, RepoContext
+from .models import PullRequest
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -52,21 +53,6 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _render(
-    pr: PullRequest | None,
-    error: str | None,
-    ctx: RepoContext,
-    seconds_left: int,
-    interval: int,
-):
-    now = datetime.now()
-    if error is not None:
-        return ui.render_error(error, now, seconds_left, interval)
-    if pr is None:
-        return ui.render_no_pr(ctx, now, seconds_left, interval)
-    return ui.render_pull_request(pr, ctx, now, seconds_left, interval)
-
-
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     console = Console()
@@ -92,26 +78,19 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.once:
         pr, error = poll()
-        console.print(_render(pr, error, ctx, interval, interval))
+        console.print(
+            Group(
+                ui.render_body(pr, error, ctx),
+                ui.render_footer(datetime.now(), interval, interval),
+            )
+        )
         return 1 if error else 0
 
     try:
-        with Live(
-            console=console,
-            screen=True,
-            auto_refresh=False,
-            transient=True,
-        ) as live:
-            while True:
-                pr, error = poll()
-                # Count down second-by-second so the UI feels alive between polls.
-                for remaining in range(interval, 0, -1):
-                    live.update(
-                        _render(pr, error, ctx, remaining, interval), refresh=True
-                    )
-                    time.sleep(1)
+        PrWatchApp(ctx=ctx, poll=poll, interval=interval).run()
     except KeyboardInterrupt:
-        console.print("[dim]pr-watch stopped.[/dim]")
+        pass
+    console.print("[dim]pr-watch stopped.[/dim]")
     return 0
 
 

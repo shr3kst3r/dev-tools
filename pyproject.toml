@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "rich>=13.7",
+    "textual>=8.2.8",
 ]
 
 # One entry point per tool. Each maps to a package under tools/.
@@ -27,11 +28,13 @@ dev = [
     "pytest>=8.2",
     "ty>=0.0.29",
     "pre-commit>=3.8",
+    "pytest-asyncio>=1.4.0",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra -q"
+asyncio_mode = "auto"
 
 [tool.ty.environment]
 python-version = "3.13"

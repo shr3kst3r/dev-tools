@@ -142,10 +142,13 @@ HELP_KEYS: tuple[tuple[str, str], ...] = (
     ("enter / o", "Open the selected PR in your browser"),
     ("tab", "Move focus between the list and the detail pane"),
     ("d", "Cycle the detail pane: right → below → hidden"),
+    ("[ / ]", "Resize the windows: shrink / grow the list"),
     ("r", "Refresh now"),
     ("?", "Show / hide this help"),
     ("q", "Quit"),
 )
+
+HELP_NOTE = "Layout and sizing are saved and restored on the next launch."
 
 
 def render_help() -> RenderableType:
@@ -156,7 +159,7 @@ def render_help() -> RenderableType:
     for key, description in HELP_KEYS:
         table.add_row(key, description)
     return Panel(
-        table,
+        Group(table, Text(), Text(HELP_NOTE, style="dim italic")),
         title=Text("Help", style="bold"),
         subtitle=Text("esc to close", style="dim"),
         border_style="cyan",

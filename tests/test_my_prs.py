@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from rich.console import Console
 from textual.widgets import DataTable, Static
 
-from tools.my_prs import ui
+from tools.my_prs import layout, ui
 from tools.my_prs.app import HelpScreen, MyPrsApp
 from tools.my_prs.cli import _parse_args
 from tools.my_prs.github import build_search_query, parse_search
@@ -454,3 +454,98 @@ async def test_open_pr_uses_selected_url(monkeypatch) -> None:
         await pilot.pause()
         await pilot.press("o")
         assert opened == ["https://github.com/o/r/pull/2"]
+
+
+# --- window layout: resizing + persistence ------------------------------------
+
+
+def test_layout_from_dict_defaults_bad_values() -> None:
+    assert layout.from_dict(None) == layout.Layout()
+    assert layout.from_dict({}) == layout.Layout()
+    assert layout.from_dict({"detail_mode": "sideways", "split": "wide"}) == layout.Layout()
+    # Booleans are ints in Python; they must not sneak in as a split.
+    assert layout.from_dict({"split": True}).split == layout.SPLIT_DEFAULT
+    # Out-of-range splits are clamped, not rejected.
+    assert layout.from_dict({"split": 5}).split == layout.SPLIT_MIN
+    assert layout.from_dict({"split": 95}).split == layout.SPLIT_MAX
+
+
+def test_layout_save_load_roundtrip(tmp_path) -> None:
+    path = tmp_path / "sub" / "layout.json"  # parent dir is created on save
+    saved = layout.Layout(detail_mode="below", split=35)
+    layout.save(saved, path)
+    assert layout.load(path) == saved
+
+
+def test_layout_load_missing_or_corrupt_file(tmp_path) -> None:
+    assert layout.load(tmp_path / "nope.json") == layout.Layout()
+    corrupt = tmp_path / "layout.json"
+    corrupt.write_text("{not json")
+    assert layout.load(corrupt) == layout.Layout()
+
+
+async def test_resize_moves_divider_and_saves(tmp_path) -> None:
+    path = tmp_path / "layout.json"
+    app = MyPrsApp(poll=lambda: (_fleet(), None), interval=60, layout_path=path)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        table = app.query_one(DataTable)
+        width_before = table.size.width
+        await pilot.press("right_square_bracket")
+        await pilot.pause()
+        assert app._split == layout.SPLIT_DEFAULT + layout.SPLIT_STEP
+        assert table.size.width > width_before
+        assert layout.load(path).split == app._split
+
+        # `[` steps back, and the divider never walks past the bounds.
+        for _ in range(30):
+            await pilot.press("left_square_bracket")
+        await pilot.pause()
+        assert app._split == layout.SPLIT_MIN
+        assert layout.load(path) == layout.Layout(detail_mode="right", split=layout.SPLIT_MIN)
+
+
+async def test_resize_is_noop_when_detail_hidden(tmp_path) -> None:
+    path = tmp_path / "layout.json"
+    app = MyPrsApp(poll=lambda: (_fleet(), None), interval=60, layout_path=path)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        await pilot.press("d", "d")  # right -> below -> hidden
+        await pilot.pause()
+        await pilot.press("right_square_bracket")
+        await pilot.pause()
+        assert app._split == layout.SPLIT_DEFAULT
+        assert layout.load(path) == layout.Layout(detail_mode="hidden")
+
+
+async def test_layout_restored_on_next_launch(tmp_path) -> None:
+    path = tmp_path / "layout.json"
+    layout.save(layout.Layout(detail_mode="below", split=30), path)
+
+    app = MyPrsApp(poll=lambda: (_fleet(), None), interval=60, layout_path=path)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        body = app.query_one("#body")
+        assert body.has_class("detail-below")
+        assert app._split == 30
+        # The saved split lands on the vertical axis in below mode: the list
+        # window gets ~30% of the body's height.
+        table = app.query_one(DataTable)
+        assert table.size.height < body.size.height // 2
+
+
+async def test_app_without_layout_path_never_persists(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    app = MyPrsApp(poll=lambda: (_fleet(), None), interval=60)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("d", "right_square_bracket")
+        await pilot.pause()
+    assert not (tmp_path / "my-prs").exists()

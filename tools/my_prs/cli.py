@@ -17,6 +17,7 @@ from rich.console import Console
 
 from . import ui
 from .app import MyPrsApp, PollResult
+from .layout import state_path
 from .github import GitHubError, fetch_my_prs, require_gh
 from .models import sort_items
 
@@ -89,7 +90,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        MyPrsApp(poll=poll, interval=interval).run()
+        MyPrsApp(poll=poll, interval=interval, layout_path=state_path()).run()
     except KeyboardInterrupt:
         pass
     console.print("[dim]my-prs stopped.[/dim]")

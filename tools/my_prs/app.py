@@ -3,7 +3,10 @@
 Windowing: a master/detail split. The left window is a DataTable of every
 recent PR (cursor keys / mouse to select); the detail pane shows the selected
 PR exactly as pr-watch would render it — checks, unresolved threads, metrics.
-`d` cycles the detail pane through right of the list, below it, or hidden.
+`d` cycles the detail pane through right of the list, below it, or hidden;
+`[` / `]` move the divider to resize the two windows. Both are remembered in
+a state file (see layout.py) when the app is given a `layout_path`, so the
+dashboard reopens the way you left it.
 `?` floats a keybinding reference over the dashboard. A summary bar is docked
 at the top, the refresh status bar at the bottom.
 
@@ -16,6 +19,7 @@ from __future__ import annotations
 
 import webbrowser
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable
 
 from textual.app import App, ComposeResult
@@ -25,15 +29,14 @@ from textual.widgets import DataTable, Static
 
 from tools.pr_watch import ui as pr_ui
 
+from . import layout as layout_state
 from . import ui
+from .layout import DETAIL_MODES, SPLIT_STEP, Layout
 from .models import PrItem
 
 # What one poll of GitHub yields: (items, None) on success or (None, error
 # message) on failure.
 PollResult = tuple[list[PrItem] | None, str | None]
-
-# Where the detail pane lives, in the order `d` cycles through.
-DETAIL_MODES = ("right", "below", "hidden")
 
 
 class HelpScreen(ModalScreen[None]):
@@ -64,6 +67,8 @@ class MyPrsApp(App[None]):
         ("r", "poll_now", "Refresh now"),
         ("o", "open_pr", "Open in browser"),
         ("d", "cycle_detail", "Move/hide detail"),
+        ("left_square_bracket", "shrink_list", "Shrink list window"),
+        ("right_square_bracket", "grow_list", "Grow list window"),
         ("question_mark", "help", "Help"),
     ]
 
@@ -112,7 +117,12 @@ class MyPrsApp(App[None]):
     }
     """
 
-    def __init__(self, poll: Callable[[], PollResult], interval: int) -> None:
+    def __init__(
+        self,
+        poll: Callable[[], PollResult],
+        interval: int,
+        layout_path: Path | None = None,
+    ) -> None:
         super().__init__()
         self._poll = poll
         self._interval = interval
@@ -122,7 +132,13 @@ class MyPrsApp(App[None]):
         self._selected_key: str | None = None
         self._updated = datetime.now()
         self._polling = False
-        self._detail_mode = DETAIL_MODES[0]
+        # Layout persists across runs only when the caller supplies a path;
+        # without one (tests, embedding) the app starts from defaults and
+        # never touches the filesystem.
+        self._layout_path = layout_path
+        saved = layout_state.load(layout_path) if layout_path else Layout()
+        self._detail_mode = saved.detail_mode
+        self._split = saved.split
 
     def compose(self) -> ComposeResult:
         yield Static(id="summary")
@@ -139,6 +155,7 @@ class MyPrsApp(App[None]):
         for column in ui.LIST_COLUMNS:
             table.add_column(column, key=column)
         table.focus()
+        self._apply_layout()
         self._refresh_view()
         self.action_poll_now()
         self.set_interval(1, self._tick)
@@ -214,17 +231,47 @@ class MyPrsApp(App[None]):
         if item is not None and item.pr.url:
             webbrowser.open(item.pr.url)
 
-    # --- detail pane placement ----------------------------------------------
+    # --- window layout: detail placement + split size ------------------------
 
     def action_cycle_detail(self) -> None:
         index = DETAIL_MODES.index(self._detail_mode)
         self._detail_mode = DETAIL_MODES[(index + 1) % len(DETAIL_MODES)]
-        body = self.query_one("#body")
-        body.set_class(self._detail_mode == "below", "detail-below")
-        body.set_class(self._detail_mode == "hidden", "detail-hidden")
+        self._apply_layout()
+        self._save_layout()
         if self._detail_mode == "hidden":
             # A hidden pane can't keep focus; hand it back to the list.
             self.query_one(DataTable).focus()
+
+    def action_grow_list(self) -> None:
+        self._resize_split(+SPLIT_STEP)
+
+    def action_shrink_list(self) -> None:
+        self._resize_split(-SPLIT_STEP)
+
+    def _resize_split(self, delta: int) -> None:
+        if self._detail_mode == "hidden":
+            return  # one window fills the screen; nothing to divide
+        self._split = layout_state.clamp_split(self._split + delta)
+        self._apply_layout()
+        self._save_layout()
+
+    def _apply_layout(self) -> None:
+        """Make the widgets match the layout state: the body's mode class and
+        the list window's share of the split. The split overrides the CSS
+        default (50%) inline, on whichever axis the current mode divides."""
+        body = self.query_one("#body")
+        body.set_class(self._detail_mode == "below", "detail-below")
+        body.set_class(self._detail_mode == "hidden", "detail-hidden")
+        list_ = self.query_one("#list")
+        list_.styles.width = f"{self._split}%" if self._detail_mode == "right" else None
+        list_.styles.height = f"{self._split}%" if self._detail_mode == "below" else None
+
+    def _save_layout(self) -> None:
+        if self._layout_path is not None:
+            layout_state.save(
+                Layout(detail_mode=self._detail_mode, split=self._split),
+                self._layout_path,
+            )
 
     # --- help ----------------------------------------------------------------
 
@@ -253,6 +300,6 @@ class MyPrsApp(App[None]):
                 max(0, self._seconds_left),
                 self._interval,
                 refreshing=self._polling,
-                quit_hint="q quit · r refresh · ↑↓ select · enter/o open · ? help",
+                quit_hint="q quit · r refresh · ↑↓ select · enter/o open · [ ] resize · ? help",
             )
         )

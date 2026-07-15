@@ -9,7 +9,7 @@ from rich.console import Console
 from textual.widgets import DataTable, Static
 
 from tools.my_prs import ui
-from tools.my_prs.app import MyPrsApp
+from tools.my_prs.app import HelpScreen, MyPrsApp
 from tools.my_prs.cli import _parse_args
 from tools.my_prs.github import build_search_query, parse_search
 from tools.my_prs.models import PrItem, sort_items
@@ -378,6 +378,71 @@ async def test_app_empty_state() -> None:
         assert app.query_one(DataTable).row_count == 0
         detail = _plain(app.query_one("#detail", Static))
         assert "No open PRs" in detail
+
+
+async def test_cycle_detail_moves_then_hides_pane() -> None:
+    app = MyPrsApp(poll=lambda: (_fleet(), None), interval=60)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        body = app.query_one("#body")
+        detail_scroll = app.query_one("#detail-scroll")
+        table = app.query_one(DataTable)
+        assert not body.has_class("detail-below")
+        assert not body.has_class("detail-hidden")
+
+        # First press: detail moves below the list.
+        await pilot.press("d")
+        await pilot.pause()
+        assert body.has_class("detail-below")
+        assert not body.has_class("detail-hidden")
+        assert detail_scroll.display
+        assert table.size.height < body.size.height
+
+        # Second press: detail disappears and the list gets the full window.
+        await pilot.press("d")
+        await pilot.pause()
+        assert body.has_class("detail-hidden")
+        assert not body.has_class("detail-below")
+        assert not detail_scroll.display
+        assert table.size.width == app.size.width
+
+        # Third press: back to the side-by-side default.
+        await pilot.press("d")
+        await pilot.pause()
+        assert not body.has_class("detail-below")
+        assert not body.has_class("detail-hidden")
+        assert detail_scroll.display
+        assert table.size.width < app.size.width
+
+
+async def test_help_overlay_opens_and_closes() -> None:
+    app = MyPrsApp(poll=lambda: (_fleet(), None), interval=60)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        await pilot.press("question_mark")
+        await pilot.pause()
+        assert isinstance(app.screen, HelpScreen)
+        help_text = _plain(app.screen.query_one("#help", Static))
+        assert "Quit" in help_text
+        assert "Cycle the detail pane" in help_text
+
+        # `q` closes the overlay without quitting the app.
+        await pilot.press("q")
+        await pilot.pause()
+        assert not isinstance(app.screen, HelpScreen)
+        assert app.is_running
+
+        # escape works too, and `?` toggles from the keyboard's perspective.
+        await pilot.press("question_mark")
+        await pilot.pause()
+        assert isinstance(app.screen, HelpScreen)
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, HelpScreen)
 
 
 async def test_open_pr_uses_selected_url(monkeypatch) -> None:

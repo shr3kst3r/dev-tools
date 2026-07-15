@@ -1,10 +1,11 @@
 """The my-prs TUI, built on Textual.
 
 Windowing: a master/detail split. The left window is a DataTable of every
-recent PR (cursor keys / mouse to select); the right window is a scrollable
-detail pane showing the selected PR exactly as pr-watch would render it —
-checks, unresolved threads, metrics. A summary bar is docked at the top,
-the refresh status bar at the bottom.
+recent PR (cursor keys / mouse to select); the detail pane shows the selected
+PR exactly as pr-watch would render it — checks, unresolved threads, metrics.
+`d` cycles the detail pane through right of the list, below it, or hidden.
+`?` floats a keybinding reference over the dashboard. A summary bar is docked
+at the top, the refresh status bar at the bottom.
 
 Rendering stays in ui.py (list cells, summary) and pr_watch.ui (detail pane)
 as pure Rich renderables; this module only owns the polling loop, the
@@ -18,7 +19,8 @@ from datetime import datetime, timezone
 from typing import Callable
 
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal, VerticalScroll
+from textual.containers import Container, VerticalScroll
+from textual.screen import ModalScreen
 from textual.widgets import DataTable, Static
 
 from tools.pr_watch import ui as pr_ui
@@ -30,12 +32,39 @@ from .models import PrItem
 # message) on failure.
 PollResult = tuple[list[PrItem] | None, str | None]
 
+# Where the detail pane lives, in the order `d` cycles through.
+DETAIL_MODES = ("right", "below", "hidden")
+
+
+class HelpScreen(ModalScreen[None]):
+    """The `?` overlay: a keybinding reference floating over the dashboard."""
+
+    BINDINGS = [("escape,q,question_mark", "dismiss_help", "Close")]
+
+    CSS = """
+    HelpScreen {
+        align: center middle;
+    }
+    HelpScreen #help {
+        width: auto;
+        height: auto;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Static(ui.render_help(), id="help")
+
+    def action_dismiss_help(self) -> None:
+        self.dismiss()
+
 
 class MyPrsApp(App[None]):
     BINDINGS = [
         ("q", "quit", "Quit"),
         ("r", "poll_now", "Refresh now"),
         ("o", "open_pr", "Open in browser"),
+        ("d", "cycle_detail", "Move/hide detail"),
+        ("question_mark", "help", "Help"),
     ]
 
     CSS = """
@@ -48,6 +77,9 @@ class MyPrsApp(App[None]):
         dock: bottom;
         height: 1;
     }
+    #body {
+        layout: horizontal;
+    }
     #list {
         width: 50%;
         min-width: 40;
@@ -56,6 +88,27 @@ class MyPrsApp(App[None]):
         width: 1fr;
         scrollbar-gutter: stable;
         border-left: solid $foreground 30%;
+    }
+    #body.detail-below {
+        layout: vertical;
+    }
+    #body.detail-below #list {
+        width: 1fr;
+        min-width: 0;
+        height: 50%;
+        min-height: 8;
+    }
+    #body.detail-below #detail-scroll {
+        width: 1fr;
+        height: 1fr;
+        border-left: none;
+        border-top: solid $foreground 30%;
+    }
+    #body.detail-hidden #list {
+        width: 1fr;
+    }
+    #body.detail-hidden #detail-scroll {
+        display: none;
     }
     """
 
@@ -69,10 +122,11 @@ class MyPrsApp(App[None]):
         self._selected_key: str | None = None
         self._updated = datetime.now()
         self._polling = False
+        self._detail_mode = DETAIL_MODES[0]
 
     def compose(self) -> ComposeResult:
         yield Static(id="summary")
-        with Horizontal():
+        with Container(id="body"):
             yield DataTable(id="list")
             with VerticalScroll(id="detail-scroll"):
                 yield Static(id="detail")
@@ -160,6 +214,24 @@ class MyPrsApp(App[None]):
         if item is not None and item.pr.url:
             webbrowser.open(item.pr.url)
 
+    # --- detail pane placement ----------------------------------------------
+
+    def action_cycle_detail(self) -> None:
+        index = DETAIL_MODES.index(self._detail_mode)
+        self._detail_mode = DETAIL_MODES[(index + 1) % len(DETAIL_MODES)]
+        body = self.query_one("#body")
+        body.set_class(self._detail_mode == "below", "detail-below")
+        body.set_class(self._detail_mode == "hidden", "detail-hidden")
+        if self._detail_mode == "hidden":
+            # A hidden pane can't keep focus; hand it back to the list.
+            self.query_one(DataTable).focus()
+
+    # --- help ----------------------------------------------------------------
+
+    def action_help(self) -> None:
+        if not isinstance(self.screen, HelpScreen):
+            self.push_screen(HelpScreen())
+
     # --- rendering ---------------------------------------------------------
 
     def _refresh_view(self) -> None:
@@ -181,6 +253,6 @@ class MyPrsApp(App[None]):
                 max(0, self._seconds_left),
                 self._interval,
                 refreshing=self._polling,
-                quit_hint="q quit · r refresh · ↑↓ select · enter/o open · tab focus detail",
+                quit_hint="q quit · r refresh · ↑↓ select · enter/o open · ? help",
             )
         )

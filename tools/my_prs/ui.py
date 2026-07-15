@@ -137,6 +137,33 @@ def render_detail_placeholder(
     return Panel(Align.center(message), title="my-prs", border_style="cyan", padding=(1, 2))
 
 
+HELP_KEYS: tuple[tuple[str, str], ...] = (
+    ("↑ / ↓", "Select a PR"),
+    ("enter / o", "Open the selected PR in your browser"),
+    ("tab", "Move focus between the list and the detail pane"),
+    ("d", "Cycle the detail pane: right → below → hidden"),
+    ("r", "Refresh now"),
+    ("?", "Show / hide this help"),
+    ("q", "Quit"),
+)
+
+
+def render_help() -> RenderableType:
+    """The keybinding reference shown by the `?` overlay."""
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column(justify="right", style="bold cyan", no_wrap=True)
+    table.add_column()
+    for key, description in HELP_KEYS:
+        table.add_row(key, description)
+    return Panel(
+        table,
+        title=Text("Help", style="bold"),
+        subtitle=Text("esc to close", style="dim"),
+        border_style="cyan",
+        padding=(1, 2),
+    )
+
+
 def render_once(items: list[PrItem], now: datetime) -> RenderableType:
     """A single-shot snapshot of the whole list for `--once` / scripting."""
     table = Table(

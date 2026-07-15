@@ -36,6 +36,10 @@ hooks:
 
 # --- tools -------------------------------------------------------------
 
+# Dashboard of your open GitHub PRs from the last 2 weeks, across all repos.
+my-prs *args:
+    uv run my-prs {{args}}
+
 # Watch the GitHub PR for the repo in DIR (default: current dir).
 pr-watch dir="." *args:
     uv run pr-watch {{dir}} {{args}}

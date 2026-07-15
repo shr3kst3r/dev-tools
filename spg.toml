@@ -13,6 +13,17 @@
 [project]
 name = "dev-tools"
 
+[commands.my-prs]
+run = "uv run my-prs"
+description = "Live Textual dashboard of your open GitHub PRs from the last 2 weeks, across all repos: failing checks, unresolved comments, missing reviews. Uses the gh CLI for auth."
+args = [
+    { name = "--days", description = "how far back to look for PR activity (default: 14)" },
+    { name = "--interval", description = "seconds between refreshes (default: 60)" },
+    { name = "--limit", description = "maximum PRs to show (default: 50)" },
+    { name = "--author", description = "GitHub login to search PRs for (default: you)" },
+    { name = "--once", description = "render a single snapshot and exit" },
+]
+
 [commands.pr-watch]
 run = "uv run pr-watch"
 description = "Live, auto-refreshing Rich TUI of a repo's current-branch GitHub PR: statuses and unresolved review threads. Uses the gh CLI for auth."

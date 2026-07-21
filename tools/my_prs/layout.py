@@ -1,8 +1,8 @@
 """Persisted window layout for my-prs.
 
 The dashboard remembers how you left its windows — where the detail pane
-lives (`d`) and where the divider sits (`[` / `]`) — in a small JSON state
-file, loaded on the next launch. Parsing/serializing is pure so it can be
+lives (`d`), where the divider sits (`[` / `]`), and which view is showing
+(`v`) — in a small JSON state file, loaded on the next launch. Parsing/serializing is pure so it can be
 unit-tested; only `load`/`save` touch the filesystem, and both shrug off a
 missing, malformed, or unwritable file (a broken state file must never take
 the dashboard down — it just means default layout).
@@ -14,6 +14,8 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+
+from .models import VIEWS
 
 # Where the detail pane lives, in the order `d` cycles through.
 DETAIL_MODES = ("right", "below", "hidden")
@@ -31,6 +33,7 @@ SPLIT_STEP = 5
 class Layout:
     detail_mode: str = DETAIL_MODES[0]
     split: int = SPLIT_DEFAULT
+    view: str = VIEWS[0]
 
 
 def clamp_split(value: int) -> int:
@@ -47,11 +50,14 @@ def from_dict(data: object) -> Layout:
     split = data.get("split")
     if not isinstance(split, int) or isinstance(split, bool):
         split = SPLIT_DEFAULT
-    return Layout(detail_mode=mode, split=clamp_split(split))
+    view = data.get("view")
+    if not isinstance(view, str) or view not in VIEWS:
+        view = VIEWS[0]
+    return Layout(detail_mode=mode, split=clamp_split(split), view=view)
 
 
 def to_dict(layout: Layout) -> dict[str, object]:
-    return {"detail_mode": layout.detail_mode, "split": layout.split}
+    return {"detail_mode": layout.detail_mode, "split": layout.split, "view": layout.view}
 
 
 def state_path() -> Path:

@@ -1,9 +1,9 @@
 """GitHub access for my-prs, via the `gh` CLI (reuses the user's auth).
 
-One GraphQL *search* query fetches every recent PR authored by the user, with
-the same per-PR fields pr-watch uses — so the hard parsing is delegated to
-pr-watch's pure `parse_pull_request`, and this module only wraps each node
-with its repo/branch.
+One GraphQL *search* query per view fetches the recent PRs — authored by the
+user ("mine") or awaiting the user's review ("review") — with the same per-PR
+fields pr-watch uses. The hard parsing is delegated to pr-watch's pure
+`parse_pull_request`; this module only wraps each node with its repo/branch.
 """
 
 from __future__ import annotations
@@ -18,7 +18,15 @@ from tools.pr_watch.github import GitHubError, _run, parse_pull_request, require
 
 from .models import PrItem
 
-__all__ = ["GitHubError", "require_gh", "build_search_query", "fetch_my_prs", "parse_search"]
+__all__ = ["GitHubError", "require_gh", "build_search_query", "fetch_prs", "parse_search"]
+
+# How each view narrows the search: whose PRs, relative to `author`.
+# `review-requested` clears once you submit a review, so the review view
+# naturally lists only PRs still waiting on you.
+_VIEW_QUALIFIERS = {
+    "mine": "author:{author}",
+    "review": "review-requested:{author}",
+}
 
 # The per-PR selection mirrors pr-watch's _PR_QUERY (parse_pull_request reads
 # this exact shape), plus repository/headRefName so the list can say where
@@ -100,20 +108,26 @@ query($q: String!, $limit: Int!) {
 """
 
 
-def build_search_query(days: int, now: datetime, author: str = "@me") -> str:
-    """The GitHub search string: the author's open PRs updated in the window."""
+def build_search_query(
+    days: int, now: datetime, author: str = "@me", view: str = "mine"
+) -> str:
+    """The GitHub search string: the view's open PRs updated in the window."""
     since = (now - timedelta(days=days)).date().isoformat()
-    return f"is:pr is:open author:{author} updated:>={since} sort:updated-desc"
+    who = _VIEW_QUALIFIERS[view].format(author=author)
+    return f"is:pr is:open {who} updated:>={since} sort:updated-desc"
 
 
-def fetch_my_prs(
+def fetch_prs(
+    view: str,
     days: int,
     limit: int,
     author: str = "@me",
     cwd: Path | None = None,
 ) -> list[PrItem]:
-    """Return the user's open PRs updated within the last `days` days."""
-    query = build_search_query(days, now=datetime.now(timezone.utc), author=author)
+    """Return the view's open PRs updated within the last `days` days."""
+    query = build_search_query(
+        days, now=datetime.now(timezone.utc), author=author, view=view
+    )
     raw = _run(
         [
             "gh",

@@ -1,12 +1,17 @@
 """The my-prs TUI, built on Textual.
 
+Two views share the dashboard — the PRs you authored ("mine") and the PRs
+waiting on a review from you ("review") — and `v` switches between them.
+Every poll fetches both, so switching is instant, and each view remembers its
+own selection.
+
 Windowing: a master/detail split. The left window is a DataTable of every
 recent PR (cursor keys / mouse to select); the detail pane shows the selected
 PR exactly as pr-watch would render it — checks, unresolved threads, metrics.
 `d` cycles the detail pane through right of the list, below it, or hidden;
-`[` / `]` move the divider to resize the two windows. Both are remembered in
-a state file (see layout.py) when the app is given a `layout_path`, so the
-dashboard reopens the way you left it.
+`[` / `]` move the divider to resize the two windows. These and the active
+view are remembered in a state file (see layout.py) when the app is given a
+`layout_path`, so the dashboard reopens the way you left it.
 `?` floats a keybinding reference over the dashboard. A summary bar is docked
 at the top, the refresh status bar at the bottom.
 
@@ -32,11 +37,13 @@ from tools.pr_watch import ui as pr_ui
 from . import layout as layout_state
 from . import ui
 from .layout import DETAIL_MODES, SPLIT_STEP, Layout
-from .models import PrItem
+from .models import VIEWS, PrItem
 
-# What one poll of GitHub yields: (items, None) on success or (None, error
-# message) on failure.
-PollResult = tuple[list[PrItem] | None, str | None]
+# What one poll of GitHub yields: ({view: items}, None) on success — every
+# view's list in one poll, so switching views never waits on the network —
+# or (None, error message) on failure.
+ViewData = dict[str, list[PrItem]]
+PollResult = tuple[ViewData | None, str | None]
 
 
 class HelpScreen(ModalScreen[None]):
@@ -64,6 +71,7 @@ class HelpScreen(ModalScreen[None]):
 class MyPrsApp(App[None]):
     BINDINGS = [
         ("q", "quit", "Quit"),
+        ("v", "switch_view", "Switch view"),
         ("r", "poll_now", "Refresh now"),
         ("o", "open_pr", "Open in browser"),
         ("d", "cycle_detail", "Move/hide detail"),
@@ -122,14 +130,16 @@ class MyPrsApp(App[None]):
         poll: Callable[[], PollResult],
         interval: int,
         layout_path: Path | None = None,
+        initial_view: str | None = None,
     ) -> None:
         super().__init__()
         self._poll = poll
         self._interval = interval
         self._seconds_left = interval
-        self._items: list[PrItem] | None = None  # None until the first poll lands
+        self._data: ViewData | None = None  # None until the first poll lands
         self._error: str | None = None
-        self._selected_key: str | None = None
+        # Each view keeps its own cursor, so flipping back lands where you were.
+        self._selected: dict[str, str | None] = {view: None for view in VIEWS}
         self._updated = datetime.now()
         self._polling = False
         # Layout persists across runs only when the caller supplies a path;
@@ -139,6 +149,19 @@ class MyPrsApp(App[None]):
         saved = layout_state.load(layout_path) if layout_path else Layout()
         self._detail_mode = saved.detail_mode
         self._split = saved.split
+        self._view = initial_view if initial_view in VIEWS else saved.view
+
+    @property
+    def _items(self) -> list[PrItem] | None:
+        return None if self._data is None else self._data.get(self._view)
+
+    @property
+    def _selected_key(self) -> str | None:
+        return self._selected[self._view]
+
+    @_selected_key.setter
+    def _selected_key(self, value: str | None) -> None:
+        self._selected[self._view] = value
 
     def compose(self) -> ComposeResult:
         yield Static(id="summary")
@@ -152,8 +175,7 @@ class MyPrsApp(App[None]):
         table = self.query_one(DataTable)
         table.cursor_type = "row"
         table.zebra_stripes = True
-        for column in ui.LIST_COLUMNS:
-            table.add_column(column, key=column)
+        self._set_columns()
         table.focus()
         self._apply_layout()
         self._refresh_view()
@@ -171,13 +193,13 @@ class MyPrsApp(App[None]):
         self.run_worker(self._poll_in_thread, thread=True, exclusive=True)
 
     def _poll_in_thread(self) -> None:
-        items, error = self._poll()
-        self.call_from_thread(self._apply_poll, items, error)
+        data, error = self._poll()
+        self.call_from_thread(self._apply_poll, data, error)
 
-    def _apply_poll(self, items: list[PrItem] | None, error: str | None) -> None:
+    def _apply_poll(self, data: ViewData | None, error: str | None) -> None:
         self._error = error
-        if items is not None:  # keep showing the last good list through errors
-            self._items = items
+        if data is not None:  # keep showing the last good lists through errors
+            self._data = data
         self._updated = datetime.now()
         self._seconds_left = self._interval
         self._polling = False
@@ -192,6 +214,22 @@ class MyPrsApp(App[None]):
                 return  # action_poll_now already refreshed the view
         # Re-render even between polls so pending-check timers stay live.
         self._refresh_view()
+
+    # --- views ---------------------------------------------------------------
+
+    def action_switch_view(self) -> None:
+        index = VIEWS.index(self._view)
+        self._view = VIEWS[(index + 1) % len(VIEWS)]
+        self._set_columns()  # the views' columns differ, so rebuild from scratch
+        self._rebuild_table()
+        self._refresh_view()
+        self._save_layout()
+
+    def _set_columns(self) -> None:
+        table = self.query_one(DataTable)
+        table.clear(columns=True)
+        for column in ui.list_columns(self._view):
+            table.add_column(column, key=column)
 
     # --- selection ---------------------------------------------------------
 
@@ -209,7 +247,7 @@ class MyPrsApp(App[None]):
         items = self._items or []
         now = datetime.now(timezone.utc)
         for item in items:
-            table.add_row(*ui.list_row(item, now), key=item.key)
+            table.add_row(*ui.list_row(item, now, self._view), key=item.key)
         if items:
             keys = [item.key for item in items]
             row = keys.index(self._selected_key) if self._selected_key in keys else 0
@@ -269,7 +307,11 @@ class MyPrsApp(App[None]):
     def _save_layout(self) -> None:
         if self._layout_path is not None:
             layout_state.save(
-                Layout(detail_mode=self._detail_mode, split=self._split),
+                Layout(
+                    detail_mode=self._detail_mode,
+                    split=self._split,
+                    view=self._view,
+                ),
                 self._layout_path,
             )
 
@@ -284,14 +326,14 @@ class MyPrsApp(App[None]):
     def _refresh_view(self) -> None:
         loading = self._items is None and self._error is None
         self.query_one("#summary", Static).update(
-            ui.render_summary(self._items, self._error)
+            ui.render_summary(self._items, self._error, self._view)
         )
         item = self._selected_item()
         if item is not None:
             detail = pr_ui.render_body(item.pr, None, item.ctx)
         else:
             detail = ui.render_detail_placeholder(
-                self._items, self._error, loading=loading
+                self._items, self._error, loading=loading, view=self._view
             )
         self.query_one("#detail", Static).update(detail)
         self.query_one("#status", Static).update(
@@ -300,6 +342,6 @@ class MyPrsApp(App[None]):
                 max(0, self._seconds_left),
                 self._interval,
                 refreshing=self._polling,
-                quit_hint="q quit · r refresh · ↑↓ select · enter/o open · [ ] resize · ? help",
+                quit_hint="q quit · v view · r refresh · ↑↓ select · enter/o open · [ ] resize · ? help",
             )
         )

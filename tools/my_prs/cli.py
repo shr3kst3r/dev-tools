@@ -2,9 +2,10 @@
 
 Shows a live dashboard of your open GitHub PRs updated in the last two weeks
 (configurable), across all repos: check status, unresolved review threads,
-and review state — so you know the moment any PR needs you. The live view is
-a Textual master/detail app: a PR list window on the left, a scrollable
-detail window on the right.
+and review state — so you know the moment any PR needs you. Two views, with
+`v` switching between them: the PRs you authored, and the PRs waiting on a
+review from you. The live view is a Textual master/detail app: a PR list
+window on the left, a scrollable detail window on the right.
 """
 
 from __future__ import annotations
@@ -18,8 +19,8 @@ from rich.console import Console
 from . import ui
 from .app import MyPrsApp, PollResult
 from .layout import state_path
-from .github import GitHubError, fetch_my_prs, require_gh
-from .models import sort_items
+from .github import GitHubError, fetch_prs, require_gh
+from .models import VIEWS, sort_items
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -53,6 +54,13 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="GitHub login to search PRs for (default: you).",
     )
     parser.add_argument(
+        "--view",
+        choices=VIEWS,
+        default=None,
+        help="Which view to open with: your PRs (mine) or PRs awaiting your "
+        "review (review). Default: the view you last had open.",
+    )
+    parser.add_argument(
         "--once",
         action="store_true",
         help="Render a single snapshot and exit (no live refresh).",
@@ -76,21 +84,35 @@ def main(argv: list[str] | None = None) -> int:
 
     def poll() -> PollResult:
         try:
-            items = fetch_my_prs(days=days, limit=limit, author=args.author)
-            return sort_items(items), None
+            data = {
+                view: sort_items(
+                    fetch_prs(view, days=days, limit=limit, author=args.author)
+                )
+                for view in VIEWS
+            }
+            return data, None
         except GitHubError as exc:
             return None, str(exc)
 
     if args.once:
-        items, error = poll()
-        if error is not None or items is None:
-            console.print(f"[red]{error or 'unknown error'}[/red]")
+        view = args.view or VIEWS[0]
+        try:
+            items = sort_items(
+                fetch_prs(view, days=days, limit=limit, author=args.author)
+            )
+        except GitHubError as exc:
+            console.print(f"[red]{exc}[/red]")
             return 1
-        console.print(ui.render_once(items, datetime.now(timezone.utc)))
+        console.print(ui.render_once(items, datetime.now(timezone.utc), view))
         return 0
 
     try:
-        MyPrsApp(poll=poll, interval=interval, layout_path=state_path()).run()
+        MyPrsApp(
+            poll=poll,
+            interval=interval,
+            layout_path=state_path(),
+            initial_view=args.view,
+        ).run()
     except KeyboardInterrupt:
         pass
     console.print("[dim]my-prs stopped.[/dim]")

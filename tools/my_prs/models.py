@@ -13,6 +13,11 @@ from datetime import datetime, timezone
 
 from tools.pr_watch.models import CheckState, PullRequest, RepoContext
 
+# The dashboard's views, in the order `v` cycles through: PRs you authored,
+# and PRs waiting on a review from you.
+VIEWS = ("mine", "review")
+VIEW_LABELS = {"mine": "My PRs", "review": "Needs my review"}
+
 
 @dataclass(frozen=True, slots=True)
 class PrItem:

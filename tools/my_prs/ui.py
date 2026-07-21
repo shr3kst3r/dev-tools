@@ -18,11 +18,20 @@ from rich.text import Text
 from tools.pr_watch.models import CheckState
 from tools.pr_watch.ui import format_relative
 
-from .models import PrItem
+from .models import VIEW_LABELS, VIEWS, PrItem
 
-LIST_COLUMNS = ("!", "Repo", "PR", "Title", "CI", "💬", "Review", "Updated")
+# The review view adds an Author column — whose PR you're being asked to
+# review — right where "mine" needs none (they're all yours).
+_COLUMNS = {
+    "mine": ("!", "Repo", "PR", "Title", "CI", "💬", "Review", "Updated"),
+    "review": ("!", "Repo", "PR", "Author", "Title", "CI", "💬", "Review", "Updated"),
+}
 
 _TITLE_WIDTH = 44
+
+
+def list_columns(view: str) -> tuple[str, ...]:
+    return _COLUMNS[view]
 
 
 def attention_cell(item: PrItem) -> Text:
@@ -78,9 +87,9 @@ def _title_cell(item: PrItem) -> Text:
     return Text(title, style=style)
 
 
-def list_row(item: PrItem, now: datetime) -> tuple[Text, ...]:
-    """The cells for one PR row, in LIST_COLUMNS order."""
-    return (
+def list_row(item: PrItem, now: datetime, view: str = "mine") -> tuple[Text, ...]:
+    """The cells for one PR row, in `list_columns(view)` order."""
+    cells = [
         attention_cell(item),
         Text(item.repo_name, style="cyan"),
         Text(f"#{item.pr.number}", style="bold"),
@@ -89,19 +98,35 @@ def list_row(item: PrItem, now: datetime) -> tuple[Text, ...]:
         comments_cell(item),
         review_cell(item),
         Text(format_relative(item.pr.metrics.updated_at, now), style="dim"),
-    )
+    ]
+    if view == "review":
+        cells.insert(3, Text(item.pr.author, style="magenta"))
+    return tuple(cells)
 
 
-def render_summary(items: list[PrItem] | None, error: str | None) -> Text:
+def view_tabs(view: str) -> Text:
+    """The view switcher: every view's label, with the active one lit up."""
+    tabs = Text()
+    for i, name in enumerate(VIEWS):
+        if i:
+            tabs.append(" │ ", style="dim")
+        active = name == view
+        tabs.append(VIEW_LABELS[name], style="bold reverse cyan" if active else "dim")
+    return tabs
+
+
+def render_summary(items: list[PrItem] | None, error: str | None, view: str = "mine") -> Text:
     """The one-line counts bar docked at the top of the app."""
+    summary = view_tabs(view)
     if error is not None:
-        return Text(f"✖ {error}", style="bold red")
+        summary.append(f"   ✖ {error}", style="bold red")
+        return summary
     if items is None:
-        return Text("Contacting GitHub…", style="dim italic")
+        summary.append("   Contacting GitHub…", style="dim italic")
+        return summary
 
-    summary = Text()
-    summary.append("my-prs", style="bold cyan")
-    summary.append(f"  ·  {len(items)} open", style="bold")
+    noun = "to review" if view == "review" else "open"
+    summary.append(f"  ·  {len(items)} {noun}", style="bold")
     failing = sum(1 for i in items if i.failing)
     commented = sum(1 for i in items if i.open_threads)
     unreviewed = sum(1 for i in items if i.review_gap)
@@ -122,6 +147,7 @@ def render_detail_placeholder(
     error: str | None,
     *,
     loading: bool = False,
+    view: str = "mine",
 ) -> RenderableType:
     """What the detail pane shows when there is no selected PR to render."""
     if loading:
@@ -129,9 +155,12 @@ def render_detail_placeholder(
     elif error is not None:
         message = Text(error, style="red")
     elif not items:
-        message = Text(
-            "No open PRs of yours updated in this window. 🎉", style="green"
-        )
+        if view == "review":
+            message = Text("No PRs waiting on your review. 🎉", style="green")
+        else:
+            message = Text(
+                "No open PRs of yours updated in this window. 🎉", style="green"
+            )
     else:
         message = Text("Select a PR on the left.", style="dim")
     return Panel(Align.center(message), title="my-prs", border_style="cyan", padding=(1, 2))
@@ -139,6 +168,7 @@ def render_detail_placeholder(
 
 HELP_KEYS: tuple[tuple[str, str], ...] = (
     ("↑ / ↓", "Select a PR"),
+    ("v", "Switch view: your PRs ↔ PRs needing your review"),
     ("enter / o", "Open the selected PR in your browser"),
     ("tab", "Move focus between the list and the detail pane"),
     ("d", "Cycle the detail pane: right → below → hidden"),
@@ -148,7 +178,7 @@ HELP_KEYS: tuple[tuple[str, str], ...] = (
     ("q", "Quit"),
 )
 
-HELP_NOTE = "Layout and sizing are saved and restored on the next launch."
+HELP_NOTE = "Layout, sizing, and the active view are saved and restored on the next launch."
 
 
 def render_help() -> RenderableType:
@@ -167,7 +197,7 @@ def render_help() -> RenderableType:
     )
 
 
-def render_once(items: list[PrItem], now: datetime) -> RenderableType:
+def render_once(items: list[PrItem], now: datetime, view: str = "mine") -> RenderableType:
     """A single-shot snapshot of the whole list for `--once` / scripting."""
     table = Table(
         expand=True,
@@ -175,8 +205,8 @@ def render_once(items: list[PrItem], now: datetime) -> RenderableType:
         border_style="dim",
         padding=(0, 1),
     )
-    for column in LIST_COLUMNS:
+    for column in list_columns(view):
         table.add_column(column, no_wrap=column != "Title")
     for item in items:
-        table.add_row(*list_row(item, now))
-    return Group(render_summary(items, None), table)
+        table.add_row(*list_row(item, now, view))
+    return Group(render_summary(items, None, view), table)

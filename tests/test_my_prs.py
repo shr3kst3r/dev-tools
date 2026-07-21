@@ -88,6 +88,14 @@ def test_build_search_query_custom_author() -> None:
     assert "author:octocat" in build_search_query(7, now=NOW, author="octocat")
 
 
+def test_build_search_query_review_view() -> None:
+    q = build_search_query(14, now=NOW, view="review")
+    assert q == "is:pr is:open review-requested:@me updated:>=2026-07-01 sort:updated-desc"
+    assert "review-requested:octocat" in build_search_query(
+        7, now=NOW, author="octocat", view="review"
+    )
+
+
 # --- parsing --------------------------------------------------------------
 
 
@@ -222,6 +230,16 @@ def test_ci_cell_states() -> None:
     assert ui.ci_cell(_item(_make_pr(rollup=CheckState.UNKNOWN))).plain == "—"
 
 
+def test_list_row_review_view_adds_author_column() -> None:
+    item = _item(_make_pr())
+    mine = ui.list_row(item, NOW)
+    review = ui.list_row(item, NOW, "review")
+    assert len(mine) == len(ui.list_columns("mine"))
+    assert len(review) == len(ui.list_columns("review"))
+    author_index = ui.list_columns("review").index("Author")
+    assert review[author_index].plain == "me"
+
+
 def test_review_cell_states() -> None:
     assert ui.review_cell(_item(_make_pr(is_draft=True))).plain == "draft"
     assert (
@@ -268,6 +286,15 @@ def test_render_summary_counts() -> None:
     assert "1 ready" in text
 
 
+def test_render_summary_shows_view_tabs() -> None:
+    text = ui.render_summary([], None).plain
+    assert "My PRs" in text
+    assert "Needs my review" in text
+    assert "0 open" in text
+    review_text = ui.render_summary([_item(_make_pr())], None, "review").plain
+    assert "1 to review" in review_text
+
+
 def test_render_summary_error() -> None:
     assert "boom" in ui.render_summary(None, "boom").plain
 
@@ -282,6 +309,11 @@ def test_cli_defaults() -> None:
     assert args.limit == 50
     assert args.author == "@me"
     assert args.once is False
+    assert args.view is None  # None: fall back to the saved layout's view
+
+
+def test_cli_view_arg() -> None:
+    assert _parse_args(["--view", "review"]).view == "review"
 
 
 # --- the app ----------------------------------------------------------------
@@ -313,8 +345,27 @@ def _fleet() -> list[PrItem]:
     )
 
 
+def _review_fleet() -> list[PrItem]:
+    return [
+        _item(
+            _make_pr(9, title="Teammate PR", review_decision="REVIEW_REQUIRED"),
+            repo="example-org/backend",
+        )
+    ]
+
+
+def _data(
+    mine: list[PrItem] | None = None, review: list[PrItem] | None = None
+) -> dict[str, list[PrItem]]:
+    """A poll payload: both views' lists, defaulting to the standard fixtures."""
+    return {
+        "mine": _fleet() if mine is None else mine,
+        "review": _review_fleet() if review is None else review,
+    }
+
+
 async def test_app_lists_prs_and_shows_detail() -> None:
-    app = MyPrsApp(poll=lambda: (_fleet(), None), interval=60)
+    app = MyPrsApp(poll=lambda: (_data(), None), interval=60)
     async with app.run_test(size=(140, 40)) as pilot:
         await app.workers.wait_for_complete()
         await pilot.pause()
@@ -334,7 +385,7 @@ async def test_app_lists_prs_and_shows_detail() -> None:
 
 
 async def test_app_keeps_selection_across_refresh() -> None:
-    app = MyPrsApp(poll=lambda: (_fleet(), None), interval=60)
+    app = MyPrsApp(poll=lambda: (_data(), None), interval=60)
     async with app.run_test(size=(140, 40)) as pilot:
         await app.workers.wait_for_complete()
         await pilot.pause()
@@ -351,8 +402,8 @@ async def test_app_keeps_selection_across_refresh() -> None:
 
 
 async def test_app_error_keeps_last_good_list() -> None:
-    polls: list[tuple[list[PrItem] | None, str | None]] = [
-        (_fleet(), None),
+    polls: list[tuple[dict[str, list[PrItem]] | None, str | None]] = [
+        (_data(), None),
         (None, "GitHub exploded"),
     ]
     app = MyPrsApp(poll=lambda: polls.pop(0), interval=60)
@@ -371,7 +422,7 @@ async def test_app_error_keeps_last_good_list() -> None:
 
 
 async def test_app_empty_state() -> None:
-    app = MyPrsApp(poll=lambda: ([], None), interval=60)
+    app = MyPrsApp(poll=lambda: (_data(mine=[], review=[]), None), interval=60)
     async with app.run_test(size=(140, 40)) as pilot:
         await app.workers.wait_for_complete()
         await pilot.pause()
@@ -380,8 +431,88 @@ async def test_app_empty_state() -> None:
         assert "No open PRs" in detail
 
 
+# --- view switching -----------------------------------------------------------
+
+
+async def test_switch_view_swaps_list_and_selection() -> None:
+    app = MyPrsApp(poll=lambda: (_data(), None), interval=60)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        table = app.query_one(DataTable)
+        assert app._view == "mine"
+        assert table.row_count == 2
+        # Park the cursor off the top row so we can check it's remembered.
+        await pilot.press("down")
+        await pilot.pause()
+        assert app._selected_key == "example-org/dev-tools#1"
+
+        await pilot.press("v")
+        await pilot.pause()
+        assert app._view == "review"
+        assert table.row_count == 1
+        assert app._selected_key == "example-org/backend#9"
+        assert "Teammate PR" in _plain(app.query_one("#detail", Static))
+        assert "1 to review" in _plain(app.query_one("#summary", Static))
+        # The review view grows an Author column.
+        assert len(table.columns) == len(ui.list_columns("review"))
+
+        # Switching back restores the other view's selection.
+        await pilot.press("v")
+        await pilot.pause()
+        assert app._view == "mine"
+        assert app._selected_key == "example-org/dev-tools#1"
+        assert table.cursor_row == 1
+        assert len(table.columns) == len(ui.list_columns("mine"))
+
+
+async def test_review_view_empty_state() -> None:
+    app = MyPrsApp(poll=lambda: (_data(review=[]), None), interval=60)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("v")
+        await pilot.pause()
+        detail = _plain(app.query_one("#detail", Static))
+        assert "No PRs waiting on your review" in detail
+
+
+async def test_view_persisted_and_restored(tmp_path) -> None:
+    path = tmp_path / "layout.json"
+    app = MyPrsApp(poll=lambda: (_data(), None), interval=60, layout_path=path)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("v")
+        await pilot.pause()
+    assert layout.load(path).view == "review"
+
+    reopened = MyPrsApp(poll=lambda: (_data(), None), interval=60, layout_path=path)
+    async with reopened.run_test(size=(140, 40)) as pilot:
+        await reopened.workers.wait_for_complete()
+        await pilot.pause()
+        assert reopened._view == "review"
+        assert reopened.query_one(DataTable).row_count == 1
+
+
+async def test_initial_view_overrides_saved(tmp_path) -> None:
+    path = tmp_path / "layout.json"
+    layout.save(layout.Layout(view="review"), path)
+    app = MyPrsApp(
+        poll=lambda: (_data(), None),
+        interval=60,
+        layout_path=path,
+        initial_view="mine",
+    )
+    async with app.run_test(size=(140, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app._view == "mine"
+
+
 async def test_cycle_detail_moves_then_hides_pane() -> None:
-    app = MyPrsApp(poll=lambda: (_fleet(), None), interval=60)
+    app = MyPrsApp(poll=lambda: (_data(), None), interval=60)
     async with app.run_test(size=(140, 40)) as pilot:
         await app.workers.wait_for_complete()
         await pilot.pause()
@@ -418,7 +549,7 @@ async def test_cycle_detail_moves_then_hides_pane() -> None:
 
 
 async def test_help_overlay_opens_and_closes() -> None:
-    app = MyPrsApp(poll=lambda: (_fleet(), None), interval=60)
+    app = MyPrsApp(poll=lambda: (_data(), None), interval=60)
     async with app.run_test(size=(140, 40)) as pilot:
         await app.workers.wait_for_complete()
         await pilot.pause()
@@ -448,7 +579,7 @@ async def test_help_overlay_opens_and_closes() -> None:
 async def test_open_pr_uses_selected_url(monkeypatch) -> None:
     opened: list[str] = []
     monkeypatch.setattr("tools.my_prs.app.webbrowser.open", opened.append)
-    app = MyPrsApp(poll=lambda: (_fleet(), None), interval=60)
+    app = MyPrsApp(poll=lambda: (_data(), None), interval=60)
     async with app.run_test(size=(140, 40)) as pilot:
         await app.workers.wait_for_complete()
         await pilot.pause()
@@ -463,6 +594,9 @@ def test_layout_from_dict_defaults_bad_values() -> None:
     assert layout.from_dict(None) == layout.Layout()
     assert layout.from_dict({}) == layout.Layout()
     assert layout.from_dict({"detail_mode": "sideways", "split": "wide"}) == layout.Layout()
+    # An unknown view falls back to the default, like the other fields.
+    assert layout.from_dict({"view": "everything"}).view == "mine"
+    assert layout.from_dict({"view": "review"}).view == "review"
     # Booleans are ints in Python; they must not sneak in as a split.
     assert layout.from_dict({"split": True}).split == layout.SPLIT_DEFAULT
     # Out-of-range splits are clamped, not rejected.
@@ -472,7 +606,7 @@ def test_layout_from_dict_defaults_bad_values() -> None:
 
 def test_layout_save_load_roundtrip(tmp_path) -> None:
     path = tmp_path / "sub" / "layout.json"  # parent dir is created on save
-    saved = layout.Layout(detail_mode="below", split=35)
+    saved = layout.Layout(detail_mode="below", split=35, view="review")
     layout.save(saved, path)
     assert layout.load(path) == saved
 
@@ -486,7 +620,7 @@ def test_layout_load_missing_or_corrupt_file(tmp_path) -> None:
 
 async def test_resize_moves_divider_and_saves(tmp_path) -> None:
     path = tmp_path / "layout.json"
-    app = MyPrsApp(poll=lambda: (_fleet(), None), interval=60, layout_path=path)
+    app = MyPrsApp(poll=lambda: (_data(), None), interval=60, layout_path=path)
     async with app.run_test(size=(140, 40)) as pilot:
         await app.workers.wait_for_complete()
         await pilot.pause()
@@ -509,7 +643,7 @@ async def test_resize_moves_divider_and_saves(tmp_path) -> None:
 
 async def test_resize_is_noop_when_detail_hidden(tmp_path) -> None:
     path = tmp_path / "layout.json"
-    app = MyPrsApp(poll=lambda: (_fleet(), None), interval=60, layout_path=path)
+    app = MyPrsApp(poll=lambda: (_data(), None), interval=60, layout_path=path)
     async with app.run_test(size=(140, 40)) as pilot:
         await app.workers.wait_for_complete()
         await pilot.pause()
@@ -526,7 +660,7 @@ async def test_layout_restored_on_next_launch(tmp_path) -> None:
     path = tmp_path / "layout.json"
     layout.save(layout.Layout(detail_mode="below", split=30), path)
 
-    app = MyPrsApp(poll=lambda: (_fleet(), None), interval=60, layout_path=path)
+    app = MyPrsApp(poll=lambda: (_data(), None), interval=60, layout_path=path)
     async with app.run_test(size=(140, 40)) as pilot:
         await app.workers.wait_for_complete()
         await pilot.pause()
@@ -542,7 +676,7 @@ async def test_layout_restored_on_next_launch(tmp_path) -> None:
 
 async def test_app_without_layout_path_never_persists(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-    app = MyPrsApp(poll=lambda: (_fleet(), None), interval=60)
+    app = MyPrsApp(poll=lambda: (_data(), None), interval=60)
     async with app.run_test(size=(140, 40)) as pilot:
         await app.workers.wait_for_complete()
         await pilot.pause()

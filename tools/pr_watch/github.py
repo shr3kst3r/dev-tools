@@ -104,6 +104,17 @@ class GitHubError(RuntimeError):
     """A user-actionable problem talking to git or gh."""
 
 
+def _display_command(args: list[str]) -> str:
+    """A readable one-line form of a command for error messages.
+
+    GraphQL calls pass the whole query as a single `-f query=…` argument —
+    hundreds of characters that would otherwise swamp the error (and any UI
+    showing it). Long arguments are truncated so the command stays legible.
+    """
+    parts = [a if len(a) <= 60 else a[:57] + "…" for a in args]
+    return " ".join(parts)
+
+
 def _run(args: list[str], cwd: Path) -> str:
     try:
         proc = subprocess.run(
@@ -117,7 +128,7 @@ def _run(args: list[str], cwd: Path) -> str:
         raise GitHubError(f"`{args[0]}` is not installed or not on PATH.") from exc
     except subprocess.CalledProcessError as exc:
         msg = (exc.stderr or exc.stdout or "").strip()
-        raise GitHubError(f"`{' '.join(args)}` failed: {msg}") from exc
+        raise GitHubError(f"`{_display_command(args)}` failed: {msg}") from exc
     return proc.stdout
 
 

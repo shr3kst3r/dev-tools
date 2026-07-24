@@ -1,14 +1,18 @@
 """GitHub access for my-prs, via the `gh` CLI (reuses the user's auth).
 
-One GraphQL *search* query per view fetches the recent PRs — authored by the
-user ("mine") or awaiting the user's review ("review") — with the same per-PR
-fields pr-watch uses. The hard parsing is delegated to pr-watch's pure
-`parse_pull_request`; this module only wraps each node with its repo/branch.
+A single GraphQL request fetches *both* views at once — the PRs authored by the
+user ("mine") and those awaiting the user's review ("review") — as two aliased
+`search` fields sharing one PR-fields fragment. One request per poll (instead
+of one per view) keeps the tool well under GitHub's rate limits. The hard
+parsing is delegated to pr-watch's pure `parse_pull_request`; this module only
+wraps each node with its repo/branch and turns `gh` failures into concise,
+actionable errors the dashboard can act on.
 """
 
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -16,9 +20,18 @@ from pathlib import Path
 # tools report git/gh failures identically.
 from tools.pr_watch.github import GitHubError, _run, parse_pull_request, require_gh
 
-from .models import PrItem
+from .models import VIEWS, PrItem
 
-__all__ = ["GitHubError", "require_gh", "build_search_query", "fetch_prs", "parse_search"]
+__all__ = [
+    "GitHubError",
+    "PollError",
+    "require_gh",
+    "build_search_query",
+    "classify_github_error",
+    "fetch_all_views",
+    "fetch_prs",
+    "parse_search",
+]
 
 # How each view narrows the search: whose PRs, relative to `author`.
 # `review-requested` clears once you submit a review, so the review view
@@ -31,72 +44,50 @@ _VIEW_QUALIFIERS = {
 # The per-PR selection mirrors pr-watch's _PR_QUERY (parse_pull_request reads
 # this exact shape), plus repository/headRefName so the list can say where
 # each PR lives. Comments are trimmed to the first one per thread — the list
-# view only shows who opened the thread and the total count.
-_SEARCH_QUERY = """
-query($q: String!, $limit: Int!) {
-  search(query: $q, type: ISSUE, first: $limit) {
-    issueCount
+# view only shows who opened the thread and the total count. Kept as a shared
+# fragment so both the single-view and combined-views queries select the same
+# fields without duplicating ~60 lines.
+_PR_FIELDS = """
+fragment PrFields on PullRequest {
+  repository { nameWithOwner }
+  headRefName
+  number
+  title
+  url
+  isDraft
+  author { login }
+  additions
+  deletions
+  changedFiles
+  createdAt
+  updatedAt
+  reviewDecision
+  mergeable
+  latestOpinionatedReviews(first: 100) {
+    nodes { state }
+  }
+  commits(last: 1) {
+    totalCount
     nodes {
-      ... on PullRequest {
-        repository { nameWithOwner }
-        headRefName
-        number
-        title
-        url
-        isDraft
-        author { login }
-        additions
-        deletions
-        changedFiles
-        createdAt
-        updatedAt
-        reviewDecision
-        mergeable
-        latestOpinionatedReviews(first: 100) {
-          nodes { state }
-        }
-        commits(last: 1) {
-          totalCount
-          nodes {
-            commit {
-              statusCheckRollup {
-                state
-                contexts(first: 100) {
-                  nodes {
-                    __typename
-                    ... on CheckRun {
-                      name
-                      status
-                      conclusion
-                      detailsUrl
-                      startedAt
-                      completedAt
-                    }
-                    ... on StatusContext {
-                      context
-                      state
-                      targetUrl
-                      createdAt
-                    }
-                  }
-                }
+      commit {
+        statusCheckRollup {
+          state
+          contexts(first: 100) {
+            nodes {
+              __typename
+              ... on CheckRun {
+                name
+                status
+                conclusion
+                detailsUrl
+                startedAt
+                completedAt
               }
-            }
-          }
-        }
-        reviewThreads(first: 100) {
-          nodes {
-            isResolved
-            isOutdated
-            comments(first: 1) {
-              totalCount
-              nodes {
-                author { login }
-                body
-                path
-                line
-                originalLine
-                url
+              ... on StatusContext {
+                context
+                state
+                targetUrl
+                createdAt
               }
             }
           }
@@ -104,8 +95,112 @@ query($q: String!, $limit: Int!) {
       }
     }
   }
+  reviewThreads(first: 100) {
+    nodes {
+      isResolved
+      isOutdated
+      comments(first: 1) {
+        totalCount
+        nodes {
+          author { login }
+          body
+          path
+          line
+          originalLine
+          url
+        }
+      }
+    }
+  }
 }
 """
+
+# One view, one search — used by the `--once` snapshot.
+_SEARCH_QUERY = (
+    _PR_FIELDS
+    + """
+query($q: String!, $limit: Int!) {
+  search(query: $q, type: ISSUE, first: $limit) {
+    nodes { ...PrFields }
+  }
+}
+"""
+)
+
+# Both views in one request: two aliased searches sharing the fragment. Halving
+# the per-poll request count is the main defense against GitHub's rate limits.
+_MULTI_SEARCH_QUERY = (
+    _PR_FIELDS
+    + """
+query($mine: String!, $review: String!, $limit: Int!) {
+  mine: search(query: $mine, type: ISSUE, first: $limit) {
+    nodes { ...PrFields }
+  }
+  review: search(query: $review, type: ISSUE, first: $limit) {
+    nodes { ...PrFields }
+  }
+}
+"""
+)
+
+
+@dataclass(frozen=True, slots=True)
+class PollError:
+    """A classified failure from a poll, ready for the UI to show and act on.
+
+    `message` is a concise, user-facing line (never the raw `gh` command).
+    `rate_limited` marks the case worth backing off for, and `retry_after` is
+    the server's requested wait in seconds when it gave one.
+    """
+
+    message: str
+    rate_limited: bool = False
+    retry_after: int | None = None
+
+
+def _extract_retry_after(text: str) -> int | None:
+    """Pull a `Retry-After: N` hint out of a gh error, if present."""
+    marker = "retry-after:"
+    lowered = text.lower()
+    if marker not in lowered:
+        return None
+    tail = text[lowered.index(marker) + len(marker) :].strip()
+    digits = ""
+    for ch in tail:
+        if ch.isdigit():
+            digits += ch
+        else:
+            break
+    return int(digits) if digits else None
+
+
+def classify_github_error(exc: GitHubError) -> PollError:
+    """Turn a raw `gh`/GraphQL failure into a concise, actionable PollError.
+
+    The raw text may be a truncated `<command> failed: <gh message>` or a
+    `GitHub GraphQL error: <messages>`; we key off the gh message tail so the
+    command noise never reaches the dashboard.
+    """
+    raw = str(exc)
+    tail = raw.split("failed:", 1)[1].strip() if "failed:" in raw else raw
+    low = tail.lower()
+    if "rate limit" in low or "secondary rate" in low or "abuse detection" in low:
+        return PollError(
+            message="GitHub API rate limit hit — backing off before retrying.",
+            rate_limited=True,
+            retry_after=_extract_retry_after(tail),
+        )
+    if (
+        "bad credentials" in low
+        or "gh auth" in low
+        or "authentication" in low
+        or "401" in low
+        or "requires authentication" in low
+    ):
+        return PollError(
+            message="GitHub authentication failed — run `gh auth login`."
+        )
+    return PollError(message=tail or raw)
 
 
 def build_search_query(
@@ -115,6 +210,17 @@ def build_search_query(
     since = (now - timedelta(days=days)).date().isoformat()
     who = _VIEW_QUALIFIERS[view].format(author=author)
     return f"is:pr is:open {who} updated:>={since} sort:updated-desc"
+
+
+def _graphql(args: list[str], cwd: Path | None) -> dict:
+    """Run a `gh api graphql` call and return its parsed `data`, raising a
+    GitHubError for any GraphQL-level errors in the response."""
+    raw = _run(["gh", "api", "graphql", *args], cwd or Path.cwd())
+    payload = json.loads(raw)
+    if payload.get("errors"):
+        messages = "; ".join(e.get("message", "?") for e in payload["errors"])
+        raise GitHubError(f"GitHub GraphQL error: {messages}")
+    return payload.get("data") or {}
 
 
 def fetch_prs(
@@ -128,11 +234,8 @@ def fetch_prs(
     query = build_search_query(
         days, now=datetime.now(timezone.utc), author=author, view=view
     )
-    raw = _run(
+    data = _graphql(
         [
-            "gh",
-            "api",
-            "graphql",
             "-f",
             f"query={_SEARCH_QUERY}",
             "-f",
@@ -140,15 +243,41 @@ def fetch_prs(
             "-F",
             f"limit={limit}",
         ],
-        cwd or Path.cwd(),
+        cwd,
     )
-    payload = json.loads(raw)
-    if payload.get("errors"):
-        messages = "; ".join(e.get("message", "?") for e in payload["errors"])
-        raise GitHubError(f"GitHub GraphQL error: {messages}")
+    return parse_search((data.get("search") or {}).get("nodes") or [])
 
-    nodes = payload.get("data", {}).get("search", {}).get("nodes") or []
-    return parse_search(nodes)
+
+def fetch_all_views(
+    days: int,
+    limit: int,
+    author: str = "@me",
+    cwd: Path | None = None,
+) -> dict[str, list[PrItem]]:
+    """Fetch every view's PRs in a single GraphQL request.
+
+    Returns `{view: items}` for each view in `VIEWS`. One request per poll
+    (rather than one per view) keeps the tool comfortably under GitHub's rate
+    limits, which is what makes the dashboard's fast refresh sustainable.
+    """
+    now = datetime.now(timezone.utc)
+    data = _graphql(
+        [
+            "-f",
+            f"query={_MULTI_SEARCH_QUERY}",
+            "-f",
+            f"mine={build_search_query(days, now, author, 'mine')}",
+            "-f",
+            f"review={build_search_query(days, now, author, 'review')}",
+            "-F",
+            f"limit={limit}",
+        ],
+        cwd,
+    )
+    return {
+        view: parse_search((data.get(view) or {}).get("nodes") or [])
+        for view in VIEWS
+    }
 
 
 def parse_search(nodes: list[dict]) -> list[PrItem]:

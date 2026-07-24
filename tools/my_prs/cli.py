@@ -19,7 +19,13 @@ from rich.console import Console
 from . import ui
 from .app import MyPrsApp, PollResult
 from .layout import state_path
-from .github import GitHubError, fetch_prs, require_gh
+from .github import (
+    GitHubError,
+    classify_github_error,
+    fetch_all_views,
+    fetch_prs,
+    require_gh,
+)
 from .models import VIEWS, sort_items
 
 
@@ -84,15 +90,11 @@ def main(argv: list[str] | None = None) -> int:
 
     def poll() -> PollResult:
         try:
-            data = {
-                view: sort_items(
-                    fetch_prs(view, days=days, limit=limit, author=args.author)
-                )
-                for view in VIEWS
-            }
+            views = fetch_all_views(days=days, limit=limit, author=args.author)
+            data = {view: sort_items(items) for view, items in views.items()}
             return data, None
         except GitHubError as exc:
-            return None, str(exc)
+            return None, classify_github_error(exc)
 
     if args.once:
         view = args.view or VIEWS[0]

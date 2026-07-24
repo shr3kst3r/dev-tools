@@ -20,6 +20,19 @@ VIEW_LABELS = {"mine": "My PRs", "review": "Needs my review"}
 
 
 @dataclass(frozen=True, slots=True)
+class LogEntry:
+    """One line in the activity log: what a background poll did and when.
+
+    `level` is one of "info" (a normal refresh), "warn" (rate-limit backoff),
+    or "error" (a failed poll). The dashboard's `l` overlay renders these.
+    """
+
+    time: datetime
+    level: str
+    message: str
+
+
+@dataclass(frozen=True, slots=True)
 class PrItem:
     """One PR in the dashboard list."""
 

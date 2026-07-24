@@ -18,7 +18,7 @@ from rich.text import Text
 from tools.pr_watch.models import CheckState
 from tools.pr_watch.ui import format_relative
 
-from .models import VIEW_LABELS, VIEWS, PrItem
+from .models import VIEW_LABELS, VIEWS, LogEntry, PrItem
 
 # The review view adds an Author column — whose PR you're being asked to
 # review — right where "mine" needs none (they're all yours).
@@ -166,6 +166,48 @@ def render_detail_placeholder(
     return Panel(Align.center(message), title="my-prs", border_style="cyan", padding=(1, 2))
 
 
+# The activity log's per-level glyph and style, keyed by LogEntry.level.
+_LOG_LEVELS = {
+    "info": ("·", "dim"),
+    "warn": ("▲", "yellow"),
+    "error": ("✖", "bold red"),
+}
+
+
+def render_log(entries: list[LogEntry]) -> RenderableType:
+    """The `l` overlay: every background poll's outcome, newest first.
+
+    This is the window into what the dashboard has been doing on its own —
+    each refresh's PR counts, and any rate-limit backoffs or failures — so a
+    quiet-looking dashboard is never a mystery.
+    """
+    if not entries:
+        body: RenderableType = Text(
+            "No activity yet — background polls will appear here.",
+            style="dim italic",
+        )
+    else:
+        table = Table(show_header=False, box=None, padding=(0, 1), expand=True)
+        table.add_column(justify="right", style="dim", no_wrap=True)  # time
+        table.add_column(no_wrap=True)  # level glyph
+        table.add_column(ratio=1)  # message
+        for entry in reversed(entries):  # newest first
+            glyph, style = _LOG_LEVELS.get(entry.level, ("·", "dim"))
+            table.add_row(
+                entry.time.strftime("%H:%M:%S"),
+                Text(glyph, style=style),
+                Text(entry.message, style=style if entry.level != "info" else ""),
+            )
+        body = table
+    return Panel(
+        body,
+        title=Text("Activity log", style="bold"),
+        subtitle=Text("l / esc to close", style="dim"),
+        border_style="cyan",
+        padding=(1, 2),
+    )
+
+
 HELP_KEYS: tuple[tuple[str, str], ...] = (
     ("↑ / ↓", "Select a PR"),
     ("v", "Switch view: your PRs ↔ PRs needing your review"),
@@ -173,6 +215,7 @@ HELP_KEYS: tuple[tuple[str, str], ...] = (
     ("tab", "Move focus between the list and the detail pane"),
     ("d", "Cycle the detail pane: right → below → hidden"),
     ("[ / ]", "Resize the windows: shrink / grow the list"),
+    ("l", "Show / hide the activity log"),
     ("r", "Refresh now"),
     ("?", "Show / hide this help"),
     ("q", "Quit"),

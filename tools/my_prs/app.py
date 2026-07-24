@@ -12,8 +12,14 @@ PR exactly as pr-watch would render it — checks, unresolved threads, metrics.
 `[` / `]` move the divider to resize the two windows. These and the active
 view are remembered in a state file (see layout.py) when the app is given a
 `layout_path`, so the dashboard reopens the way you left it.
-`?` floats a keybinding reference over the dashboard. A summary bar is docked
-at the top, the refresh status bar at the bottom.
+`?` floats a keybinding reference over the dashboard, and `l` floats a live
+activity log of every background poll — its PR counts, and any rate-limit
+backoffs or failures. A summary bar is docked at the top, the refresh status
+bar at the bottom.
+
+Polling is resilient: all views are fetched in one request, errors are shown
+as concise one-liners (never a raw command dump), and a rate limit triggers an
+exponential backoff instead of hammering the API on the normal cadence.
 
 Rendering stays in ui.py (list cells, summary) and pr_watch.ui (detail pane)
 as pure Rich renderables; this module only owns the polling loop, the
@@ -25,7 +31,7 @@ from __future__ import annotations
 import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, cast
 
 from textual.app import App, ComposeResult
 from textual.containers import Container, VerticalScroll
@@ -36,14 +42,24 @@ from tools.pr_watch import ui as pr_ui
 
 from . import layout as layout_state
 from . import ui
+from .github import PollError
 from .layout import DETAIL_MODES, SPLIT_STEP, Layout
-from .models import VIEWS, PrItem
+from .models import VIEWS, LogEntry, PrItem
 
 # What one poll of GitHub yields: ({view: items}, None) on success — every
 # view's list in one poll, so switching views never waits on the network —
-# or (None, error message) on failure.
+# or (None, PollError) on failure.
 ViewData = dict[str, list[PrItem]]
-PollResult = tuple[ViewData | None, str | None]
+PollResult = tuple[ViewData | None, PollError | None]
+
+# When GitHub reports a rate limit, we stop polling on the normal cadence and
+# back off exponentially — doubling from the base interval up to this ceiling —
+# so the dashboard never turns a rate limit into a worse one. A successful poll
+# resets the backoff immediately.
+MAX_BACKOFF_SECONDS = 900
+
+# How many activity-log lines to keep in memory (a rolling tail).
+MAX_LOG_ENTRIES = 200
 
 
 class HelpScreen(ModalScreen[None]):
@@ -68,6 +84,38 @@ class HelpScreen(ModalScreen[None]):
         self.dismiss()
 
 
+class LogScreen(ModalScreen[None]):
+    """The `l` overlay: a scrollable, live activity log of background polls."""
+
+    BINDINGS = [("escape,q,l", "dismiss_log", "Close")]
+
+    CSS = """
+    LogScreen {
+        align: center middle;
+    }
+    LogScreen #log-box {
+        width: 80%;
+        height: 80%;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="log-box"):
+            yield Static(id="log-content")
+
+    def on_mount(self) -> None:
+        self.refresh_log()
+
+    def refresh_log(self) -> None:
+        """Re-render from the app's log — called on open and on every poll,
+        so the log stays live while it's on screen."""
+        app = cast("MyPrsApp", self.app)
+        self.query_one("#log-content", Static).update(ui.render_log(app.activity_log))
+
+    def action_dismiss_log(self) -> None:
+        self.dismiss()
+
+
 class MyPrsApp(App[None]):
     BINDINGS = [
         ("q", "quit", "Quit"),
@@ -77,6 +125,7 @@ class MyPrsApp(App[None]):
         ("d", "cycle_detail", "Move/hide detail"),
         ("left_square_bracket", "shrink_list", "Shrink list window"),
         ("right_square_bracket", "grow_list", "Grow list window"),
+        ("l", "toggle_log", "Activity log"),
         ("question_mark", "help", "Help"),
     ]
 
@@ -136,8 +185,14 @@ class MyPrsApp(App[None]):
         self._poll = poll
         self._interval = interval
         self._seconds_left = interval
+        # The delay currently counting down: the base interval, or a longer
+        # backoff after a rate limit. Shown in the footer and reset each poll.
+        self._current_delay = interval
+        self._rate_limit_streak = 0
         self._data: ViewData | None = None  # None until the first poll lands
-        self._error: str | None = None
+        self._error: PollError | None = None
+        # A rolling log of what each background poll did, for the `l` overlay.
+        self._activity_log: list[LogEntry] = []
         # Each view keeps its own cursor, so flipping back lands where you were.
         self._selected: dict[str, str | None] = {view: None for view in VIEWS}
         self._updated = datetime.now()
@@ -150,6 +205,14 @@ class MyPrsApp(App[None]):
         self._detail_mode = saved.detail_mode
         self._split = saved.split
         self._view = initial_view if initial_view in VIEWS else saved.view
+
+    @property
+    def activity_log(self) -> list[LogEntry]:
+        """The activity log, read by the `l` overlay (LogScreen.refresh_log).
+
+        Not named `log`: that's a reserved Textual `App` property (the logger).
+        """
+        return self._activity_log
 
     @property
     def _items(self) -> list[PrItem] | None:
@@ -196,15 +259,53 @@ class MyPrsApp(App[None]):
         data, error = self._poll()
         self.call_from_thread(self._apply_poll, data, error)
 
-    def _apply_poll(self, data: ViewData | None, error: str | None) -> None:
+    def _apply_poll(self, data: ViewData | None, error: PollError | None) -> None:
         self._error = error
         if data is not None:  # keep showing the last good lists through errors
             self._data = data
         self._updated = datetime.now()
-        self._seconds_left = self._interval
+        self._current_delay = self._delay_after(error)
+        self._seconds_left = self._current_delay
         self._polling = False
+        self._record_poll(data, error)
         self._rebuild_table()
         self._refresh_view()
+
+    def _delay_after(self, error: PollError | None) -> int:
+        """Seconds until the next poll. Normal polls use the configured
+        interval; a rate limit backs off exponentially (capped) so we stop
+        hammering an API that's already pushing back. Anything else resets."""
+        if error is not None and error.rate_limited:
+            self._rate_limit_streak += 1
+            base = error.retry_after or self._interval * 2 ** (
+                self._rate_limit_streak - 1
+            )
+            return min(base, MAX_BACKOFF_SECONDS)
+        self._rate_limit_streak = 0
+        return self._interval
+
+    def _record_poll(self, data: ViewData | None, error: PollError | None) -> None:
+        """Append one activity-log line summarizing this poll's outcome."""
+        if error is None:
+            counts = " · ".join(
+                f"{len((data or {}).get(view, []))} {view}" for view in VIEWS
+            )
+            self._append_log("info", f"Refreshed — {counts}")
+        elif error.rate_limited:
+            self._append_log(
+                "warn", f"{error.message} Next try in {self._current_delay}s."
+            )
+        else:
+            self._append_log("error", error.message)
+
+    def _append_log(self, level: str, message: str) -> None:
+        self._activity_log.append(
+            LogEntry(time=datetime.now(), level=level, message=message)
+        )
+        if len(self._activity_log) > MAX_LOG_ENTRIES:
+            del self._activity_log[: -MAX_LOG_ENTRIES]
+        if isinstance(self.screen, LogScreen):
+            self.screen.refresh_log()  # keep an open log overlay live
 
     def _tick(self) -> None:
         if not self._polling:
@@ -321,27 +422,34 @@ class MyPrsApp(App[None]):
         if not isinstance(self.screen, HelpScreen):
             self.push_screen(HelpScreen())
 
+    def action_toggle_log(self) -> None:
+        if isinstance(self.screen, LogScreen):
+            self.screen.dismiss()
+        else:
+            self.push_screen(LogScreen())
+
     # --- rendering ---------------------------------------------------------
 
     def _refresh_view(self) -> None:
         loading = self._items is None and self._error is None
+        error_message = self._error.message if self._error is not None else None
         self.query_one("#summary", Static).update(
-            ui.render_summary(self._items, self._error, self._view)
+            ui.render_summary(self._items, error_message, self._view)
         )
         item = self._selected_item()
         if item is not None:
             detail = pr_ui.render_body(item.pr, None, item.ctx)
         else:
             detail = ui.render_detail_placeholder(
-                self._items, self._error, loading=loading, view=self._view
+                self._items, error_message, loading=loading, view=self._view
             )
         self.query_one("#detail", Static).update(detail)
         self.query_one("#status", Static).update(
             pr_ui.render_footer(
                 self._updated,
                 max(0, self._seconds_left),
-                self._interval,
+                self._current_delay,
                 refreshing=self._polling,
-                quit_hint="q quit · v view · r refresh · ↑↓ select · enter/o open · [ ] resize · ? help",
+                quit_hint="q quit · v view · r refresh · o open · l log · [ ] resize · ? help",
             )
         )

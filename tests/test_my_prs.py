@@ -9,9 +9,15 @@ from rich.console import Console
 from textual.widgets import DataTable, Static
 
 from tools.my_prs import layout, ui
-from tools.my_prs.app import HelpScreen, MyPrsApp
+from tools.my_prs.app import HelpScreen, LogScreen, MyPrsApp
 from tools.my_prs.cli import _parse_args
-from tools.my_prs.github import build_search_query, parse_search
+from tools.my_prs.github import (
+    GitHubError,
+    PollError,
+    build_search_query,
+    classify_github_error,
+    parse_search,
+)
 from tools.my_prs.models import PrItem, sort_items
 from tools.pr_watch.models import Check, CheckState, PRMetrics, PullRequest
 
@@ -94,6 +100,81 @@ def test_build_search_query_review_view() -> None:
     assert "review-requested:octocat" in build_search_query(
         7, now=NOW, author="octocat", view="review"
     )
+
+
+# --- error classification -------------------------------------------------
+
+
+def test_classify_rate_limit_is_concise_and_backs_off() -> None:
+    # The raw error embeds the whole gh command; classification must drop it.
+    raw = GitHubError(
+        "`gh api graphql -f query=query($q: String!, $limit: Int!) {…` failed: "
+        "gh: API rate limit exceeded for user ID 114263."
+    )
+    err = classify_github_error(raw)
+    assert err.rate_limited is True
+    assert "rate limit" in err.message.lower()
+    assert "gh api graphql" not in err.message  # no command dump reaches the UI
+
+
+def test_classify_rate_limit_reads_retry_after() -> None:
+    err = classify_github_error(
+        GitHubError("`gh api …` failed: secondary rate limit. Retry-After: 45 seconds")
+    )
+    assert err.rate_limited is True
+    assert err.retry_after == 45
+
+
+def test_classify_auth_error() -> None:
+    err = classify_github_error(
+        GitHubError("`gh api …` failed: gh: Bad credentials (HTTP 401)")
+    )
+    assert err.rate_limited is False
+    assert "gh auth login" in err.message
+
+
+def test_classify_generic_error_keeps_gh_message_only() -> None:
+    err = classify_github_error(
+        GitHubError("`gh api graphql -f query=…` failed: gh: something went wrong")
+    )
+    assert err.rate_limited is False
+    assert err.message == "gh: something went wrong"
+
+
+def test_classify_graphql_rate_limit() -> None:
+    # GraphQL-level errors come through without a "failed:" prefix.
+    err = classify_github_error(
+        GitHubError("GitHub GraphQL error: API rate limit exceeded")
+    )
+    assert err.rate_limited is True
+
+
+def test_fetch_all_views_one_request_both_views(monkeypatch) -> None:
+    import json
+
+    from tools.my_prs import github as gh
+
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(args: list[str], cwd) -> str:
+        captured["args"] = args
+        return json.dumps(
+            {
+                "data": {
+                    "mine": {"nodes": [_search_node(1)]},
+                    "review": {"nodes": [_search_node(2), _search_node(3)]},
+                }
+            }
+        )
+
+    monkeypatch.setattr(gh, "_run", fake_run)
+    views = gh.fetch_all_views(days=14, limit=50)
+    assert [i.pr.number for i in views["mine"]] == [1]
+    assert [i.pr.number for i in views["review"]] == [2, 3]
+    # A single gh graphql call carries both searches (one request per poll).
+    assert captured["args"][:3] == ["gh", "api", "graphql"]
+    joined = " ".join(captured["args"])
+    assert "mine=" in joined and "review=" in joined
 
 
 # --- parsing --------------------------------------------------------------
@@ -299,6 +380,27 @@ def test_render_summary_error() -> None:
     assert "boom" in ui.render_summary(None, "boom").plain
 
 
+def test_render_log_empty_and_with_entries() -> None:
+    from tools.my_prs.models import LogEntry
+
+    empty = Console(width=80)
+    with empty.capture() as cap:
+        empty.print(ui.render_log([]))
+    assert "No activity yet" in cap.get()
+
+    entries = [
+        LogEntry(time=NOW, level="info", message="Refreshed — 2 mine · 1 review"),
+        LogEntry(time=NOW, level="warn", message="rate limit — backing off"),
+    ]
+    console = Console(width=80)
+    with console.capture() as cap:
+        console.print(ui.render_log(entries))
+    out = cap.get()
+    assert "Refreshed" in out
+    assert "rate limit" in out
+    assert "Activity log" in out
+
+
 # --- cli -------------------------------------------------------------------
 
 
@@ -402,9 +504,9 @@ async def test_app_keeps_selection_across_refresh() -> None:
 
 
 async def test_app_error_keeps_last_good_list() -> None:
-    polls: list[tuple[dict[str, list[PrItem]] | None, str | None]] = [
+    polls: list[tuple[dict[str, list[PrItem]] | None, PollError | None]] = [
         (_data(), None),
-        (None, "GitHub exploded"),
+        (None, PollError(message="GitHub exploded")),
     ]
     app = MyPrsApp(poll=lambda: polls.pop(0), interval=60)
     async with app.run_test(size=(140, 40)) as pilot:
@@ -419,6 +521,84 @@ async def test_app_error_keeps_last_good_list() -> None:
         assert app.query_one(DataTable).row_count == 2
         summary = app.query_one("#summary", Static)
         assert "GitHub exploded" in _plain(summary)
+
+
+async def test_app_backs_off_then_recovers_on_rate_limit() -> None:
+    polls: list[tuple[dict[str, list[PrItem]] | None, PollError | None]] = [
+        (_data(), None),
+        (None, PollError(message="rate limited", rate_limited=True)),
+        (None, PollError(message="rate limited", rate_limited=True)),
+        (_data(), None),
+    ]
+    app = MyPrsApp(poll=lambda: polls.pop(0), interval=60)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app._current_delay == 60  # normal cadence after a clean poll
+
+        app.action_poll_now()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app._current_delay == 60  # first rate-limit hit: interval * 2**0
+
+        app.action_poll_now()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app._current_delay == 120  # second consecutive hit doubles
+
+        app.action_poll_now()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app._current_delay == 60  # a good poll resets the backoff
+
+
+async def test_app_backoff_respects_retry_after_and_caps() -> None:
+    app = MyPrsApp(
+        poll=lambda: (None, PollError("slow down", rate_limited=True, retry_after=99999)),
+        interval=60,
+    )
+    async with app.run_test(size=(140, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        # retry_after is honored but capped at the 15-minute ceiling.
+        assert app._current_delay == 900
+
+
+async def test_app_logs_each_poll() -> None:
+    polls: list[tuple[dict[str, list[PrItem]] | None, PollError | None]] = [
+        (_data(), None),
+        (None, PollError(message="rate limited", rate_limited=True)),
+    ]
+    app = MyPrsApp(poll=lambda: polls.pop(0), interval=60)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert len(app.activity_log) == 1
+        assert app.activity_log[0].level == "info"
+        assert "2 mine" in app.activity_log[0].message and "1 review" in app.activity_log[0].message
+
+        app.action_poll_now()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app.activity_log[-1].level == "warn"
+        assert "rate limited" in app.activity_log[-1].message
+
+
+async def test_log_overlay_opens_and_closes_and_is_live() -> None:
+    app = MyPrsApp(poll=lambda: (_data(), None), interval=60)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        await pilot.press("l")
+        await pilot.pause()
+        assert isinstance(app.screen, LogScreen)
+        content = _plain(app.screen.query_one("#log-content", Static))
+        assert "Refreshed" in content  # the first poll's line is visible
+
+        await pilot.press("l")
+        await pilot.pause()
+        assert not isinstance(app.screen, LogScreen)
 
 
 async def test_app_empty_state() -> None:

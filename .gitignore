@@ -11,3 +11,8 @@ __pycache__/
 # OS / editor
 .DS_Store
 *.swp
+
+# ephemeral rpi / adr-rpi artifacts (research.md, plan.md, implementation.md)
+.rpi/
+.adr-rpi/
+.context/

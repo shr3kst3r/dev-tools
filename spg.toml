@@ -40,3 +40,40 @@ args = [
     { name = "message", description = "the message to send (default: read from stdin)" },
     { name = "--quiet", description = "send silently, no confirmation output" },
 ]
+
+# --- links: publish this repo's skills and agents to Claude Code --------------
+#
+# `spg install` / `sync` creates these symlinks (and `uninstall` removes them),
+# so the skills work in every session rather than only when the shell is inside
+# this repo. `source` is repo-relative and points at the real top-level file —
+# never at the `.claude/` bridge symlink, so nothing resolves through two hops.
+#
+# A `target` ending in `/` links *into* that directory using the table name as
+# the leaf. The agents need the explicit form instead, because Claude Code only
+# reads `.md` files out of an agents directory and the table name carries no
+# extension.
+
+[links.slack-me]
+source = "skills/slack-me"
+target = "~/.claude/skills/"
+description = "slack-me skill: ping yourself on Slack, plus the Slack mrkdwn reference"
+
+[links.adr-rpi]
+source = "skills/adr-rpi"
+target = "~/.claude/skills/"
+description = "adr-rpi skill: Research → Plan → Implement with ADRs as the durable memory layer"
+
+[links.adr-format]
+source = "skills/adr-format"
+target = "~/.claude/skills/"
+description = "adr-format skill: ADR format spec + significance bar, preloaded into the adr-rpi subagents"
+
+[links.adr-implementer]
+source = "agents/adr-implementer.md"
+target = "~/.claude/agents/adr-implementer.md"
+description = "adr-rpi implement phase subagent (Opus) — adr-rpi cannot run its implement phase without it"
+
+[links.adr-reviewer]
+source = "agents/adr-reviewer.md"
+target = "~/.claude/agents/adr-reviewer.md"
+description = "adr-rpi review phase subagent (Opus, xhigh effort) — adr-rpi cannot run its review phase without it"

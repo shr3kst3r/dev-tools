@@ -34,6 +34,7 @@ from tools.airflow_watch.app import (
     HelpScreen,
     ImportErrorScreen,
     LogScreen,
+    MenuScreen,
 )
 from tools.airflow_watch.astro import AstroError, PollError
 from tools.airflow_watch.cli import _parse_args, _plain_deployment, _states
@@ -2904,6 +2905,131 @@ def test_render_chart_says_when_nothing_can_be_placed() -> None:
     assert "No task instance has started yet" in text
 
 
+# --- the in-flight chart ----------------------------------------------------
+
+
+def test_in_flight_counts_counts_overlapping_spans() -> None:
+    spans = (
+        # Done inside the first quarter of the window.
+        (NOW - timedelta(hours=4), NOW - timedelta(minutes=210)),
+        # Started mid-window, still going: runs through to `now`.
+        (NOW - timedelta(minutes=150), None),
+        # Overlaps the still-running span across the last two buckets.
+        (NOW - timedelta(hours=2), NOW - timedelta(hours=1)),
+        # Never started: was never in flight.
+        (None, NOW),
+    )
+    assert ui.in_flight_counts(spans, NOW, buckets=4) == [1, 1, 2, 2]
+
+
+def test_in_flight_counts_without_started_spans_is_empty() -> None:
+    assert ui.in_flight_counts((), NOW, buckets=3) == [0, 0, 0]
+    assert ui.in_flight_counts(((None, None),), NOW, buckets=3) == [0, 0, 0]
+
+
+def test_in_flight_counts_single_instant_collapses_to_one_bucket() -> None:
+    counts = ui.in_flight_counts(((NOW, NOW), (NOW, None)), NOW, buckets=5)
+    assert counts[0] == 2
+    assert sum(counts) == 2
+
+
+def test_render_in_flight_chart_counts_runs_at_the_top_level() -> None:
+    runs = (
+        _run_(state="running", start=NOW - timedelta(hours=1)),  # no end: to now
+        _run_("sync_beta", state="success", end=NOW - timedelta(minutes=5)),
+    )
+    text = _plain_renderable(ui.render_in_flight_chart(Drill(), runs, NOW), width=80)
+    assert "Runs in flight" in text
+    assert "█" in text
+    assert "now" in text  # the time axis is labelled
+    assert "2" in text  # the peak: the two runs overlapped
+
+
+def test_render_in_flight_chart_follows_the_drill_into_a_run() -> None:
+    drill = Drill(
+        level="tasks",
+        run=_run_(),
+        tasks=(_task(), _task("loader", state="failed")),
+    )
+    text = _plain_renderable(ui.render_in_flight_chart(drill, (), NOW), width=80)
+    assert "Tasks in flight · sync_alpha" in text
+    assert "█" in text
+
+
+def test_render_in_flight_chart_says_when_nothing_has_started() -> None:
+    assert "No run has started" in _plain_renderable(
+        ui.render_in_flight_chart(Drill(), (), NOW)
+    )
+    queued = DagRun(dag_id="sync_alpha", run_id="manual", state="queued")
+    assert "No run has started" in _plain_renderable(
+        ui.render_in_flight_chart(Drill(), (queued,), NOW)
+    )
+    never_started = Drill(
+        level="tasks",
+        run=_run_(),
+        tasks=(TaskInstance(task_id="sensor", state="scheduled"),),
+    )
+    assert "No task instance has started" in _plain_renderable(
+        ui.render_in_flight_chart(never_started, (), NOW)
+    )
+
+
+# --- the actions menu --------------------------------------------------------
+
+
+def test_menu_entries_narrow_to_the_context() -> None:
+    """The menu offers what the footer hint used to, per level and view."""
+    top = [entry.action for entry in ui.menu_entries("runs", "runs")]
+    assert "drill_in" in top and "trigger_run" in top
+    assert "clear_tasks" not in top and "toggle_stale" not in top
+    assert top[-1] == "quit"
+
+    tasks = [entry.action for entry in ui.menu_entries("runs", "tasks")]
+    assert "clear_tasks" in tasks and "mark_tasks" in tasks
+    assert "switch_view" not in tasks
+
+    log = [entry.action for entry in ui.menu_entries("runs", "log")]
+    assert "prev_try" in log and "next_try" in log
+    assert "clear_tasks" not in log
+
+    dags = [entry.action for entry in ui.menu_entries("dags", "runs")]
+    assert "toggle_stale" in dags
+
+
+def test_menu_entries_label_their_toggles_by_state() -> None:
+    def label(entries: tuple[ui.MenuEntry, ...], action: str) -> str:
+        return next(entry.label for entry in entries if entry.action == action)
+
+    assert "Show stale" in label(
+        ui.menu_entries("dags", "runs", stale_shown=False), "toggle_stale"
+    )
+    assert "Hide stale" in label(
+        ui.menu_entries("dags", "runs", stale_shown=True), "toggle_stale"
+    )
+    assert "Hide the charts" in label(
+        ui.menu_entries("runs", "runs", chart_shown=True), "toggle_chart"
+    )
+    assert "Show the charts" in label(
+        ui.menu_entries("runs", "runs", chart_shown=False), "toggle_chart"
+    )
+
+
+def test_menu_option_names_the_direct_key() -> None:
+    """Every row teaches the shortcut it replaces."""
+    for entry in ui.menu_entries("runs", "runs"):
+        assert entry.key and entry.label and entry.action
+        row = ui.menu_option(entry).plain
+        assert entry.key in row and entry.label in row
+
+
+def test_render_summary_marks_hidden_stale_dags() -> None:
+    snapshot = _snapshot(dags=_dag_fleet())
+    hidden = ui.render_summary(snapshot, None, view="dags", stale_hidden=True).plain
+    assert "1 stale hidden · s shows" in hidden
+    shown = ui.render_summary(snapshot, None, view="dags").plain
+    assert "1 stale" in shown and "hidden" not in shown
+
+
 # --- layout ---------------------------------------------------------------
 
 
@@ -3595,44 +3721,67 @@ async def test_cycle_detail_moves_then_hides_pane() -> None:
         assert table.size.width < app.size.width
 
 
-async def test_chart_pane_graphs_runs_and_follows_the_drill() -> None:
+async def test_detail_below_puts_the_charts_beside_the_run_pane() -> None:
+    """In "right" mode the charts sit under the detail; "below" mode is
+    height-starved, so there they move next to it instead."""
+    app = _app()
+    async with app.run_test(size=(150, 44)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        scroll = app.query_one("#detail-scroll")
+        charts = app.query_one("#charts")
+        assert charts.region.y > scroll.region.y  # right mode: stacked
+
+        await pilot.press("d")  # -> below
+        await pilot.pause()
+        assert charts.region.y == scroll.region.y  # side by side...
+        assert charts.region.x > scroll.region.x  # ...detail left, charts right
+
+
+async def test_chart_panes_graph_runs_and_follow_the_drill() -> None:
     app = _app()
     async with app.run_test(size=(150, 40)) as pilot:
         await app.workers.wait_for_complete()
         await pilot.pause()
         chart = app.query_one("#chart", Static)
-        assert chart.display
+        flight = app.query_one("#in-flight-chart", Static)
+        assert app.query_one("#charts").display
         assert "Runs over time" in _plain(chart)
+        assert "Runs in flight" in _plain(flight)
 
         await pilot.press("enter")  # drill into the failed run (sync_beta)
         await app.workers.wait_for_complete()
         await pilot.pause()
         assert "Tasks over time · sync_beta" in _plain(chart)
+        assert "Tasks in flight · sync_beta" in _plain(flight)
 
         await pilot.press("escape")
         await pilot.pause()
         assert "Runs over time" in _plain(chart)
+        assert "Runs in flight" in _plain(flight)
 
 
-async def test_chart_toggles_and_persists(tmp_path) -> None:
+async def test_charts_toggle_together_and_persist(tmp_path) -> None:
     path = tmp_path / "layout.json"
     app = _app(layout_path=path)
     async with app.run_test(size=(150, 40)) as pilot:
         await app.workers.wait_for_complete()
         await pilot.pause()
-        chart = app.query_one("#chart", Static)
-        assert chart.display
+        charts = app.query_one("#charts")
+        assert charts.display
 
         await pilot.press("g")
         await pilot.pause()
-        assert not chart.display
+        assert not charts.display
         assert layout.load(path).chart is False
 
         await pilot.press("g")
         await pilot.pause()
-        assert chart.display
+        assert charts.display
         assert layout.load(path).chart is True
-        assert "Runs over time" in _plain(chart)  # repainted on re-show
+        # Both panes repainted on re-show.
+        assert "Runs over time" in _plain(app.query_one("#chart", Static))
+        assert "Runs in flight" in _plain(app.query_one("#in-flight-chart", Static))
 
 
 async def test_resize_moves_divider_and_persists(tmp_path) -> None:
@@ -3684,7 +3833,7 @@ async def test_saved_layout_and_deployment_are_restored(tmp_path) -> None:
         await pilot.pause()
         assert app.query_one("#body").has_class("detail-below")
         assert app._split == 30
-        assert not app.query_one("#chart", Static).display
+        assert not app.query_one("#charts").display
         # The remembered deployment is what the first poll was asked to read.
         assert asked[0].deployment is not None and asked[0].deployment.key == "dep-stg-2"
 
@@ -3815,9 +3964,10 @@ def _dag_fleet() -> tuple[Dag, ...]:
     )
 
 
-async def test_view_switch_shows_every_dag_including_paused_and_stale() -> None:
-    """"I can't see all the DAGs": paused and stale DAGs are rows with labels,
-    not omissions."""
+async def test_view_switch_shows_dags_with_stale_hidden_but_counted() -> None:
+    """Paused DAGs are rows with labels, not omissions. Stale DAGs are hidden
+    by default — but *counted* hidden, never silently absent, and `s` shows
+    them."""
     snapshot = _snapshot(dags=_dag_fleet())
     app = _app([(snapshot, None)])
     async with app.run_test(size=(150, 40)) as pilot:
@@ -3829,18 +3979,35 @@ async def test_view_switch_shows_every_dag_including_paused_and_stale() -> None:
         await pilot.press("v")
         await pilot.pause()
         assert app._view == "dags"
-        assert table.row_count == 4  # every DAG, none filtered out
+        assert table.row_count == 3  # gone_stale hidden, paused still a row
         assert len(table.columns) == len(ui.dag_columns())
+        assert "gone_stale" not in [dag.dag_id for dag in app.visible_dags()]
+        summary = _plain(app.query_one("#summary", Static))
+        assert "3 dags" in summary
+        assert "1 paused" in summary
+        assert "1 stale hidden" in summary  # hidden rows stay on the books
+
+        # `s` shows the stale rows; pressing it again hides them.
+        await pilot.press("s")
+        await pilot.pause()
+        assert table.row_count == 4
+        assert "gone_stale" in [dag.dag_id for dag in app.visible_dags()]
         summary = _plain(app.query_one("#summary", Static))
         assert "4 dags" in summary
-        assert "1 paused" in summary
-        assert "1 stale" in summary
+        assert "1 stale" in summary and "hidden" not in summary
+        await pilot.press("s")
+        await pilot.pause()
+        assert table.row_count == 3
 
-        # Switching back restores the runs list and its own cursor.
+        # Switching back restores the runs list, where `s` is a no-op.
         await pilot.press("v")
         await pilot.pause()
         assert app._view == "runs"
         assert table.row_count == 2
+        await pilot.press("s")
+        await pilot.pause()
+        assert table.row_count == 2
+        assert not app._show_stale
 
 
 async def test_dag_view_detail_labels_the_dags_state() -> None:
@@ -3855,6 +4022,7 @@ async def test_dag_view_detail_labels_the_dags_state() -> None:
         assert "sync_alpha" in detail
         assert "paused" in detail
 
+        await pilot.press("s")  # show the stale rows to reach one
         await pilot.press("down", "down")
         await pilot.pause()
         stale = _plain(app.query_one("#detail", Static))
@@ -3878,7 +4046,8 @@ async def test_summary_states_the_true_total_when_a_list_is_partial() -> None:
 
         await pilot.press("v")
         await pilot.pause()
-        assert "4 of 1,200 dags" in _plain(app.query_one("#summary", Static))
+        # 3, not 4: the stale DAG is hidden — and separately counted as such.
+        assert "3 of 1,200 dags" in _plain(app.query_one("#summary", Static))
 
 
 async def test_pause_in_the_dag_view_targets_the_selected_dag() -> None:
@@ -4190,20 +4359,77 @@ async def test_the_heartbeat_does_not_re_render_the_log_pane(monkeypatch) -> Non
         assert renders
 
 
-async def test_footer_hint_narrows_to_the_current_level() -> None:
+async def test_footer_points_to_the_menu_and_keeps_the_filter_state() -> None:
+    """The footer no longer enumerates keys — the `o` menu does. What it keeps
+    is the stateful part: an active filter, which would otherwise make a
+    narrowed list indistinguishable from a short one."""
     app = _app()
     async with app.run_test(size=(150, 40)) as pilot:
         await app.workers.wait_for_complete()
         await pilot.pause()
-        assert "enter tasks" in _plain(app.query_one("#status", Static))
+        status = _plain(app.query_one("#status", Static))
+        assert "o menu" in status and "q quit" in status
 
-        await pilot.press("enter")
+        await pilot.press("enter")  # the per-level key lists are gone
         await app.workers.wait_for_complete()
         await pilot.pause()
         status = _plain(app.query_one("#status", Static))
-        assert "c clear" in status and "m mark" in status
+        assert "o menu" in status
+        assert "c clear" not in status and "m mark" not in status
 
-        await pilot.press("enter")
+        await pilot.press("escape")
+        await pilot.pause()
+        await pilot.press("slash", "b", "e", "t", "a", "enter")
+        await pilot.pause()
+        status = _plain(app.query_one("#status", Static))
+        assert "/beta" in status and "(1/2)" in status  # the filter survives
+        assert "o menu" in status
+
+
+async def test_menu_lists_actions_and_runs_the_chosen_one() -> None:
+    app = _app()
+    async with app.run_test(size=(150, 40)) as pilot:
         await app.workers.wait_for_complete()
         await pilot.pause()
-        assert "attempt" in _plain(app.query_one("#status", Static))
+        await pilot.press("o")
+        await pilot.pause()
+        assert isinstance(app.screen, MenuScreen)
+
+        # Walk to the charts toggle and select it: the menu runs the same
+        # action the direct key would, then closes.
+        entries = ui.menu_entries("runs", "runs", chart_shown=True)
+        for _ in range([entry.action for entry in entries].index("toggle_chart")):
+            await pilot.press("down")
+        await pilot.press("enter")
+        await pilot.pause()
+        assert not isinstance(app.screen, MenuScreen)
+        assert not app.query_one("#charts").display  # the action ran
+
+        # Escape closes without running anything.
+        await pilot.press("o")
+        await pilot.pause()
+        assert isinstance(app.screen, MenuScreen)
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, MenuScreen)
+        assert not app.query_one("#charts").display  # still as it was
+
+
+async def test_menu_follows_the_drill_level() -> None:
+    """Inside a run the menu offers the task actions, not the run ones —
+    the same narrowing the footer hint used to do."""
+    app = _app()
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("enter")  # drill into the failed run
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("o")
+        await pilot.pause()
+        assert isinstance(app.screen, MenuScreen)
+        labels = [entry.label for entry in app.screen._entries]
+        assert any("Clear" in label for label in labels)
+        assert not any("Trigger" in label for label in labels)
+        await pilot.press("escape")
+        await pilot.pause()

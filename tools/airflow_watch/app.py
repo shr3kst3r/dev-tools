@@ -6,13 +6,17 @@ recent DAG runs across every DAG on the left, and a detail pane that drills
 comes back out, `<`/`>` step through a task's log attempts.
 
 Windowing follows my-prs: `d` cycles the detail pane through right of the list,
-below it, or hidden; `[` / `]` move the divider. Under the detail pane sits an
-activity chart — the listed runs (or, drilled in, the run's task instances)
-bucketed over time and coloured by state — which `g` shows or hides. All of
-those and the selected deployment persist in a state file (see layout.py) when
-the app is given a `layout_path`. `?` floats a keybinding reference, `l` a live activity log of
+below it, or hidden; `[` / `]` move the divider. Under the detail pane sits a
+chart strip — an in-flight chart counting how many runs (or, drilled in, task
+instances) were running at once, stacked on top of an activity chart of the
+same rows bucketed over time and coloured by state — which `g` shows or
+hides. All of those and the selected deployment persist in a state file (see
+layout.py) when the app is given a `layout_path`. `o` opens the actions menu —
+every key that applies right now, in one list, since the footer stopped trying
+to name them all. `?` floats a keybinding reference, `l` a live activity log of
 every poll and every action, `e` the DAG import errors, and `D` a deployment
-switcher.
+switcher. Stale DAGs are hidden from the DAGs view by default (`s` shows them);
+the summary bar always counts them.
 
 Polling is resilient in the same way my-prs is: errors show as concise
 one-liners (never a raw command dump), the last good run list stays on screen
@@ -37,7 +41,8 @@ from textual.app import App, ComposeResult
 from textual.containers import Container, VerticalScroll
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
-from textual.widgets import DataTable, Static
+from textual.widgets import DataTable, OptionList, Static
+from textual.widgets.option_list import Option
 
 from tools.pr_watch import ui as pr_ui
 
@@ -217,6 +222,62 @@ class DeploymentScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class MenuScreen(ModalScreen[str | None]):
+    """The `o` overlay: every action available right now, one per row.
+
+    The footer used to advertise every keybinding and ran out of room; it now
+    points here instead. Selecting a row dismisses with the action's name and
+    the app runs it — the menu itself changes nothing, so it can be closed and
+    reopened without consequence.
+    """
+
+    BINDINGS = [("escape,q,o", "dismiss_menu", "Close")]
+
+    CSS = """
+    MenuScreen {
+        align: center middle;
+    }
+    MenuScreen #menu {
+        width: 56;
+        height: auto;
+        max-height: 80%;
+        border: round $accent;
+        padding: 0 1;
+    }
+    """
+
+    def __init__(self, entries: tuple[ui.MenuEntry, ...]) -> None:
+        super().__init__()
+        self._entries = entries
+
+    def compose(self) -> ComposeResult:
+        menu = OptionList(
+            *(
+                Option(ui.menu_option(entry), id=entry.action)
+                for entry in self._entries
+            ),
+            id="menu",
+        )
+        menu.border_title = "Menu"
+        menu.border_subtitle = "enter selects · esc closes"
+        yield menu
+
+    def on_mount(self) -> None:
+        # Arrow keys need the list focused, and a menu with nothing highlighted
+        # reads as broken — land on the first action.
+        menu = self.query_one(OptionList)
+        menu.focus()
+        menu.highlighted = 0
+
+    def on_option_list_option_selected(
+        self, event: OptionList.OptionSelected
+    ) -> None:
+        self.dismiss(event.option.id)
+
+    def action_dismiss_menu(self) -> None:
+        self.dismiss(None)
+
+
 class ConfirmScreen(ModalScreen[bool]):
     """The gate in front of every mutation.
 
@@ -268,6 +329,8 @@ class AirflowWatchApp(App[None]):
         ("greater_than_sign,full_stop", "next_try", "Next attempt"),
         ("D", "switch_deployment", "Switch deployment"),
         ("e", "show_import_errors", "Import errors"),
+        ("s", "toggle_stale", "Show/hide stale DAGs"),
+        ("o", "open_menu", "Actions menu"),
         ("p", "toggle_pause", "Pause/unpause DAG"),
         ("t", "trigger_run", "Trigger run"),
         ("c", "clear_tasks", "Clear task"),
@@ -306,7 +369,10 @@ class AirflowWatchApp(App[None]):
         height: 1fr;
         scrollbar-gutter: stable;
     }
-    #chart {
+    #charts {
+        height: 18;
+    }
+    #chart, #in-flight-chart {
         height: 9;
     }
     #body.detail-below {
@@ -323,6 +389,19 @@ class AirflowWatchApp(App[None]):
         height: 1fr;
         border-left: none;
         border-top: solid $foreground 30%;
+        /* Below the list the pane is height-starved: an 18-row chart stack
+           under the detail would leave the Run pane nothing. Lay the two out
+           side by side instead — detail left, charts right. */
+        layout: horizontal;
+    }
+    #body.detail-below #detail-scroll {
+        width: 1fr;
+        height: 1fr;
+    }
+    #body.detail-below #charts {
+        width: 50%;
+        height: 1fr;
+        max-height: 18;
     }
     #body.detail-hidden #list {
         width: 1fr;
@@ -369,6 +448,9 @@ class AirflowWatchApp(App[None]):
         # `_filters` (its line-filter list) and shadowing it breaks rendering.
         self._queries: dict[str, str] = {target: "" for target in FILTER_TARGETS}
         self._filtering: str | None = None
+        # Whether the DAGs view shows stale DAGs. Deliberately not persisted:
+        # "hidden by default" is the promise, and `s` is one keystroke.
+        self._show_stale = False
         self._updated = datetime.now()
         self._polling = False
         # Bumped whenever the *target* of a poll changes (a deployment switch).
@@ -453,9 +535,18 @@ class AirflowWatchApp(App[None]):
         return tuple(run for run in self._runs if matches(query, run.search_text))
 
     def visible_dags(self) -> tuple[Dag, ...]:
+        """The DAG rows the list shows: the `/` filter, and — unless `s` has
+        shown them — stale DAGs dropped. Hiding is view-side only: the snapshot
+        keeps every stale DAG, so the summary count stays real and showing
+        them costs no fetch."""
         dags = self._snapshot.dags if self._snapshot is not None else ()
         query = self._queries["dags"]
-        return tuple(dag for dag in dags if matches(query, dag.search_text))
+        return tuple(
+            dag
+            for dag in dags
+            if (self._show_stale or not dag.is_stale)
+            and matches(query, dag.search_text)
+        )
 
     def visible_rows(self) -> tuple[TaskRow, ...]:
         query = self._queries["tasks"]
@@ -484,7 +575,13 @@ class AirflowWatchApp(App[None]):
             with Container(id="detail-pane"):
                 with VerticalScroll(id="detail-scroll"):
                     yield Static(id="detail")
-                yield Static(id="chart")
+                # The chart strip: the in-flight chart stacked on top of the
+                # activity chart, so the two share one time axis and read as
+                # views of the same window. Under the detail in "right" mode;
+                # beside it in "below" mode (see the detail-below CSS).
+                with Container(id="charts"):
+                    yield Static(id="in-flight-chart")
+                    yield Static(id="chart")
         yield Static(id="status")
 
     def on_mount(self) -> None:
@@ -1189,7 +1286,44 @@ class AirflowWatchApp(App[None]):
         self._apply_layout()
         self._save_layout()
         if self._chart_shown:
-            self._refresh_view()  # the pane went un-updated while hidden
+            self._refresh_view()  # the panes went un-updated while hidden
+
+    def action_toggle_stale(self) -> None:
+        """Show or hide stale DAGs in the DAGs view. Hidden by default — a
+        stale DAG is one whose file left the bundle, which is history, not
+        state — while the summary bar keeps counting them so hidden rows can
+        never read as a smaller fleet."""
+        if self._view != "dags" or self._showing_tasks:
+            return
+        self._show_stale = not self._show_stale
+        self._append_log(
+            "info",
+            "Showing stale DAGs." if self._show_stale else "Hiding stale DAGs.",
+        )
+        self._rebuild_table()
+        self._refresh_view()
+
+    # --- the actions menu ----------------------------------------------------
+
+    def action_open_menu(self) -> None:
+        if isinstance(self.screen, MenuScreen):
+            self.screen.dismiss(None)
+            return
+        entries = ui.menu_entries(
+            self._view,
+            self._drill.level,
+            chart_shown=self._chart_shown,
+            stale_shown=self._show_stale,
+        )
+        self.push_screen(MenuScreen(entries), self._on_menu_picked)
+
+    def _on_menu_picked(self, action: str | None) -> None:
+        if action is None:
+            return
+        # Deferred one message: run_action may push a screen (help, confirm),
+        # and pushing from inside the dismiss callback of the screen being
+        # popped is exactly the re-entrancy Textual dislikes.
+        self.call_later(self.run_action, action)
 
     def action_grow_list(self) -> None:
         self._resize_split(+SPLIT_STEP)
@@ -1215,7 +1349,7 @@ class AirflowWatchApp(App[None]):
         list_.styles.height = (
             f"{self._split}%" if self._detail_mode == "below" else None
         )
-        self.query_one("#chart").display = self._chart_shown
+        self.query_one("#charts").display = self._chart_shown
 
     def _save_layout(self) -> None:
         if self._layout_path is not None:
@@ -1269,7 +1403,6 @@ class AirflowWatchApp(App[None]):
             # so it can fire while the app is tearing down — after compose's
             # widgets are gone. Nothing to render into, so nothing to do.
             return
-        loading = self._snapshot is None and self._error is None
         error_message = self._error.message if self._error is not None else None
         summary.update(
             ui.render_summary(
@@ -1277,14 +1410,18 @@ class AirflowWatchApp(App[None]):
                 error_message,
                 view=self._view,
                 shown=self._shown_count(),
+                stale_hidden=not self._show_stale,
             )
         )
         now = datetime.now(timezone.utc)
         if self._chart_shown:
-            # The chart tracks the same selection the detail pane does; when
-            # hidden it is skipped entirely and repainted on toggle instead.
+            # The charts track the same selection the detail pane does; when
+            # hidden they are skipped entirely and repainted on toggle instead.
             self.query_one("#chart", Static).update(
                 ui.render_chart(self._drill, self.visible_runs(), now)
+            )
+            self.query_one("#in-flight-chart", Static).update(
+                ui.render_in_flight_chart(self._drill, self.visible_runs(), now)
             )
         if detail:
             self.query_one("#detail", Static).update(
@@ -1314,29 +1451,19 @@ class AirflowWatchApp(App[None]):
                 max(0, self._seconds_left),
                 self._current_delay,
                 refreshing=self._polling,
-                quit_hint=self._hint(loading),
+                quit_hint=self._hint(),
             )
         )
 
-    def _hint(self, loading: bool) -> str:
-        """The footer's key hint, narrowed to the current level so keys that do
-        nothing here are not advertised. An active filter is stated first,
-        because a narrowed list is otherwise indistinguishable from a short one.
-        """
-        base = "q quit · r refresh · D deployment · l log · ? help"
+    def _hint(self) -> str:
+        """The footer's key hint. It once tried to advertise every key for the
+        current level and ran out of room; the `o` menu now carries that list,
+        so the footer keeps only what is stateful — an active filter, which
+        would otherwise make a narrowed list indistinguishable from a short
+        one — plus the three constants."""
         active = self._queries[self._filter_target]
         prefix = f"/{active} ({self._filter_count()}) esc clears · " if active else ""
-        if loading:
-            return prefix + base
-        match self._drill.level:
-            case "tasks":
-                return prefix + "enter log · esc back · / filter · c clear · m mark · " + base
-            case "log":
-                return prefix + "< > attempt · esc back · / search · " + base
-            case _:
-                if self._view == "dags":
-                    return prefix + "enter runs · v runs · / filter · p pause · t trigger · " + base
-                return prefix + "enter tasks · v dags · / filter · p pause · t trigger · e errors · " + base
+        return prefix + "o menu · ? help · q quit"
 
     def _filter_count(self) -> str:
         """"12/240" — matches over the rows the filter searched."""

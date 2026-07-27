@@ -1,7 +1,7 @@
 """Persisted window layout for airflow-watch.
 
 The dashboard remembers how you left it — where the detail pane lives (`d`),
-where the divider sits (`[` / `]`), whether the activity chart is shown (`g`),
+where the divider sits (`[` / `]`), whether the chart strip is shown (`g`),
 and which deployment was selected — in a small JSON state file. Parsing/serializing is pure so it can be unit-tested;
 only `load`/`save` touch the filesystem, and both shrug off a missing,
 malformed, or unwritable file (a broken state file must never take the
@@ -39,7 +39,7 @@ class Layout:
     # The deployment key (its Astro id, or its URL for a plain Airflow) that
     # was selected last. Empty means "no preference — take the first one".
     deployment: str = ""
-    # Whether the activity chart under the detail pane is shown (`g`).
+    # Whether the chart strip under the detail pane is shown (`g`).
     chart: bool = True
 
 

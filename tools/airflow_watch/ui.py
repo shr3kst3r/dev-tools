@@ -186,8 +186,12 @@ def dag_columns() -> tuple[str, ...]:
 def dag_marker(dag: Dag, live_errors: frozenset[str] = frozenset()) -> Text:
     """Why this DAG might need you: a broken file, a deleted file, or paused.
 
-    Paused and stale DAGs are *labelled*, never filtered out — Airflow's own list
-    endpoint hides stale DAGs by default and we deliberately ask it not to.
+    Paused DAGs are *labelled*, never filtered out. Stale DAGs are hidden from
+    the DAGs view by default (`s` shows them, and the summary bar always counts
+    them) — but we still deliberately ask Airflow's list endpoint *not* to hide
+    them, so the count is real and showing them costs nothing, and the marker
+    here is what identifies them once shown (and in `--once` output, which
+    hides nothing).
 
     A live import error outranks staleness, but a *stale* DAG's leftover
     `has_import_errors` flag does not: see `Dag.import_error_is_live`. Getting
@@ -301,12 +305,15 @@ def render_summary(
     *,
     view: str = "runs",
     shown: int | None = None,
+    stale_hidden: bool = False,
 ) -> Text:
     """The one-line status bar docked at the top: which view, which deployment,
     what state its rows are in, and whether any DAG file is failing to parse.
 
     `shown` is how many rows the list is actually displaying after any `/` filter,
-    so the bar never claims more than is on screen.
+    so the bar never claims more than is on screen. `stale_hidden` marks the
+    stale count as hidden rows — the count itself never goes away, because rows
+    silently absent is exactly the failure mode this bar exists to prevent.
     """
     bar = view_tabs(view)
     if snapshot is not None:
@@ -337,10 +344,10 @@ def render_summary(
             style="yellow" if snapshot.paused_count else "dim",
         )
         bar.append("   ")
-        bar.append(
-            f"✂ {snapshot.stale_count} stale",
-            style="yellow" if snapshot.stale_count else "dim",
-        )
+        stale = f"✂ {snapshot.stale_count} stale"
+        if stale_hidden and snapshot.stale_count:
+            stale += " hidden · s shows"
+        bar.append(stale, style="yellow" if snapshot.stale_count else "dim")
     else:
         runs = snapshot.runs
         failed = sum(1 for run in runs if run.state == "failed")
@@ -728,13 +735,15 @@ def render_detail(
     return render_run(run, known, now)
 
 
-# --- the chart pane ---------------------------------------------------------
+# --- the chart strip ---------------------------------------------------------
 #
-# A stacked-bar timeline under the detail pane (`g` toggles it): activity
-# bucketed over time, one bucket per column, coloured by state. Bucketing and
-# stacking are pure functions asserted on directly in tests; only the bucket
-# count depends on the pane's width, which is why the body is a renderable
-# (resolved at render time) rather than a function of the data alone.
+# Two charts stacked under the detail pane (`g` toggles the strip): an
+# in-flight chart counting how many runs (or tasks) were going at once, above a
+# stacked-bar timeline of activity — starts bucketed over time, one bucket per
+# column, coloured by state. Bucketing, stacking, and overlap counting are pure
+# functions asserted on directly in tests; only the bucket count depends on the
+# pane's width, which is why each body is a renderable (resolved at render
+# time) rather than a function of the data alone.
 
 # chart group -> style, in stacking order: the bottom of the bar first. Failure
 # sits at the bottom so a tall stack of successes can never hide it.
@@ -870,12 +879,17 @@ class ChartBody:
                 else:
                     line.append(" ")
             yield line
-        yield Text("    └" + "─" * buckets, style="dim")
         start = min(when for when, _ in self.points if when is not None)
-        left = format_relative(start, self.now)
-        pad = buckets - len(left) - len("now")
-        labels = f"     {left}{' ' * pad}now" if pad >= 1 else f"     {left}"
-        yield Text(labels, style="dim")
+        yield from _time_axis(start, self.now, buckets)
+
+
+def _time_axis(start: datetime, now: datetime, buckets: int) -> RenderResult:
+    """The x axis both chart bodies share: the rule, then "<oldest> … now"."""
+    yield Text("    └" + "─" * buckets, style="dim")
+    left = format_relative(start, now)
+    pad = buckets - len(left) - len("now")
+    labels = f"     {left}{' ' * pad}now" if pad >= 1 else f"     {left}"
+    yield Text(labels, style="dim")
 
 
 def render_chart(
@@ -912,6 +926,118 @@ def render_chart(
         body,
         title=Text(title, style="bold"),
         subtitle=legend or None,
+        border_style="cyan",
+        padding=(0, 1),
+    )
+
+
+# When a run or task started (None if it never did) and when it ended (None
+# while it is still going).
+ChartSpan = tuple[datetime | None, datetime | None]
+
+
+def in_flight_counts(
+    spans: Sequence[ChartSpan], now: datetime, buckets: int
+) -> list[int]:
+    """How many spans were in flight during each of `buckets` equal slices.
+
+    The window matches `chart_counts`: oldest start to `now` (or to the latest
+    end, should one somehow sit in the future). A span with no end is still
+    going, so it runs to `now` — the same reading `_duration_cell` gives a
+    record with a start and no end. A span that never started is skipped: it
+    was never in flight.
+    """
+    counts = [0] * max(1, buckets)
+    started = [(start, end) for start, end in spans if start is not None]
+    if not started:
+        return counts
+    window_start = min(start for start, _ in started)
+    window_end = max(now, max(end or now for _, end in started))
+    window = max((window_end - window_start).total_seconds(), 1.0)
+    for start, end in started:
+        lo = int((start - window_start).total_seconds() / window * len(counts))
+        hi = int(((end or now) - window_start).total_seconds() / window * len(counts))
+        first = min(max(lo, 0), len(counts) - 1)
+        last = min(max(hi, first), len(counts) - 1)
+        for index in range(first, last + 1):
+            counts[index] += 1
+    return counts
+
+
+@dataclass(frozen=True)
+class InFlightBody:
+    """The concurrency bars, the y-axis peak label, and the time axis.
+
+    One colour, cyan — the in-flight colour everywhere else — scaled to the
+    peak, with any non-zero bucket getting at least one cell. `spans` must
+    already have starts (no Nones) and be non-empty —
+    `render_in_flight_chart` owns the empty state. Width-adaptive the way
+    `ChartBody` is, and for the same reason.
+    """
+
+    spans: tuple[tuple[datetime, datetime | None], ...]
+    now: datetime
+
+    def __rich_console__(
+        self, console: Console, options: ConsoleOptions
+    ) -> RenderResult:
+        buckets = options.max_width - _CHART_GUTTER
+        if buckets < 4:
+            return
+        counts = in_flight_counts(self.spans, self.now, buckets)
+        peak = max(counts)
+        heights = [
+            (round(count / peak * CHART_BAR_ROWS) or 1) if count else 0
+            for count in counts
+        ]
+        for row in range(CHART_BAR_ROWS - 1, -1, -1):
+            top = row == CHART_BAR_ROWS - 1
+            line = Text(f"{peak:>4}┤" if top else "    │", style="dim")
+            for height in heights:
+                if height > row:
+                    line.append("█", style="cyan")
+                else:
+                    line.append(" ")
+            yield line
+        yield from _time_axis(
+            min(start for start, _ in self.spans), self.now, buckets
+        )
+
+
+def render_in_flight_chart(
+    drill: Drill, runs: tuple[DagRun, ...], now: datetime
+) -> RenderableType:
+    """The companion chart: how many were running at once, over time.
+
+    The activity chart answers "what happened and when"; this one answers "how
+    much was going on at once" — the concurrency the deployment was sustaining.
+    Each run (or, drilled in, task instance) occupies its start→end interval,
+    to `now` while it is still going, and every bucket counts the intervals
+    crossing it. Follows the drill the way the activity chart does.
+    """
+    if drill.level in ("tasks", "log") and drill.run is not None:
+        title = f"Tasks in flight · {drill.run.dag_id}"
+        spans: tuple[ChartSpan, ...] = tuple(
+            (task.start_date, task.end_date) for task in drill.tasks
+        )
+        empty = "No task instance has started yet."
+    else:
+        title = "Runs in flight"
+        spans = tuple((run.start_date, run.end_date) for run in runs)
+        empty = "No run has started yet."
+    started = tuple(
+        (start, end) for start, end in spans if start is not None
+    )
+    if not started:
+        body: RenderableType = Align.center(Text(empty, style="dim"))
+        subtitle = None
+    else:
+        body = InFlightBody(spans=started, now=now)
+        subtitle = Text("█ in flight at once", style="cyan")
+    return Panel(
+        body,
+        title=Text(title, style="bold"),
+        subtitle=subtitle,
         border_style="cyan",
         padding=(0, 1),
     )
@@ -1010,6 +1136,97 @@ def render_confirm(action: Action) -> RenderableType:
     )
 
 
+# --- the actions menu --------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MenuEntry:
+    """One row of the `o` menu: the direct key, what it does, and the app
+    action (`action_<name>`) that selecting it runs."""
+
+    key: str
+    label: str
+    action: str
+
+
+def menu_entries(
+    view: str,
+    level: str,
+    *,
+    chart_shown: bool = True,
+    stale_shown: bool = False,
+) -> tuple[MenuEntry, ...]:
+    """The actions available right now, for the `o` menu.
+
+    The footer used to advertise every key and ran out of room; the menu
+    replaces it. Context-narrowed the way that footer hint was — keys that do
+    nothing at this level are not offered — and every entry still names its
+    direct key, so the menu keeps teaching the shortcuts it replaced.
+    """
+    entries: list[MenuEntry] = []
+    if level == "log":
+        entries += [
+            MenuEntry("/", "Search the log", "start_filter"),
+            MenuEntry("<", "Previous log attempt", "prev_try"),
+            MenuEntry(">", "Next log attempt", "next_try"),
+            MenuEntry("esc", "Back to the task instances", "escape"),
+        ]
+    elif level == "tasks":
+        entries += [
+            MenuEntry("enter", "Open the selected task's log", "drill_in"),
+            MenuEntry("/", "Filter the task instances", "start_filter"),
+            MenuEntry("c", "Clear (retry) the selected task", "clear_tasks"),
+            MenuEntry("m", "Mark the selected task success / failed", "mark_tasks"),
+            MenuEntry("esc", "Back to the runs list", "escape"),
+        ]
+    elif view == "dags":
+        entries += [
+            MenuEntry("enter", "Show the selected DAG's runs", "drill_in"),
+            MenuEntry("v", "Switch view: DAGs → DAG runs", "switch_view"),
+            MenuEntry("/", "Filter the DAG list", "start_filter"),
+            MenuEntry(
+                "s",
+                "Hide stale DAGs" if stale_shown else "Show stale DAGs",
+                "toggle_stale",
+            ),
+            MenuEntry("p", "Pause / unpause the selected DAG", "toggle_pause"),
+            MenuEntry("t", "Trigger a run of the selected DAG", "trigger_run"),
+            MenuEntry("e", "Show DAG import errors", "show_import_errors"),
+        ]
+    else:
+        entries += [
+            MenuEntry("enter", "Drill into the selected run's tasks", "drill_in"),
+            MenuEntry("v", "Switch view: DAG runs → DAGs", "switch_view"),
+            MenuEntry("/", "Filter the runs list", "start_filter"),
+            MenuEntry("p", "Pause / unpause the selected DAG", "toggle_pause"),
+            MenuEntry("t", "Trigger a run of the selected DAG", "trigger_run"),
+            MenuEntry("e", "Show DAG import errors", "show_import_errors"),
+        ]
+    entries += [
+        MenuEntry("r", "Refresh now", "poll_now"),
+        MenuEntry("D", "Switch deployment", "switch_deployment"),
+        MenuEntry("d", "Move / hide the detail pane", "cycle_detail"),
+        MenuEntry(
+            "g",
+            "Hide the charts" if chart_shown else "Show the charts",
+            "toggle_chart",
+        ),
+        MenuEntry("l", "Activity log", "toggle_log"),
+        MenuEntry("?", "Help", "help"),
+        MenuEntry("q", "Quit", "quit"),
+    ]
+    return tuple(entries)
+
+
+def menu_option(entry: MenuEntry) -> Text:
+    """One menu row: the key in the gutter, then the label."""
+    text = Text()
+    text.append(f"{entry.key:>5}", style="bold cyan")
+    text.append("  ")
+    text.append(entry.label)
+    return text
+
+
 # The activity log's per-level glyph and style, keyed by LogEntry.level.
 _LOG_LEVELS = {
     "info": ("·", "dim"),
@@ -1055,6 +1272,7 @@ def render_activity_log(entries: list[LogEntry]) -> RenderableType:
 
 HELP_KEYS: tuple[tuple[str, str], ...] = (
     ("↑ / ↓", "Move through the list"),
+    ("o", "Open the actions menu — everything below, narrowed to what applies"),
     ("v", "Switch view: DAG runs ↔ DAGs"),
     ("/", "Filter the list (or the log) — type to narrow, esc clears"),
     ("enter", "Drill in: run → task instances → log"),
@@ -1062,12 +1280,13 @@ HELP_KEYS: tuple[tuple[str, str], ...] = (
     ("< / >", "Previous / next log attempt"),
     ("D", "Switch deployment"),
     ("e", "Show / hide DAG import errors"),
+    ("s", "Show / hide stale DAGs (hidden by default)"),
     ("p", "Pause or unpause the selected DAG"),
     ("t", "Trigger a new run of the selected DAG"),
     ("c", "Clear (retry) the selected task instance"),
     ("m", "Mark the selected task instance success / failed"),
     ("d", "Cycle the detail pane: right → below → hidden"),
-    ("g", "Show / hide the activity chart under the detail pane"),
+    ("g", "Show / hide the charts under the detail pane"),
     ("[ / ]", "Resize the windows: shrink / grow the list"),
     ("l", "Show / hide the activity log"),
     ("r", "Refresh now"),
@@ -1077,11 +1296,12 @@ HELP_KEYS: tuple[tuple[str, str], ...] = (
 
 HELP_NOTE = (
     "Task instances are listed in dependency order — an upstream task above the "
-    "tasks it feeds. Paused and stale DAGs are labelled, never hidden, and a "
-    "list that could not be fetched in full says 'N of M'. Every action that "
-    "changes Airflow asks first, offers a dry run, and is recorded in the "
-    "activity log. Layout and the selected deployment are restored on the next "
-    "launch."
+    "tasks it feeds. Paused DAGs are labelled, never hidden; stale DAGs are "
+    "hidden by default but always counted in the summary bar, and `s` shows "
+    "them. A list that could not be fetched in full says 'N of M'. Every "
+    "action that changes Airflow asks first, offers a dry run, and is recorded "
+    "in the activity log. Layout and the selected deployment are restored on "
+    "the next launch."
 )
 
 

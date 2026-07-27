@@ -17,6 +17,12 @@ activity log of every background poll — its PR counts, and any rate-limit
 backoffs or failures. A summary bar is docked at the top, the refresh status
 bar at the bottom.
 
+`g` hands the selected PR to goblin-watcher: the app suspends itself and runs
+`gw new --pr <url>` on the real terminal (gw needs it to attach tmux when run
+outside a session). If gw reports that a task for the branch already exists, a
+confirm dialog offers to re-run with --rm; any other failure lands in the
+activity log and a toast.
+
 Polling is resilient: all views are fetched in one request, errors are shown
 as concise one-liners (never a raw command dump), and a rate limit triggers an
 exponential backoff instead of hammering the API on the normal cadence.
@@ -33,13 +39,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, cast
 
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, SuspendNotSupported
 from textual.containers import Container, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Static
 
 from tools.pr_watch import ui as pr_ui
 
+from . import gw
 from . import layout as layout_state
 from . import ui
 from .github import PollError
@@ -116,12 +123,50 @@ class LogScreen(ModalScreen[None]):
         self.dismiss()
 
 
+class GwRmScreen(ModalScreen[bool]):
+    """The confirm dialog when a gw task for the PR's branch already exists:
+    dismisses True to re-run `gw new` with --rm, False to leave it alone."""
+
+    BINDINGS = [
+        ("y", "confirm", "Remove & recreate"),
+        ("n,escape", "cancel", "Keep"),
+    ]
+
+    CSS = """
+    GwRmScreen {
+        align: center middle;
+    }
+    GwRmScreen #gw-exists {
+        width: auto;
+        max-width: 80;
+        height: auto;
+    }
+    """
+
+    def __init__(self, existing: gw.ExistingTask) -> None:
+        super().__init__()
+        self._existing = existing
+
+    def compose(self) -> ComposeResult:
+        yield Static(
+            ui.render_gw_exists(self._existing.task_id, self._existing.project),
+            id="gw-exists",
+        )
+
+    def action_confirm(self) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
 class MyPrsApp(App[None]):
     BINDINGS = [
         ("q", "quit", "Quit"),
         ("v", "switch_view", "Switch view"),
         ("r", "poll_now", "Refresh now"),
         ("o", "open_pr", "Open in browser"),
+        ("g", "open_in_gw", "Open in gw"),
         ("d", "cycle_detail", "Move/hide detail"),
         ("left_square_bracket", "shrink_list", "Shrink list window"),
         ("right_square_bracket", "grow_list", "Grow list window"),
@@ -370,6 +415,47 @@ class MyPrsApp(App[None]):
         if item is not None and item.pr.url:
             webbrowser.open(item.pr.url)
 
+    # --- goblin-watcher hand-off ---------------------------------------------
+
+    def action_open_in_gw(self) -> None:
+        item = self._selected_item()
+        if item is not None and item.pr.url:
+            self._launch_gw(item, rm=False)
+
+    def _launch_gw(self, item: PrItem, *, rm: bool) -> None:
+        """Hand the PR to `gw new --pr`, then classify the outcome. The app is
+        suspended for the duration: gw prints its progress to the terminal,
+        and outside tmux it execs `tmux attach`, which needs the real tty."""
+        result = self._run_suspended(lambda: gw.run_new(item.pr.url, rm=rm))
+        if result.ok:
+            flags = " --rm" if rm else ""
+            self._append_log("info", f"gw: created task for {item.key} (gw new --pr{flags})")
+            return
+        if result.exists is not None and not rm:
+            existing = result.exists
+
+            def answer(remove: bool | None) -> None:
+                if remove:
+                    self._launch_gw(item, rm=True)
+                else:
+                    self._append_log(
+                        "info", f"gw: kept existing task {existing.task_id!r}"
+                    )
+
+            self.push_screen(GwRmScreen(existing), answer)
+            return
+        self._append_log("error", f"gw: {result.error}")
+        self.notify(result.error or "gw failed", title="gw", severity="error")
+
+    def _run_suspended(self, run: Callable[[], gw.GwLaunch]) -> gw.GwLaunch:
+        """Run with the terminal handed back to the shell. Headless drivers
+        (tests) can't suspend; there the subprocess needs no tty anyway."""
+        try:
+            with self.suspend():
+                return run()
+        except SuspendNotSupported:
+            return run()
+
     # --- window layout: detail placement + split size ------------------------
 
     def action_cycle_detail(self) -> None:
@@ -450,6 +536,6 @@ class MyPrsApp(App[None]):
                 max(0, self._seconds_left),
                 self._current_delay,
                 refreshing=self._polling,
-                quit_hint="q quit · v view · r refresh · o open · l log · [ ] resize · ? help",
+                quit_hint="q quit · v view · r refresh · o open · g gw · l log · [ ] resize · ? help",
             )
         )

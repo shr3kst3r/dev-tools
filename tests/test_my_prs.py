@@ -8,8 +8,8 @@ from datetime import datetime, timedelta, timezone
 from rich.console import Console
 from textual.widgets import DataTable, Static
 
-from tools.my_prs import layout, ui
-from tools.my_prs.app import HelpScreen, LogScreen, MyPrsApp
+from tools.my_prs import gw, layout, ui
+from tools.my_prs.app import GwRmScreen, HelpScreen, LogScreen, MyPrsApp
 from tools.my_prs.cli import _parse_args
 from tools.my_prs.github import (
     GitHubError,
@@ -765,6 +765,197 @@ async def test_open_pr_uses_selected_url(monkeypatch) -> None:
         await pilot.pause()
         await pilot.press("o")
         assert opened == ["https://github.com/o/r/pull/2"]
+
+
+# --- goblin-watcher hand-off ---------------------------------------------------
+
+
+def test_gw_new_pr_command() -> None:
+    url = "https://github.com/o/r/pull/2"
+    assert gw.new_pr_command(url) == ["gw", "new", "--pr", url]
+    assert gw.new_pr_command(url, rm=True) == ["gw", "new", "--pr", url, "--rm"]
+
+
+def test_gw_parse_exists_matches_collision_error() -> None:
+    stderr = (
+        "Error: Task 's-feature' already exists in project 'dev-tools'.\n"
+        "Hint: Use `gw run s-feature` to resume it. Pass --rm to remove it."
+    )
+    existing = gw.parse_exists(stderr)
+    assert existing == gw.ExistingTask(task_id="s-feature", project="dev-tools")
+
+
+def test_gw_parse_exists_survives_rich_line_wrapping() -> None:
+    # gw prints errors through a rich Console, which wraps at 80 columns when
+    # stderr is piped — a long task id splits the message across lines. This
+    # is real captured output.
+    task_id = "s-" + "x" * 55
+    stderr = (
+        f"Error: Task '{task_id}' already\n"
+        "exists in project 'dev-tools'.\n"
+        "Hint: Pass --rm to remove it and start over.\n"
+    )
+    existing = gw.parse_exists(stderr)
+    assert existing == gw.ExistingTask(task_id=task_id, project="dev-tools")
+    # error_line joins the wrapped message back together and drops the hint.
+    assert gw.error_line(stderr) == (
+        f"Task '{task_id}' already exists in project 'dev-tools'."
+    )
+
+
+def test_gw_parse_exists_ignores_other_errors() -> None:
+    # --rm's own refusal on a dirty worktree must NOT read as a collision,
+    # or the app would loop offering --rm forever.
+    dirty = "Error: Existing task 's-feature' has uncommitted changes in /x.\n"
+    assert gw.parse_exists(dirty) is None
+    assert gw.parse_exists("Error: No registered project matches the PR's repo.") is None
+
+
+def test_gw_classify() -> None:
+    assert gw.classify(0, "") == gw.GwLaunch(ok=True)
+
+    exists = gw.classify(1, "Error: Task 'a' already exists in project 'b'.")
+    assert exists.ok is False
+    assert exists.exists == gw.ExistingTask(task_id="a", project="b")
+    assert exists.error == "Task 'a' already exists in project 'b'."
+
+    other = gw.classify(1, "Error: something broke\nHint: try again\n")
+    assert other.exists is None
+    assert other.error == "something broke"
+
+    silent = gw.classify(1, "")
+    assert silent.error == "gw failed with no error output."
+
+
+async def test_open_in_gw_runs_gw_new(monkeypatch) -> None:
+    calls: list[tuple[str, bool]] = []
+
+    def fake_run_new(url: str, *, rm: bool = False) -> gw.GwLaunch:
+        calls.append((url, rm))
+        return gw.GwLaunch(ok=True)
+
+    monkeypatch.setattr("tools.my_prs.gw.run_new", fake_run_new)
+    app = MyPrsApp(poll=lambda: (_data(), None), interval=60)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        # The attention-needing PR (example-org/other#2) is selected first.
+        await pilot.press("g")
+        await pilot.pause()
+        assert calls == [("https://github.com/o/r/pull/2", False)]
+        assert app.activity_log[-1].message.startswith("gw: created task")
+        assert "example-org/other#2" in app.activity_log[-1].message
+
+
+async def test_open_in_gw_existing_task_confirms_then_retries_with_rm(monkeypatch) -> None:
+    calls: list[tuple[str, bool]] = []
+    exists = gw.ExistingTask(task_id="s-feature", project="dev-tools")
+
+    def fake_run_new(url: str, *, rm: bool = False) -> gw.GwLaunch:
+        calls.append((url, rm))
+        if rm:
+            return gw.GwLaunch(ok=True)
+        return gw.GwLaunch(ok=False, exists=exists, error="Task exists")
+
+    monkeypatch.setattr("tools.my_prs.gw.run_new", fake_run_new)
+    app = MyPrsApp(poll=lambda: (_data(), None), interval=60)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        await pilot.press("g")
+        await pilot.pause()
+        assert isinstance(app.screen, GwRmScreen)
+        content = _plain(app.screen.query_one("#gw-exists", Static))
+        assert "s-feature" in content
+        assert "dev-tools" in content
+
+        await pilot.press("y")
+        await pilot.pause()
+        assert not isinstance(app.screen, GwRmScreen)
+        assert calls == [
+            ("https://github.com/o/r/pull/2", False),
+            ("https://github.com/o/r/pull/2", True),
+        ]
+        assert app.activity_log[-1].message.startswith("gw: created task")
+
+
+async def test_open_in_gw_existing_task_declined_keeps_it(monkeypatch) -> None:
+    calls: list[tuple[str, bool]] = []
+    exists = gw.ExistingTask(task_id="s-feature", project="dev-tools")
+
+    def fake_run_new(url: str, *, rm: bool = False) -> gw.GwLaunch:
+        calls.append((url, rm))
+        return gw.GwLaunch(ok=False, exists=exists, error="Task exists")
+
+    monkeypatch.setattr("tools.my_prs.gw.run_new", fake_run_new)
+    app = MyPrsApp(poll=lambda: (_data(), None), interval=60)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        await pilot.press("g")
+        await pilot.pause()
+        assert isinstance(app.screen, GwRmScreen)
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, GwRmScreen)
+        assert calls == [("https://github.com/o/r/pull/2", False)]
+        assert "kept existing task" in app.activity_log[-1].message
+
+
+async def test_open_in_gw_rm_failure_does_not_reprompt(monkeypatch) -> None:
+    # A collision surviving --rm (e.g. gw refused a dirty worktree) must land
+    # in the log as an error, never reopen the confirm dialog.
+    exists = gw.ExistingTask(task_id="s-feature", project="dev-tools")
+
+    def fake_run_new(url: str, *, rm: bool = False) -> gw.GwLaunch:
+        if rm:
+            return gw.GwLaunch(ok=False, error="has uncommitted changes")
+        return gw.GwLaunch(ok=False, exists=exists, error="Task exists")
+
+    monkeypatch.setattr("tools.my_prs.gw.run_new", fake_run_new)
+    app = MyPrsApp(poll=lambda: (_data(), None), interval=60)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("g")
+        await pilot.pause()
+        await pilot.press("y")
+        await pilot.pause()
+        assert not isinstance(app.screen, GwRmScreen)
+        assert app.activity_log[-1].level == "error"
+        assert "uncommitted changes" in app.activity_log[-1].message
+
+
+async def test_open_in_gw_error_is_logged(monkeypatch) -> None:
+    def fake_run_new(url: str, *, rm: bool = False) -> gw.GwLaunch:
+        return gw.GwLaunch(ok=False, error="No registered project matches the PR's repo.")
+
+    monkeypatch.setattr("tools.my_prs.gw.run_new", fake_run_new)
+    app = MyPrsApp(poll=lambda: (_data(), None), interval=60)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("g")
+        await pilot.pause()
+        assert app.activity_log[-1].level == "error"
+        assert "No registered project" in app.activity_log[-1].message
+
+
+async def test_open_in_gw_without_selection_is_a_noop(monkeypatch) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "tools.my_prs.gw.run_new",
+        lambda url, *, rm=False: calls.append(url) or gw.GwLaunch(ok=True),
+    )
+    app = MyPrsApp(poll=lambda: (_data(mine=[], review=[]), None), interval=60)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("g")
+        await pilot.pause()
+        assert calls == []
 
 
 # --- window layout: resizing + persistence ------------------------------------

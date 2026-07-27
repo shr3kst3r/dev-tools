@@ -208,10 +208,40 @@ def render_log(entries: list[LogEntry]) -> RenderableType:
     )
 
 
+def render_gw_exists(task_id: str, project: str) -> RenderableType:
+    """The confirm dialog shown when gw already has a task for the PR's
+    branch: recreate it with --rm, or leave it alone."""
+    body = Text()
+    body.append("gw already has task ")
+    body.append(task_id, style="bold cyan")
+    body.append(" in project ")
+    body.append(project, style="bold cyan")
+    body.append(".\n\n")
+    body.append(
+        "--rm removes that task's worktree and record, then recreates the "
+        "task from the PR. The branch itself is kept, and gw refuses if the "
+        "worktree has uncommitted changes.\n\n",
+        style="dim",
+    )
+    body.append("y", style="bold cyan")
+    body.append("  remove it and recreate  ")
+    body.append("(gw new --pr --rm)", style="dim")
+    body.append("\n")
+    body.append("n / esc", style="bold cyan")
+    body.append("  keep it")
+    return Panel(
+        body,
+        title=Text("Task already exists", style="bold"),
+        border_style="yellow",
+        padding=(1, 2),
+    )
+
+
 HELP_KEYS: tuple[tuple[str, str], ...] = (
     ("↑ / ↓", "Select a PR"),
     ("v", "Switch view: your PRs ↔ PRs needing your review"),
     ("enter / o", "Open the selected PR in your browser"),
+    ("g", "Open the PR's branch as a gw task (asks before --rm if it exists)"),
     ("tab", "Move focus between the list and the detail pane"),
     ("d", "Cycle the detail pane: right → below → hidden"),
     ("[ / ]", "Resize the windows: shrink / grow the list"),

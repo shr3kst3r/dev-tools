@@ -77,6 +77,49 @@ Uses the `gh` CLI for auth, so `gh auth login` must be done once. The PR is
 found by the directory's current git branch; if there's no open PR yet, the view
 waits and picks it up automatically.
 
+### `airflow-watch`
+
+A Textual monitor for Airflow deployments on Astronomer Astro, built around one
+loop: **see what's failing → drill into the failed task → read its log.**
+
+- recent DAG runs across every DAG, newest and most-broken first, filterable by
+  state; `v` switches to a **full DAG list** — paused and stale DAGs included and
+  labelled, never hidden;
+- `enter` drills a run into its **task instances**, shown in **dependency order**
+  (an upstream task above the tasks it feeds, indented, numbered), and a task
+  instance into its **log** (`<` / `>` step through attempts);
+- `/` **searches** whatever is on screen — the DAG list, the runs list, the task
+  list, or the text of a log — client-side and instantly, with the match count in
+  the footer;
+- a **DAG import errors** pane (`e`) and a header indicator, because an
+  unparseable DAG file looks exactly like "nothing scheduled";
+- an in-TUI **deployment switcher** (`D`), and an **activity log** (`l`) of every
+  poll — its call count and wall clock — and every action;
+- safe actions — pause/unpause, trigger, clear (retry), mark success/failed —
+  each behind a confirmation modal that names its target and offers a **dry-run
+  preview** first.
+
+```bash
+just airflow-watch                       # watch the deployment you last had open
+uv run airflow-watch -d Production       # pick one by name or id
+uv run airflow-watch --state failed      # only failing runs (repeatable)
+uv run airflow-watch --once              # one snapshot, no live loop
+uv run airflow-watch --once --view dags  # every DAG, paused and stale included
+```
+
+**No silent truncation.** Airflow 2 caps a page at 100 records whatever you ask
+for, and the `astro` CLI's own `--paginate` does not work against this API — so
+every list is paged explicitly off the server's `total_entries`, and the header
+says `N of M` whenever it is holding less than the whole thing.
+
+Uses the `astro` CLI for auth and transport, so `astro login` must be done once —
+there is no HTTP client and no credential handling in this repo. **Airflow 2
+only**: the version is detected during deployment discovery, and a non-2.x target
+is refused by name rather than half-supported. All version-specific knowledge
+lives behind one seam (`tools/airflow_watch/api.py`). See
+`docs/adrs/2026-07-24-airflow-access-via-astro-cli.md` and
+`docs/adrs/2026-07-24-airflow-2-only-behind-a-version-seam.md`.
+
 ## Skills
 
 Agent skills — the instructions that teach an AI coding agent how to work here —

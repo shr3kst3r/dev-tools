@@ -4,10 +4,12 @@
 
 # ADR index
 
-1 active · 0 superseded
+3 active · 0 superseded
 
 ## Active
 
 | ADR | Title | Status | Components | Ticket | Date |
 | --- | --- | --- | --- | --- | --- |
+| [2026-07-24-airflow-access-via-astro-cli](2026-07-24-airflow-access-via-astro-cli.md) | Reach Airflow and Astro exclusively by shelling out to the `astro` CLI | Accepted | airflow-watch, transport | — | 2026-07-24 |
+| [2026-07-24-airflow-2-only-behind-a-version-seam](2026-07-24-airflow-2-only-behind-a-version-seam.md) | Support only Airflow 2 at first, with all version-specific knowledge behind one seam | Accepted | airflow-watch, api-versions | — | 2026-07-24 |
 | [2026-07-24-adr-backed-rpi](2026-07-24-adr-backed-rpi.md) | Keep architectural decisions in an immutable ADR corpus, written by the plan phase | Proposed | skills, workflow | — | 2026-07-24 |

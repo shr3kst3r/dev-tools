@@ -11,6 +11,7 @@ dependencies = [
 
 # One entry point per tool. Each maps to a package under tools/.
 [project.scripts]
+airflow-watch = "tools.airflow_watch.cli:main"
 my-prs = "tools.my_prs.cli:main"
 pr-watch = "tools.pr_watch.cli:main"
 slack-me = "tools.slack_me.cli:main"

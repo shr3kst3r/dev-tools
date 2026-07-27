@@ -36,6 +36,10 @@ hooks:
 
 # --- tools -------------------------------------------------------------
 
+# Monitor an Astro Airflow deployment: failing runs, task instances, logs.
+airflow-watch *args:
+    uv run airflow-watch {{args}}
+
 # Dashboard of your open GitHub PRs from the last 2 weeks, across all repos.
 my-prs *args:
     uv run my-prs {{args}}

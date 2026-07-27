@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 
 from rich.console import Console
 
-from . import api, ui
+from . import api, investigate as investigate_mod, ui
 from .app import AirflowWatchApp, Poll, PollResult
 from .astro import (
     AstroError,
@@ -33,6 +33,7 @@ from .astro import (
     classify_astro_error,
     detect_version,
     fetch_log,
+    fetch_run_bundle,
     fetch_run_tasks,
     fetch_snapshot,
     list_deployments,
@@ -44,6 +45,7 @@ from .layout import state_path
 from .models import (
     KNOWN_RUN_STATES,
     Action,
+    Dag,
     DagList,
     DagRun,
     Deployment,
@@ -58,6 +60,11 @@ from .models import (
 # impose. 15s is the floor regardless of what is asked for.
 MIN_INTERVAL = 15
 DEFAULT_INTERVAL = 60
+
+# How many DAG runs a poll fetches when --limit is not given: ten server pages,
+# fanned out in parallel — enough history to scroll through without asking for
+# more, at roughly one extra second per refresh over a single page.
+DEFAULT_RUN_LIMIT = 1000
 
 # How long a fetched DAG list stays good. The DAG list is the expensive half of
 # a poll — a 242-DAG deployment needs three pages, an 800-DAG one eight, and each
@@ -103,11 +110,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--limit",
         type=int,
-        default=api.DEFAULT_LIMIT,
+        default=DEFAULT_RUN_LIMIT,
         help=(
-            f"Maximum DAG runs to show (default: {api.DEFAULT_LIMIT}). More than "
-            f"{api.PAGE_LIMIT} is fetched by paging; the header always states how "
-            "many of the deployment's total are shown."
+            f"DAG runs to fetch per refresh (default: {DEFAULT_RUN_LIMIT}). "
+            "Scrolling to the bottom of the runs list loads older runs past "
+            f"this; more than {api.PAGE_LIMIT} is fetched by paging, and the "
+            "header always states how many of the deployment's total are shown."
         ),
     )
     parser.add_argument(
@@ -308,6 +316,10 @@ def main(argv: list[str] | None = None) -> int:
         is too large to filter client-side, in which case it becomes Airflow's
         server-side `dag_id_pattern`. Because that changes what a page contains,
         it also bypasses the DAG cache.
+
+        `request.run_limit` is set once scrolling to the bottom of the runs list
+        has grown the run window past `--limit` — it only ever widens the fetch,
+        so a stale request can never shrink the list the user scrolled for.
         """
         try:
             if args.api_url:
@@ -320,7 +332,7 @@ def main(argv: list[str] | None = None) -> int:
             pattern = request.dag_pattern
             snapshot = fetch_snapshot(
                 chosen,
-                limit=limit,
+                limit=max(limit, request.run_limit or 0),
                 states=states,
                 deployments=deployments,
                 dags=None if pattern else dag_cache.get(chosen.key, now),
@@ -378,6 +390,28 @@ def main(argv: list[str] | None = None) -> int:
             dag_cache.drop(deployment.key)
         return line, None
 
+    def prepare_investigation(
+        deployment: Deployment, run: DagRun, dag: Dag | None
+    ) -> tuple[investigate_mod.Investigation | None, PollError | None]:
+        """Gather one run's metadata and task logs into the report `gw` reads.
+
+        Reuses (and refreshes) the graph cache the drill-down uses, since the
+        gather starts from the same task fetch.
+        """
+        try:
+            bundle = fetch_run_bundle(
+                deployment, run, graph=graph_cache.get(deployment.key, run.dag_id)
+            )
+        except (AstroError, api.UnsupportedAirflowVersion) as exc:
+            return None, classify_astro_error(exc)
+        graph_cache.put(deployment.key, run.dag_id, bundle.graph)
+        return (
+            investigate_mod.prepare(
+                deployment, run, dag, bundle, datetime.now(timezone.utc)
+            ),
+            None,
+        )
+
     if args.once:
         return _once(console, poll, view=args.view)
 
@@ -388,6 +422,8 @@ def main(argv: list[str] | None = None) -> int:
             fetch_tasks=load_tasks,
             fetch_log=load_log,
             perform=run_action,
+            investigate=prepare_investigation,
+            launch=investigate_mod.run_scratch,
             layout_path=state_path(),
             deployment=args.deployment,
         ).run()

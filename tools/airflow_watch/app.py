@@ -3,7 +3,13 @@
 The spine is the investigation loop, and the app is shaped around it: a list of
 recent DAG runs across every DAG on the left, and a detail pane that drills
 `run → task instances → log` on the right. `enter` goes in a level, `escape`
-comes back out, `<`/`>` step through a task's log attempts.
+comes back out, `<`/`>` step through a task's log attempts. The runs list is
+not a fixed window: moving the cursor near its bottom widens the poll's run
+window by a page, so older runs stream in as you scroll back — see
+`_maybe_extend_runs`. `i` hands the selected run to goblin-watcher: a worker
+gathers the run's metadata and task logs into a report file, then `gw scratch`
+is launched (app suspended — gw needs the real terminal) with a prompt to
+summarize it, change nothing, and wait.
 
 Windowing follows my-prs: `d` cycles the detail pane through right of the list,
 below it, or hidden; `[` / `]` move the divider. Under the detail pane sits a
@@ -37,7 +43,7 @@ from pathlib import Path
 from typing import Callable, cast
 
 from textual import events
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, SuspendNotSupported
 from textual.containers import Container, VerticalScroll
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
@@ -49,6 +55,7 @@ from tools.pr_watch import ui as pr_ui
 from . import layout as layout_state
 from . import ui
 from .astro import PollError, RunTasks
+from .investigate import Investigation
 from .layout import DETAIL_MODES, SPLIT_STEP, Layout
 from .models import (
     FILTER_TARGETS,
@@ -85,6 +92,17 @@ FetchLog = Callable[
 # the poll so a mutation can never happen as a side effect of refreshing.
 Perform = Callable[[Deployment, Action], tuple[str | None, PollError | None]]
 
+# The `i` hand-off, in two injected halves. `PrepareInvestigation` gathers one
+# run's metadata and task logs into a report file — many subprocess calls, so
+# it runs in a worker exactly like the poll. `LaunchInvestigation` runs
+# `gw scratch` on the prepared report, returning (message, error) one-liners
+# for the activity log; the app suspends itself around it because gw needs the
+# real terminal.
+PrepareInvestigation = Callable[
+    [Deployment, DagRun, Dag | None], tuple[Investigation | None, PollError | None]
+]
+LaunchInvestigation = Callable[[Investigation], tuple[str | None, str | None]]
+
 # When Airflow reports a rate limit we back off exponentially — doubling from
 # the base interval up to this ceiling — rather than turning a rate limit into a
 # worse one. A successful poll resets it immediately.
@@ -92,6 +110,13 @@ MAX_BACKOFF_SECONDS = 900
 
 # How many activity-log lines to keep in memory (a rolling tail).
 MAX_LOG_ENTRIES = 200
+
+# How the runs list grows when scrolled: nearing the bottom (within the margin)
+# asks the next poll for one more step of older runs. The step matches the
+# server's page size, so each extension costs about one extra `astro` call per
+# poll; the margin makes the loading start a little before the wall is hit.
+RUNS_EXTEND_STEP = 100
+RUNS_EXTEND_MARGIN = 5
 
 # Which states `m` can mark a task instance as. Both are terminal states a human
 # sets deliberately when they know better than the scheduler does.
@@ -335,6 +360,7 @@ class AirflowWatchApp(App[None]):
         ("t", "trigger_run", "Trigger run"),
         ("c", "clear_tasks", "Clear task"),
         ("m", "mark_tasks", "Mark task state"),
+        ("i", "investigate", "Summarize run in gw"),
         ("d", "cycle_detail", "Move/hide detail"),
         ("g", "toggle_chart", "Show/hide chart"),
         ("left_square_bracket", "shrink_list", "Shrink list window"),
@@ -419,6 +445,8 @@ class AirflowWatchApp(App[None]):
         fetch_tasks: FetchTasks | None = None,
         fetch_log: FetchLog | None = None,
         perform: Perform | None = None,
+        investigate: PrepareInvestigation | None = None,
+        launch: LaunchInvestigation | None = None,
         layout_path: Path | None = None,
         deployment: str | None = None,
     ) -> None:
@@ -427,6 +455,8 @@ class AirflowWatchApp(App[None]):
         self._fetch_tasks = fetch_tasks
         self._fetch_log = fetch_log
         self._perform = perform
+        self._investigate = investigate
+        self._launch = launch
         self._interval = interval
         self._seconds_left = interval
         # The delay currently counting down: the base interval, or a longer
@@ -451,6 +481,20 @@ class AirflowWatchApp(App[None]):
         # Whether the DAGs view shows stale DAGs. Deliberately not persisted:
         # "hidden by default" is the promise, and `s` is one keystroke.
         self._show_stale = False
+        # How many runs the poll should fetch, once scrolling has grown it past
+        # the caller's --limit. None until then, so the caller's default rules;
+        # never shrunk within a deployment, so a refresh cannot cut a list the
+        # user scrolled to see.
+        self._wanted_runs: int | None = None
+        # Whether the "run list is at its paging ceiling" line has been logged.
+        # Once is information; once per keystroke at the bottom would be spam.
+        self._runs_ceiling_noted = False
+        # True from a scroll-triggered extension until its poll lands — the
+        # bottom bar shows a loading notice for exactly that window.
+        self._extending = False
+        # Whether an `i` gather is currently running; one at a time, because a
+        # gather is dozens of subprocess calls.
+        self._investigating = False
         self._updated = datetime.now()
         self._polling = False
         # Bumped whenever the *target* of a poll changes (a deployment switch).
@@ -615,7 +659,9 @@ class AirflowWatchApp(App[None]):
     def _poll_in_thread(self) -> None:
         epoch = self._target_epoch
         request = PollRequest(
-            deployment=self._target_deployment(), dag_pattern=self._dag_pattern
+            deployment=self._target_deployment(),
+            dag_pattern=self._dag_pattern,
+            run_limit=self._wanted_runs,
         )
         snapshot, error = self._poll(request)
         self.call_from_thread(self._apply_poll, snapshot, error, epoch)
@@ -650,6 +696,7 @@ class AirflowWatchApp(App[None]):
             self._poll_again = True  # the heartbeat starts the replacement
             return
         self._error = error
+        self._extending = False  # whatever poll lands, the wait is over
         if snapshot is not None:  # keep the last good list through errors
             self._snapshot = snapshot
         self._updated = datetime.now()
@@ -812,8 +859,16 @@ class AirflowWatchApp(App[None]):
             live_errors = live_import_error_files(
                 self._snapshot.import_errors if self._snapshot else ()
             )
+            running = (
+                self._snapshot.running_counts() if self._snapshot is not None else {}
+            )
             for dag in dags:
-                table.add_row(*ui.dag_row(dag, now, live_errors), key=dag.key)
+                table.add_row(
+                    *ui.dag_row(
+                        dag, now, live_errors, running=running.get(dag.dag_id, 0)
+                    ),
+                    key=dag.key,
+                )
             self._selected_key = self._reseat(
                 table, [dag.key for dag in dags], self._selected_key
             )
@@ -855,10 +910,59 @@ class AirflowWatchApp(App[None]):
             # Moving off a run invalidates whatever we drilled into from it.
             self._drill = Drill()
             self._task_key = None
+            self._maybe_extend_runs(event.cursor_row)
         self._refresh_view()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         self.action_drill_in()  # Enter on a row drills in
+
+    def _maybe_extend_runs(self, cursor_row: int) -> None:
+        """Load older runs when the cursor nears the bottom of the runs list.
+
+        Scrolling *is* the request: each time the cursor comes within
+        `RUNS_EXTEND_MARGIN` rows of the end, the poll's run window grows by
+        `RUNS_EXTEND_STEP` and a refresh is asked for — so history streams in
+        as you go back, and every later poll keeps the window scrolling earned.
+        Nothing happens when everything the server has is already loaded, while
+        the last extension is still undelivered, or once the fetch layer's
+        paging ceiling is hit — which is logged once rather than re-attempted
+        on every keystroke at the bottom.
+        """
+        snapshot = self._snapshot
+        if self._view != "runs" or self._showing_tasks or snapshot is None:
+            return
+        if self._polling:
+            return
+        table = self.query_one(DataTable)
+        # Row 0 never triggers: a table rebuild highlights it in passing, and a
+        # load the user did not scroll for would start a rebuild → highlight →
+        # load cycle that polls forever.
+        if cursor_row < max(table.row_count - 1 - RUNS_EXTEND_MARGIN, 1):
+            return
+        held = len(self._runs)
+        if snapshot.runs_total <= held:
+            return  # the list already holds every run the server reports
+        if snapshot.runs_truncated:
+            if not self._runs_ceiling_noted:
+                self._runs_ceiling_noted = True
+                self._append_log(
+                    "warn",
+                    f"Run list is at its paging ceiling — showing {held} of "
+                    f"{snapshot.runs_total:,} runs.",
+                )
+            return
+        if self._wanted_runs is not None and held < self._wanted_runs:
+            # The last extension has not landed (or the server could not fill
+            # it); asking again before it does would stack polls, not rows.
+            return
+        self._wanted_runs = held + RUNS_EXTEND_STEP
+        self._extending = True  # the bottom bar shows the notice until it lands
+        self._append_log(
+            "info",
+            f"Scrolled near the bottom — loading older runs ({held} of "
+            f"{snapshot.runs_total:,} held).",
+        )
+        self.action_poll_now()
 
     # --- drill-down: run -> task instances -> log ---------------------------
 
@@ -1149,6 +1253,11 @@ class AirflowWatchApp(App[None]):
         self._selected_key = None
         self._task_key = None
         self._drill = Drill()
+        # A run window grown by scrolling was earned against the old
+        # deployment's history; the new one starts back at the default.
+        self._wanted_runs = None
+        self._runs_ceiling_noted = False
+        self._extending = False
         self._wanted_deployment = key
         # Any poll already in flight is now about the wrong deployment.
         self._target_epoch += 1
@@ -1269,6 +1378,90 @@ class AirflowWatchApp(App[None]):
             )
             return
         self.action_poll_now()  # a real change makes the current list stale
+
+    # --- the gw hand-off ----------------------------------------------------
+
+    def action_investigate(self) -> None:
+        """`i`: hand the selected run to goblin-watcher for an AI summary.
+
+        Two phases. A worker gathers the run's metadata, task instances and
+        task logs into a report file — dozens of subprocess calls, so it stays
+        off the UI thread like every other fetch. Then `gw scratch` launches on
+        the real terminal with the app suspended, seeded with a prompt that
+        says: read the report, summarize it, change nothing, wait.
+
+        Read-only from Airflow's point of view, so no confirmation modal — the
+        gate every mutation goes through guards Airflow, and this touches it
+        with nothing but GETs.
+        """
+        if self._investigating:
+            return  # one gather at a time; each is dozens of calls
+        if self._view == "dags" and not self._showing_tasks:
+            return  # the DAGs list has no run on screen to hand over
+        deployment, run = self.deployment, self._selected_run()
+        if deployment is None or run is None:
+            return
+        if self._investigate is None or self._launch is None:
+            return
+        dag = self._snapshot.dag(run.dag_id) if self._snapshot is not None else None
+        self._investigating = True
+        self._append_log(
+            "info", f"{run.dag_id}: gathering run metadata and task logs for gw…"
+        )
+        self.run_worker(
+            lambda: self._investigate_in_thread(deployment, run, dag),
+            thread=True,
+            group="investigate",
+        )
+
+    def _investigate_in_thread(
+        self, deployment: Deployment, run: DagRun, dag: Dag | None
+    ) -> None:
+        assert self._investigate is not None
+        investigation, error = self._investigate(deployment, run, dag)
+        self.call_from_thread(self._apply_investigation, run, investigation, error)
+
+    def _apply_investigation(
+        self,
+        run: DagRun,
+        investigation: Investigation | None,
+        error: PollError | None,
+    ) -> None:
+        self._investigating = False
+        if error is not None or investigation is None:
+            message = error.message if error is not None else "Nothing gathered."
+            self._append_log("error", f"{run.dag_id}: {message}")
+            self.notify(message, title="investigate", severity="error")
+            return
+        self._append_log(
+            "info",
+            f"{run.dag_id}: report ready — {investigation.logs} logs, "
+            f"{investigation.calls} calls in {investigation.elapsed:.1f}s → "
+            f"{investigation.path}",
+        )
+        launch = self._launch
+        assert launch is not None
+        message, failure = self._run_suspended(lambda: launch(investigation))
+        if failure is not None:
+            self._append_log("error", f"gw: {failure}")
+            self.notify(failure, title="gw", severity="error")
+        else:
+            self._append_log(
+                "action", message or f"gw: opened scratch {investigation.name}."
+            )
+        self._refresh_view()
+
+    def _run_suspended(
+        self, run: Callable[[], tuple[str | None, str | None]]
+    ) -> tuple[str | None, str | None]:
+        """Run with the terminal handed back to the shell — outside tmux, gw
+        execs `tmux attach`, which needs the real tty. Headless drivers (tests)
+        cannot suspend; there the callable needs no tty anyway."""
+        try:
+            with self.suspend():
+                return run()
+        except SuspendNotSupported:
+            return run()
 
     # --- window layout: detail placement + split size ----------------------
 
@@ -1443,6 +1636,16 @@ class AirflowWatchApp(App[None]):
         if self._filtering is not None:
             self.query_one("#status", Static).update(
                 ui.render_filter_prompt(self._filtering, self._queries[self._filtering])
+            )
+            return
+        # While a scroll-triggered extension is fetching, the bottom bar says
+        # so — otherwise the seconds it takes read as nothing happening.
+        if self._extending:
+            self.query_one("#status", Static).update(
+                ui.render_loading_older(
+                    len(self._runs),
+                    self._snapshot.runs_total if self._snapshot is not None else 0,
+                )
             )
             return
         self.query_one("#status", Static).update(

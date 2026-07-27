@@ -74,7 +74,7 @@ _LIST_COLUMNS = ("", "DAG", "Run", "Type", "State", "Started", "Duration")
 # indentation shows *what* feeds what, the number gives you something to say out
 # loud ("row 3 is the one that failed").
 _TASK_COLUMNS = ("#", "", "Task", "State", "Try", "Operator", "Started", "Duration")
-_DAG_COLUMNS = ("", "DAG", "Schedule", "Owners", "Tags", "Next run")
+_DAG_COLUMNS = ("", "DAG", "Running", "Schedule", "Owners", "Tags", "Next run")
 
 _DAG_ID_WIDTH = 34
 _RUN_ID_WIDTH = 26
@@ -207,8 +207,19 @@ def dag_marker(dag: Dag, live_errors: frozenset[str] = frozenset()) -> Text:
     return Text(" ")
 
 
+def running_cell(count: int) -> Text:
+    """The DAGs view's "is it running right now?" column: a live dot, with the
+    count when more than one run is in flight at once."""
+    if count <= 0:
+        return Text("—", style="dim")
+    return Text("●" if count == 1 else f"● {count}", style="bold cyan")
+
+
 def dag_row(
-    dag: Dag, now: datetime, live_errors: frozenset[str] = frozenset()
+    dag: Dag,
+    now: datetime,
+    live_errors: frozenset[str] = frozenset(),
+    running: int = 0,
 ) -> tuple[Text, ...]:
     name = Text(_elide(dag.dag_id, _DAG_ID_WIDTH), style="cyan")
     if dag.is_paused:
@@ -220,6 +231,7 @@ def dag_row(
     return (
         dag_marker(dag, live_errors),
         name,
+        running_cell(running),
         Text(_elide(dag.schedule or "—", 18), style="dim"),
         Text(_elide(", ".join(dag.owners) or "—", 16), style="dim"),
         Text(_elide(", ".join(dag.tags) or "—", 20), style="dim"),
@@ -230,7 +242,11 @@ def dag_row(
 def render_dag(
     dag: Dag, now: datetime, live_errors: frozenset[str] = frozenset()
 ) -> RenderableType:
-    """The selected DAG in the detail pane."""
+    """The selected DAG in the detail pane.
+
+    Same shape as the Run pane: the facts as `key: value` lines, one per line
+    (see `render_run` for why a column grid lost this job).
+    """
     body = Text()
     body.append(dag.dag_id, style="bold cyan")
     for label, style in (
@@ -245,17 +261,13 @@ def render_dag(
     if dag.description:
         body.append(f"\n{dag.description}", style="dim")
 
-    grid = Table.grid(expand=True, padding=(0, 2))
     stats: list[tuple[str, Text]] = [
         ("schedule", Text(dag.schedule or "—")),
         ("owners", Text(", ".join(dag.owners) or "—")),
         ("tags", Text(", ".join(dag.tags) or "—")),
         ("next run", Text(_stamp(dag.next_dagrun))),
     ]
-    for _ in stats:
-        grid.add_column(justify="center")
-    grid.add_row(*(Text(label.upper(), style="dim") for label, _ in stats))
-    grid.add_row(*(value for _, value in stats))
+    grid = key_value_lines(stats)
 
     return Panel(
         Group(
@@ -362,6 +374,9 @@ def render_summary(
         bar.append(f"● {running} running", style="bold cyan" if running else "dim")
         bar.append("   ")
         bar.append(f"◌ {queued} queued", style="yellow" if queued else "dim")
+        if snapshot.runs_truncated:
+            bar.append("   ")
+            bar.append("⋯ run list truncated", style="bold yellow")
     if snapshot.import_errors:
         bar.append("   ")
         bar.append(
@@ -377,7 +392,12 @@ def render_summary(
 
 
 def render_run(run: DagRun, dag: Dag | None, now: datetime) -> RenderableType:
-    """The selected run at level "runs": what it is and how to drill in."""
+    """The selected run at level "runs": what it is and how to drill in.
+
+    The facts read as `key: value` lines rather than a row of columns — a run
+    has too many fields for a horizontal grid to survive a narrow pane, and a
+    vertical list scans the same way whatever the split is set to.
+    """
     body = Text()
     body.append(run.dag_id, style="bold cyan")
     if dag is not None and dag.is_paused:
@@ -386,7 +406,6 @@ def render_run(run: DagRun, dag: Dag | None, now: datetime) -> RenderableType:
     body.append_text(state_cell(run.state))
     body.append(f"    {run.run_type or 'unknown'} run", style="dim")
 
-    grid = Table.grid(expand=True, padding=(0, 2))
     stats: list[tuple[str, Text]] = [
         ("logical date", Text(_stamp(run.logical_date))),
         ("started", Text(format_relative(run.start_date, now))),
@@ -400,10 +419,7 @@ def render_run(run: DagRun, dag: Dag | None, now: datetime) -> RenderableType:
     if dag is not None:
         stats.append(("owners", Text(", ".join(dag.owners) or "—")))
         stats.append(("next run", Text(_stamp(dag.next_dagrun))))
-    for _ in stats:
-        grid.add_column(justify="center")
-    grid.add_row(*(Text(label.upper(), style="dim") for label, _ in stats))
-    grid.add_row(*(value for _, value in stats))
+    grid = key_value_lines(stats)
 
     hint = Text("enter → task instances", style="dim italic")
     if run.note:
@@ -414,6 +430,16 @@ def render_run(run: DagRun, dag: Dag | None, now: datetime) -> RenderableType:
         border_style="cyan",
         padding=(1, 2),
     )
+
+
+def key_value_lines(stats: list[tuple[str, Text]]) -> Table:
+    """`key: value`, one per line, keys right-aligned so the values line up."""
+    grid = Table.grid(padding=(0, 1))
+    grid.add_column(justify="right", no_wrap=True)
+    grid.add_column()
+    for label, value in stats:
+        grid.add_row(Text(f"{label}:", style="dim"), value)
+    return grid
 
 
 def _stamp(value: datetime | None) -> str:
@@ -1057,6 +1083,19 @@ def render_filter_prompt(target: str, query: str) -> RenderableType:
     return body
 
 
+def render_loading_older(held: int, total: int) -> Text:
+    """The bottom bar while a scroll-triggered run extension is in flight.
+
+    The refresh countdown gives up its row for the duration: "the list is about
+    to grow" is the one thing the user just asked for by scrolling, and without
+    a notice the extra second or two of fetching reads as nothing happening.
+    """
+    notice = Text(justify="center")
+    notice.append("⇣ loading older runs… ", style="bold cyan")
+    notice.append(f"({held} of {total:,} loaded)", style="dim")
+    return notice
+
+
 # --- overlays --------------------------------------------------------------
 
 
@@ -1169,6 +1208,7 @@ def menu_entries(
             MenuEntry("/", "Search the log", "start_filter"),
             MenuEntry("<", "Previous log attempt", "prev_try"),
             MenuEntry(">", "Next log attempt", "next_try"),
+            MenuEntry("i", "Hand this run to gw for a summary", "investigate"),
             MenuEntry("esc", "Back to the task instances", "escape"),
         ]
     elif level == "tasks":
@@ -1177,6 +1217,7 @@ def menu_entries(
             MenuEntry("/", "Filter the task instances", "start_filter"),
             MenuEntry("c", "Clear (retry) the selected task", "clear_tasks"),
             MenuEntry("m", "Mark the selected task success / failed", "mark_tasks"),
+            MenuEntry("i", "Hand this run to gw for a summary", "investigate"),
             MenuEntry("esc", "Back to the runs list", "escape"),
         ]
     elif view == "dags":
@@ -1200,6 +1241,7 @@ def menu_entries(
             MenuEntry("/", "Filter the runs list", "start_filter"),
             MenuEntry("p", "Pause / unpause the selected DAG", "toggle_pause"),
             MenuEntry("t", "Trigger a run of the selected DAG", "trigger_run"),
+            MenuEntry("i", "Hand the selected run to gw for a summary", "investigate"),
             MenuEntry("e", "Show DAG import errors", "show_import_errors"),
         ]
     entries += [
@@ -1271,7 +1313,7 @@ def render_activity_log(entries: list[LogEntry]) -> RenderableType:
 
 
 HELP_KEYS: tuple[tuple[str, str], ...] = (
-    ("↑ / ↓", "Move through the list"),
+    ("↑ / ↓", "Move through the list — the bottom of the runs list loads older runs"),
     ("o", "Open the actions menu — everything below, narrowed to what applies"),
     ("v", "Switch view: DAG runs ↔ DAGs"),
     ("/", "Filter the list (or the log) — type to narrow, esc clears"),
@@ -1285,6 +1327,7 @@ HELP_KEYS: tuple[tuple[str, str], ...] = (
     ("t", "Trigger a new run of the selected DAG"),
     ("c", "Clear (retry) the selected task instance"),
     ("m", "Mark the selected task instance success / failed"),
+    ("i", "Hand the run to gw: gather metadata + task logs, summarize, wait"),
     ("d", "Cycle the detail pane: right → below → hidden"),
     ("g", "Show / hide the charts under the detail pane"),
     ("[ / ]", "Resize the windows: shrink / grow the list"),
@@ -1331,8 +1374,11 @@ def render_once(
         table.add_column(column, no_wrap=True)
     if view == "dags":
         live_errors = live_import_error_files(snapshot.import_errors)
+        running = snapshot.running_counts()
         for dag in snapshot.dags:
-            table.add_row(*dag_row(dag, now, live_errors))
+            table.add_row(
+                *dag_row(dag, now, live_errors, running=running.get(dag.dag_id, 0))
+            )
     else:
         for run in snapshot.runs:
             table.add_row(*list_row(run, now))

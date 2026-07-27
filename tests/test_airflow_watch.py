@@ -28,6 +28,7 @@ from textual.widgets import DataTable, Static
 
 from tools.airflow_watch import api, astro, layout, ui
 from tools.airflow_watch.app import (
+    RUNS_EXTEND_STEP,
     AirflowWatchApp,
     ConfirmScreen,
     DeploymentScreen,
@@ -37,7 +38,13 @@ from tools.airflow_watch.app import (
     MenuScreen,
 )
 from tools.airflow_watch.astro import AstroError, PollError
-from tools.airflow_watch.cli import _parse_args, _plain_deployment, _states
+from tools.airflow_watch import investigate
+from tools.airflow_watch.cli import (
+    DEFAULT_RUN_LIMIT,
+    _parse_args,
+    _plain_deployment,
+    _states,
+)
 from tools.airflow_watch.models import (
     ACTION_KINDS,
     KNOWN_RUN_STATES,
@@ -162,8 +169,9 @@ def _snapshot(
     deployments: tuple[Deployment, ...] | None = None,
 ) -> Snapshot:
     chosen = deployment or _deployment()
+    # The failed run started later, so the chronological sort puts it first.
     default_runs = (
-        _run_("sync_beta", run_id="r-broken", state="failed"),
+        _run_("sync_beta", run_id="r-broken", state="failed", start=NOW - timedelta(minutes=10)),
         _run_("sync_alpha", run_id="r-ok", state="success", end=NOW),
     )
     return Snapshot(
@@ -1406,11 +1414,18 @@ def test_plain_airflow_deployment_is_addressed_by_url() -> None:
     assert plain.label == "local"
 
 
-def test_sort_runs_attention_first_then_newest() -> None:
+def test_sort_runs_newest_start_first() -> None:
+    """The list is a timeline: newest start on top, scrolling down goes back in
+    time — a failed run keeps its chronological place and is *marked* instead
+    (the attention dot, the summary counts)."""
     calm_new = _run_("a", run_id="1", state="success", start=NOW, end=NOW)
     calm_old = _run_("b", run_id="2", state="success", start=NOW - timedelta(days=1), end=NOW)
     hot_old = _run_("c", run_id="3", state="failed", start=NOW - timedelta(days=3))
-    assert [r.dag_id for r in sort_runs([calm_old, calm_new, hot_old])] == ["c", "a", "b"]
+    assert [r.dag_id for r in sort_runs([calm_old, calm_new, hot_old])] == ["a", "b", "c"]
+    # A run that never started still has a place in time (its logical date);
+    # one with no date at all sinks to the bottom.
+    undated = DagRun(dag_id="z", run_id="4", state="queued")
+    assert [r.dag_id for r in sort_runs([undated, calm_old])] == ["b", "z"]
 
 
 def test_sort_task_instances_failed_first() -> None:
@@ -1973,8 +1988,8 @@ def test_fetch_snapshot_issues_one_call_per_pane(monkeypatch) -> None:
     snapshot = astro.fetch_snapshot(_deployment(), limit=5, states=("failed",))
     assert snapshot.calls == 3
     assert snapshot.elapsed >= 0
-    # Newest-attention-first, straight out of sort_runs.
-    assert [r.dag_id for r in snapshot.runs] == ["cw_beta", "sync_alpha", "monitoring"]
+    # Newest start first, straight out of sort_runs.
+    assert [r.dag_id for r in snapshot.runs] == ["cw_beta", "monitoring", "sync_alpha"]
     assert snapshot.paused_count == 1
     assert len(snapshot.import_errors) == 1
     # The state filter rides in the path of the runs call only.
@@ -2067,6 +2082,29 @@ async def test_paged_runs_never_repeat_a_row(monkeypatch) -> None:
         await app.workers.wait_for_complete()
         await pilot.pause()
         assert app.query_one(DataTable).row_count == 3
+
+
+def test_fetch_snapshot_says_when_the_run_list_hit_the_page_ceiling(monkeypatch) -> None:
+    """A run window wider than `MAX_RUN_PAGES` can page comes back marked
+    truncated — the flag that tells the app scrolling for more runs cannot get
+    more, and the summary bar to say so."""
+
+    def routed(args: list[str], *, timeout: float = 30.0, input_text: str | None = None) -> str:
+        if "dagRuns?" in args[-1]:
+            return json.dumps({"dag_runs": DAG_RUN_ROWS, "total_entries": 5000})
+        return json.dumps({"total_entries": 0})
+
+    monkeypatch.setattr(astro, "_run", routed)
+    ceiling = astro.MAX_RUN_PAGES * api.PAGE_LIMIT
+    snapshot = astro.fetch_snapshot(_deployment(), limit=ceiling + 100)
+    assert snapshot.runs_truncated
+    assert "run list truncated" in ui.render_summary(snapshot, None).plain
+
+    # A window the ceiling can serve is not truncated, however short the server's
+    # answer — "more exists" is `runs_total`'s job, not this flag's.
+    snapshot = astro.fetch_snapshot(_deployment(), limit=50)
+    assert not snapshot.runs_truncated
+    assert "run list truncated" not in ui.render_summary(snapshot, None).plain
 
 
 def test_fetch_snapshot_reuses_a_supplied_dag_list(monkeypatch) -> None:
@@ -2332,6 +2370,81 @@ def test_fetch_log_leaves_a_normal_log_whole(monkeypatch) -> None:
     assert "end of attempt 1" in out
 
 
+def test_fetch_run_bundle_fetches_failed_attempts_in_full(monkeypatch) -> None:
+    """Failed tasks contribute every attempt (the earlier tries are usually
+    where the answer is); everything else contributes only its latest. A log
+    that cannot be fetched becomes a note in the bundle — the run may be worth
+    summarizing precisely because one of its tasks is misbehaving."""
+    instances = {
+        "task_instances": [
+            {"task_id": "sensor", "state": "failed", "try_number": 2, "max_tries": 3},
+            {"task_id": "loader", "state": "success", "try_number": 2, "max_tries": 3},
+        ],
+        "total_entries": 2,
+    }
+    structure = {
+        "tasks": [
+            {"task_id": "sensor", "downstream_task_ids": ["loader"]},
+            {"task_id": "loader", "downstream_task_ids": []},
+        ]
+    }
+
+    def routed(args: list[str], *, timeout: float = 30.0, input_text: str | None = None) -> str:
+        path = args[-1]
+        if "/logs/" in path:
+            if "sensor" in path and "/logs/1" in path:
+                raise AstroError('`x` failed: 404 {"detail": "no log for attempt 1"}')
+            return json.dumps({"content": "log body"})
+        if path.endswith("/tasks"):
+            return json.dumps(structure)
+        if "taskInstances" in path:
+            return json.dumps(instances)
+        return "{}"
+
+    monkeypatch.setattr(astro, "_run", routed)
+    bundle = astro.fetch_run_bundle(_deployment(), _run_())
+    fetched = {(a.task.task_id, a.try_number) for a in bundle.logs}
+    assert fetched == {("sensor", 1), ("sensor", 2), ("loader", 2)}
+    broken = next(
+        a for a in bundle.logs if a.task.task_id == "sensor" and a.try_number == 1
+    )
+    assert broken.log is None and broken.error is not None
+    assert "no log for attempt 1" in broken.error
+    healthy = [a for a in bundle.logs if a.error is None]
+    assert healthy and all(
+        a.log is not None and a.log.content == "log body" for a in healthy
+    )
+    assert bundle.calls == 5  # instances + structure + three logs
+    assert not bundle.skipped
+    assert bundle.graph == {"sensor": ("loader",), "loader": ()}
+
+
+def test_fetch_run_bundle_caps_its_log_fetches_and_says_so(monkeypatch) -> None:
+    """Past the per-investigation ceiling the remaining attempts are *listed*,
+    not silently dropped — the report's reader cannot see what was left out."""
+    instances = {
+        "task_instances": [
+            {"task_id": "sensor", "state": "failed", "try_number": 2, "max_tries": 3},
+            {"task_id": "loader", "state": "success", "try_number": 1, "max_tries": 1},
+        ],
+        "total_entries": 2,
+    }
+
+    def routed(args: list[str], *, timeout: float = 30.0, input_text: str | None = None) -> str:
+        path = args[-1]
+        if "/logs/" in path:
+            return json.dumps({"content": "log body"})
+        if "taskInstances" in path:
+            return json.dumps(instances)
+        return "{}"
+
+    monkeypatch.setattr(astro, "_run", routed)
+    bundle = astro.fetch_run_bundle(_deployment(), _run_(), max_logs=1)
+    assert len(bundle.logs) == 1
+    assert len(bundle.skipped) == 2
+    assert all("attempt" in skipped for skipped in bundle.skipped)
+
+
 def test_mutations_send_their_body_on_stdin_with_an_explicit_method(monkeypatch) -> None:
     """`--input -` + `-X` rather than -f/-F, which would rewrite the method."""
     captured: list[list[str]] = []
@@ -2582,6 +2695,63 @@ def test_render_detail_walks_the_drill_levels() -> None:
     assert "to change attempt" in at_log
 
 
+def test_render_run_reads_as_key_value_lines() -> None:
+    """The Run pane lists its facts as `key: value`, one per line — a row of
+    columns dies in a narrow split; a vertical list scans the same everywhere."""
+    out = _plain_renderable(ui.render_run(_run_(end=NOW), _dag(), NOW), width=60)
+    for key in ("logical date:", "started:", "ended:", "duration:", "owners:", "next run:"):
+        assert key in out
+    assert "LOGICAL DATE" not in out  # no header row of uppercase columns
+
+
+def test_render_dag_reads_as_key_value_lines() -> None:
+    """The DAG pane matches the Run pane's shape: `key: value`, one per line."""
+    out = _plain_renderable(ui.render_dag(_dag(), NOW), width=60)
+    for key in ("schedule:", "owners:", "tags:", "next run:"):
+        assert key in out
+    assert "SCHEDULE" not in out  # no header row of uppercase columns
+    assert "data" in out and "databricks" in out  # the fixture's owner and tag
+
+
+def test_running_cell_marks_in_flight_dags() -> None:
+    assert ui.running_cell(0).plain == "—"
+    assert ui.running_cell(1).plain == "●"
+    assert ui.running_cell(3).plain == "● 3"
+
+
+def test_dags_view_shows_which_dags_are_running() -> None:
+    """The Running column is derived from the runs already on hand — a DAG with
+    a run in flight shows a live dot (and a count past one), the rest a dash."""
+    snapshot = _snapshot(
+        runs=(
+            _run_("sync_alpha", run_id="r1", state="running"),
+            _run_("sync_alpha", run_id="r2", state="running"),
+            _run_("sync_beta", run_id="r3", state="success"),
+        ),
+    )
+    assert snapshot.running_counts() == {"sync_alpha": 2}
+    out = _plain_renderable(ui.render_once(snapshot, NOW, view="dags"), width=170)
+    assert "Running" in out  # the column is named
+    alpha = next(line for line in out.splitlines() if "sync_alpha" in line)
+    assert "● 2" in alpha
+    beta = next(line for line in out.splitlines() if "sync_beta" in line)
+    assert "●" not in beta
+
+
+def test_render_loading_older_names_the_numbers() -> None:
+    out = ui.render_loading_older(150, 5000).plain
+    assert "loading older runs" in out
+    assert "150 of 5,000" in out
+
+
+def test_menu_offers_the_gw_hand_off_wherever_a_run_is_on_screen() -> None:
+    for view, level in (("runs", "runs"), ("runs", "tasks"), ("runs", "log")):
+        actions = [entry.action for entry in ui.menu_entries(view, level)]
+        assert "investigate" in actions, (view, level)
+    dags = [entry.action for entry in ui.menu_entries("dags", "runs")]
+    assert "investigate" not in dags
+
+
 def test_render_detail_shows_loading_and_error_states() -> None:
     snapshot = _snapshot()
     run = snapshot.runs[0]
@@ -2716,10 +2886,16 @@ def test_cli_defaults() -> None:
     args = _parse_args([])
     assert args.deployment is None
     assert args.interval == 60
-    assert args.limit == 50
+    assert args.limit == DEFAULT_RUN_LIMIT
     assert args.state is None
     assert args.api_url is None
     assert args.once is False
+
+
+def test_default_run_window_is_within_the_page_ceiling() -> None:
+    """The default window must be fetchable in full — a default that the paging
+    ceiling silently cut short would make every fresh session start truncated."""
+    assert DEFAULT_RUN_LIMIT <= astro.MAX_RUN_PAGES * api.PAGE_LIMIT
 
 
 def test_cli_state_is_repeatable_and_unvalidated() -> None:
@@ -2799,6 +2975,197 @@ def test_cli_a_stated_airflow_version_never_probes(monkeypatch) -> None:
     )
     assert stated.airflow_version == "2.10.5"
     assert captured == []
+
+
+def test_cli_poll_widens_the_fetch_to_the_apps_scrolled_window(monkeypatch) -> None:
+    """The poll closure honours `PollRequest.run_limit` — how far the runs list
+    has been scrolled — and only ever widens: a request below `--limit` cannot
+    shrink the fetch."""
+    from tools.airflow_watch import cli
+
+    limits: list[int] = []
+
+    def fake_fetch_snapshot(deployment, *, limit, states, deployments, dags, dag_pattern):
+        limits.append(limit)
+        return _snapshot(deployment=deployment)
+
+    polls = []
+
+    class FakeApp:
+        def __init__(self, *, poll, **kwargs):
+            polls.append(poll)
+
+        def run(self) -> None:
+            return None
+
+    monkeypatch.setattr(cli, "require_astro", lambda: None)
+    monkeypatch.setattr(cli, "list_deployments", lambda: [_deployment()])
+    monkeypatch.setattr(cli, "fetch_snapshot", fake_fetch_snapshot)
+    monkeypatch.setattr(cli, "AirflowWatchApp", FakeApp)
+    assert cli.main([]) == 0
+
+    [poll] = polls
+    poll(PollRequest())
+    poll(PollRequest(run_limit=DEFAULT_RUN_LIMIT + 500))
+    poll(PollRequest(run_limit=10))
+    assert limits == [DEFAULT_RUN_LIMIT, DEFAULT_RUN_LIMIT + 500, DEFAULT_RUN_LIMIT]
+
+
+# --- the gw hand-off ---------------------------------------------------------
+
+
+def _bundle(
+    *,
+    logs: tuple[astro.AttemptLog, ...] = (),
+    skipped: tuple[str, ...] = (),
+    tasks: tuple[TaskInstance, ...] | None = None,
+    truncated: bool = False,
+) -> astro.RunBundle:
+    resolved = tasks if tasks is not None else (_task("sensor", state="failed"), _task("loader"))
+    graph = {"sensor": ("loader",), "loader": ()}
+    return astro.RunBundle(
+        run=_run_(),
+        tasks=resolved,
+        rows=tuple(order_task_instances(list(resolved), graph)),
+        logs=logs,
+        skipped=skipped,
+        tasks_total=len(resolved),
+        tasks_truncated=truncated,
+        graph=graph,
+        calls=6,
+        elapsed=2.0,
+    )
+
+
+def test_log_tail_keeps_short_logs_and_cuts_long_ones_on_a_line() -> None:
+    text, cut = investigate.log_tail("short", limit=100)
+    assert text == "short" and not cut
+    body = "\n".join(f"line {number}" for number in range(100))
+    tail, cut = investigate.log_tail(body, limit=50)
+    assert cut
+    assert tail.startswith("line")  # the cut lands on a line boundary
+    assert body.endswith(tail)
+
+
+def test_scratch_name_is_slugged_and_timestamped() -> None:
+    run = _run_("My DAG.v2")
+    assert investigate.scratch_name(run, NOW) == "af-my-dag-v2-20260724-210000"
+
+
+def test_render_report_covers_metadata_tasks_and_log_tails() -> None:
+    """Everything the agent needs, and every omission stated in place: a fetch
+    that failed, a tail that was cut, attempts past the ceiling."""
+    sensor = _task("sensor", state="failed", try_number=2, max_tries=3)
+    loader = _task("loader")
+    long_log = "\n".join(f"line {number}" for number in range(3000))
+    bundle = _bundle(
+        tasks=(sensor, loader),
+        logs=(
+            astro.AttemptLog(task=sensor, try_number=1, error="Not permitted."),
+            astro.AttemptLog(
+                task=sensor, try_number=2, log=TaskLog(content=long_log, try_number=2)
+            ),
+            astro.AttemptLog(
+                task=loader, try_number=1, log=TaskLog(content="all good", try_number=1)
+            ),
+        ),
+        skipped=("mapper[3] attempt 1",),
+    )
+    run = bundle.run
+    report = investigate.render_report(_deployment(), run, _dag(), bundle, NOW)
+    assert f"# Airflow DAG run report: {run.dag_id} / {run.run_id}" in report
+    assert "- state: success" in report
+    assert "- deployment: Customers / Production (Airflow 2.11.0)" in report
+    assert "- owners: data" in report  # the DAG section rode along
+    assert "└─ loader" in report  # dependency order survives as plain text
+    assert "sensor — attempt 1 of 3 (failed)" in report
+    assert "Log could not be fetched: Not permitted." in report
+    assert "[showing the last 16,000 of" in report
+    assert report.count("line 2999") == 1  # the tail end is there…
+    assert "line 0\n" not in report  # …the cut-away head is not
+    assert "all good" in report
+    assert "mapper[3] attempt 1" in report  # the ceiling names what it dropped
+
+
+def test_render_report_says_when_the_task_list_itself_was_cut() -> None:
+    report = investigate.render_report(
+        _deployment(), _run_(), None, _bundle(truncated=True), NOW
+    )
+    assert "the task list was truncated" in report
+
+
+def test_build_prompt_orders_a_summary_and_a_stop() -> None:
+    path = pathlib.Path("/tmp/airflow-watch/af-x.md")
+    prompt = investigate.build_prompt(_deployment(), _run_(), path)
+    assert str(path) in prompt
+    assert "sync_alpha" in prompt
+    assert "summary" in prompt
+    assert "Do not make any changes" in prompt
+    assert "wait for instructions" in prompt
+
+
+def test_scratch_command_shape() -> None:
+    assert investigate.scratch_command("af-x", "read it") == [
+        "gw",
+        "scratch",
+        "af-x",
+        "--prompt",
+        "read it",
+    ]
+
+
+def test_prepare_writes_the_report_the_prompt_points_at(tmp_path) -> None:
+    bundle = _bundle(
+        logs=(
+            astro.AttemptLog(
+                task=_task("sensor"), try_number=1, log=TaskLog(content="x", try_number=1)
+            ),
+        )
+    )
+    investigation = investigate.prepare(
+        _deployment(), bundle.run, None, bundle, NOW, directory=tmp_path
+    )
+    assert investigation.path.parent == tmp_path / "airflow-watch"
+    assert investigation.path.read_text().startswith("# Airflow DAG run report")
+    assert str(investigation.path) in investigation.prompt
+    assert investigation.name in investigation.path.name
+    assert investigation.logs == 1 and investigation.calls == 6
+
+
+def test_run_scratch_without_gw_is_a_concise_error(monkeypatch) -> None:
+    monkeypatch.setattr(investigate.shutil, "which", lambda _: None)
+    message, error = investigate.run_scratch(_investigation())
+    assert message is None
+    assert error is not None and "gw not found" in error
+
+
+def test_run_scratch_reports_success_and_gw_failures(monkeypatch) -> None:
+    class FakeProc:
+        def __init__(self, returncode: int, stderr: str) -> None:
+            self.returncode = returncode
+            self.stderr = stderr
+
+    commands: list[list[str]] = []
+    monkeypatch.setattr(investigate.shutil, "which", lambda _: "/usr/local/bin/gw")
+
+    def succeed(cmd, *, stderr=None, text=None):
+        commands.append(cmd)
+        return FakeProc(0, "")
+
+    monkeypatch.setattr(investigate.subprocess, "run", succeed)
+    message, error = investigate.run_scratch(_investigation("af-demo"))
+    assert error is None
+    assert message is not None and "af-demo" in message
+    assert commands[0][:3] == ["gw", "scratch", "af-demo"]
+    assert commands[0][3] == "--prompt"
+
+    def fail(cmd, *, stderr=None, text=None):
+        return FakeProc(1, "Error: no agent configured\nHint: run gw doctor")
+
+    monkeypatch.setattr(investigate.subprocess, "run", fail)
+    message, error = investigate.run_scratch(_investigation())
+    assert message is None
+    assert error == "no agent configured"  # gw's line, without prefix or hint
 
 
 # --- the chart --------------------------------------------------------------
@@ -3073,6 +3440,18 @@ def _plain(widget: Static) -> str:
     return _plain_renderable(widget.content, width=140)
 
 
+def _investigation(name: str = "af-test") -> investigate.Investigation:
+    return investigate.Investigation(
+        name=name,
+        prompt="read the report and summarize",
+        path=pathlib.Path(f"/tmp/{name}.md"),
+        tasks=2,
+        logs=2,
+        calls=5,
+        elapsed=1.5,
+    )
+
+
 def _app(
     polls: list[tuple[Snapshot | None, PollError | None]] | None = None,
     *,
@@ -3086,12 +3465,18 @@ def _app(
     interval: int = 60,
     requested: list[PollRequest] | None = None,
     graph: dict[str, tuple[str, ...]] | None = None,
+    prepared: list | None = None,
+    prepare_error: PollError | None = None,
+    launched: list | None = None,
+    launch_error: str | None = None,
 ) -> AirflowWatchApp:
     """An app wired to fakes: one poll queue plus the three drill-down seams."""
     queue = list(polls) if polls else [(_snapshot(), None)]
     resolved_tasks = tasks if tasks is not None else [_task("sensor", state="failed"), _task("loader")]
     fired = performed if performed is not None else []
     asked = requested if requested is not None else []
+    gathered = prepared if prepared is not None else []
+    handed_off = launched if launched is not None else []
     # Default structure: sensor feeds loader, so the pane shows the tree.
     edges = graph if graph is not None else {"sensor": ("loader",), "loader": ()}
 
@@ -3129,12 +3514,26 @@ def _app(
         fired.append(action)
         return f"{action.summary} — ok", None
 
+    def prepare(_deployment, run, dag):
+        if prepare_error is not None:
+            return None, prepare_error
+        gathered.append((run, dag))
+        return _investigation(), None
+
+    def launch(inv):
+        if launch_error is not None:
+            return None, launch_error
+        handed_off.append(inv)
+        return f"gw: opened scratch {inv.name}.", None
+
     return AirflowWatchApp(
         poll=poll,
         interval=interval,
         fetch_tasks=fetch_tasks,
         fetch_log=fetch_log,
         perform=perform,
+        investigate=prepare,
+        launch=launch,
         layout_path=layout_path,
     )
 
@@ -3156,6 +3555,208 @@ async def test_app_lists_runs_and_shows_the_selected_one() -> None:
         await pilot.pause()
         assert app._selected_key is not None and "sync_alpha" in app._selected_key
         assert "sync_alpha" in _plain(app.query_one("#detail", Static))
+
+
+async def test_app_scrolling_near_the_bottom_loads_older_runs() -> None:
+    """The runs list is not a fixed window: moving the cursor near its bottom
+    asks the next poll for a wider run window, and every later refresh keeps
+    the window scrolling earned — a refresh cannot cut the list back."""
+    first = dataclasses.replace(
+        _snapshot(runs=tuple(_run_(f"dag_{i}", run_id=f"r{i}") for i in range(6))),
+        runs_total=40,
+    )
+    wider = dataclasses.replace(
+        _snapshot(runs=tuple(_run_(f"dag_{i}", run_id=f"r{i}") for i in range(12))),
+        runs_total=40,
+    )
+    asked: list[PollRequest] = []
+    app = _app([(first, None), (wider, None)], requested=asked)
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app.query_one(DataTable).row_count == 6
+        assert asked[0].run_limit is None  # the caller's default, untouched
+
+        await pilot.press("down")  # into the margin above the bottom row
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert asked[-1].run_limit == 6 + RUNS_EXTEND_STEP
+        assert app.query_one(DataTable).row_count == 12
+        assert any("older runs" in entry.message for entry in app.activity_log)
+
+        await pilot.press("r")  # a manual refresh keeps the grown window
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert asked[-1].run_limit == 6 + RUNS_EXTEND_STEP
+
+
+async def test_app_bottom_of_a_fully_loaded_run_list_asks_for_nothing() -> None:
+    """When the list already holds every run the server reports, hitting the
+    bottom costs no poll — there is nothing more to load."""
+    snapshot = dataclasses.replace(_snapshot(), runs_total=2)  # both runs held
+    asked: list[PollRequest] = []
+    app = _app([(snapshot, None)], requested=asked)
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        polls = len(asked)
+        await pilot.press("down")
+        await pilot.pause()
+        assert len(asked) == polls
+        assert app._wanted_runs is None
+
+
+async def test_app_run_list_page_ceiling_is_noted_once_not_hammered() -> None:
+    """At the fetch layer's paging ceiling, more scrolling cannot get more runs.
+    That is said once in the activity log — and never turned into re-fetches
+    that would spawn the same processes to hit the same wall."""
+    snapshot = dataclasses.replace(
+        _snapshot(), runs_total=5000, runs_truncated=True
+    )
+    asked: list[PollRequest] = []
+    app = _app([(snapshot, None)], requested=asked)
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        polls = len(asked)
+        for key in ("down", "up", "down"):  # bounce along the bottom
+            await pilot.press(key)
+            await pilot.pause()
+        assert len(asked) == polls
+        assert app._wanted_runs is None
+        notes = [e for e in app.activity_log if "ceiling" in e.message]
+        assert len(notes) == 1 and notes[0].level == "warn"
+
+
+async def test_app_deployment_switch_resets_the_scrolled_run_window() -> None:
+    """A run window grown by scrolling was earned against one deployment's
+    history; switching starts the new deployment back at the default."""
+    snapshot = dataclasses.replace(_snapshot(), runs_total=40)
+    asked: list[PollRequest] = []
+    app = _app([(snapshot, None)], requested=asked)
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("down")  # grows the window on this deployment
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert asked[-1].run_limit == 2 + RUNS_EXTEND_STEP
+
+        app.action_switch_deployment()
+        await pilot.pause()
+        await pilot.press("2")  # Staging
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert asked[-1].run_limit is None
+        assert asked[-1].deployment is not None
+        assert asked[-1].deployment.key == "dep-stg-2"
+
+
+async def test_app_extension_shows_a_loading_notice_in_the_bottom_bar() -> None:
+    """While the scroll-triggered fetch is in flight the bottom bar says so —
+    the seconds it takes would otherwise read as nothing happening."""
+    runs = tuple(_run_(f"dag_{i}", run_id=f"r{i}") for i in range(6))
+    snapshot = dataclasses.replace(_snapshot(runs=runs), runs_total=40)
+    holding = threading.Event()
+    released = threading.Event()
+
+    def poll(request: PollRequest):
+        if request.run_limit:  # the extension poll: hold it open
+            holding.set()
+            released.wait(5)
+        return snapshot, None
+
+    app = AirflowWatchApp(poll=poll, interval=60)
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("down")  # trigger the extension
+        for _ in range(200):  # yield so the held worker thread can start
+            if holding.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert holding.is_set()
+        await pilot.pause()
+        assert "loading older runs" in _plain(app.query_one("#status", Static))
+
+        released.set()  # the poll lands: the countdown takes the row back
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert "loading older runs" not in _plain(app.query_one("#status", Static))
+
+
+async def test_app_i_hands_the_selected_run_to_gw() -> None:
+    """`i` gathers the selected run through the injected preparer, then hands
+    the prepared investigation to the injected launcher — and both ends land
+    in the activity log, so 'did it actually fire?' has an answer."""
+    prepared: list = []
+    launched: list = []
+    app = _app(prepared=prepared, launched=launched)
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("i")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        run, dag = prepared[0]
+        assert run.dag_id == "sync_beta"  # the selected run
+        assert dag is not None and dag.dag_id == "sync_beta"
+        assert len(launched) == 1 and launched[0].name == "af-test"
+        assert any("report ready" in entry.message for entry in app.activity_log)
+        assert any(
+            entry.level == "action" and "af-test" in entry.message
+            for entry in app.activity_log
+        )
+
+
+async def test_app_i_gather_failure_never_launches() -> None:
+    launched: list = []
+    app = _app(
+        prepare_error=PollError(message="Not permitted.", kind="forbidden"),
+        launched=launched,
+    )
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("i")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert launched == []
+        assert any(
+            entry.level == "error" and "Not permitted." in entry.message
+            for entry in app.activity_log
+        )
+
+
+async def test_app_i_reports_a_gw_failure_and_carries_on() -> None:
+    app = _app(launch_error="gw not found on PATH — is goblin-watcher installed?")
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("i")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert any(
+            entry.level == "error" and "gw not found" in entry.message
+            for entry in app.activity_log
+        )
+        # The dashboard is still alive and polling.
+        assert app.query_one(DataTable).row_count == 2
+
+
+async def test_app_i_in_the_dags_view_does_nothing() -> None:
+    """The DAGs list has no run on screen; `i` there would have to guess."""
+    prepared: list = []
+    app = _app(prepared=prepared)
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("v")  # → DAGs view
+        await pilot.pause()
+        await pilot.press("i")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert prepared == []
 
 
 async def test_app_drills_run_to_tasks_to_log() -> None:

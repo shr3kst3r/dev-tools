@@ -357,6 +357,9 @@ class Snapshot:
     elapsed: float = 0.0
     runs_total: int = 0
     dags_total: int = 0
+    # Set when the run list was cut short by our page ceiling rather than by the
+    # requested limit — the signal that scrolling for more runs cannot get more.
+    runs_truncated: bool = False
     # Set when the DAG list was cut short by our page ceiling, which is what
     # makes a client-side DAG filter incomplete and a server-side one necessary.
     dags_truncated: bool = False
@@ -375,6 +378,16 @@ class Snapshot:
                 return candidate
         return None
 
+    def running_counts(self) -> dict[str, int]:
+        """How many currently-running runs each DAG has, from this snapshot's
+        runs window. Derived, not fetched: the DAGs view shows it, and a
+        running run is by nature recent enough to be inside the window."""
+        counts: dict[str, int] = {}
+        for run in self.runs:
+            if run.state == "running":
+                counts[run.dag_id] = counts.get(run.dag_id, 0) + 1
+        return counts
+
 
 @dataclass(frozen=True, slots=True)
 class PollRequest:
@@ -384,10 +397,14 @@ class PollRequest:
     selection yet and the caller's closure picks the default. `dag_pattern` is
     forwarded to the server-side DAG filter — used when the DAG list is too large
     to have been fully loaded, so filtering cannot be done client-side alone.
+    `run_limit` is how many runs the app wants, once scrolling to the bottom of
+    the runs list has grown it past the caller's own `--limit`; None leaves the
+    caller's default in charge.
     """
 
     deployment: Deployment | None = None
     dag_pattern: str = ""
+    run_limit: int | None = None
 
 
 # The mutating actions, in the order the confirmation modal describes them.
@@ -468,16 +485,17 @@ class LogEntry:
 
 
 def sort_runs(runs: list[DagRun]) -> list[DagRun]:
-    """Attention-needing runs first, newest first within each group.
+    """Newest first, by start time.
 
-    Mirrors `my_prs.models.sort_items`: the point of the list is that the thing
-    you need to look at is on top, not that it is chronological.
+    The list reads as a timeline: the run that started most recently is on
+    top, and scrolling down goes back in time — which is also what makes
+    "the bottom of the list loads older runs" coherent. (`sort_date` falls
+    back to the logical date, then `run_after`, for a run that has not
+    started; a run with no date at all sinks to the bottom.) Failed runs are
+    *marked*, not floated: the attention dot and the summary counts carry
+    "what needs looking at", so the ordering can carry "when".
     """
-
-    def key(run: DagRun) -> tuple[bool, float]:
-        return (not run.needs_attention, -run.sort_date.timestamp())
-
-    return sorted(runs, key=key)
+    return sorted(runs, key=lambda run: -run.sort_date.timestamp())
 
 
 def sort_task_instances(tasks: list[TaskInstance]) -> list[TaskInstance]:

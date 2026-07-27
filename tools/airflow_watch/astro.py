@@ -1,10 +1,11 @@
 """Airflow and Astro access for airflow-watch, via the `astro` CLI.
 
-The only module in the tool that performs I/O, and the only one that spawns a
-process. Mirrors `tools/pr_watch/github.py`: a single thin `_run()` wrapper, a
-`require_astro()` preflight, and a pure classification step that turns raw
-subprocess failures into typed, user-facing `PollError`s so no stderr ever
-reaches the UI.
+The only module in the tool that talks to Airflow or Astro, and the only one
+that spawns `astro` processes (`investigate.py` spawns exactly one other
+binary — `gw`, for the run hand-off). Mirrors `tools/pr_watch/github.py`: a
+single thin `_run()` wrapper, a `require_astro()` preflight, and a pure
+classification step that turns raw subprocess failures into typed, user-facing
+`PollError`s so no stderr ever reaches the UI.
 
 Why the CLI rather than HTTP (see the airflow-access-via-astro-cli ADR): Astro's
 ingress authenticates *every* path, its session tokens are 60-minute JWTs the
@@ -54,14 +55,17 @@ from .models import (
 __all__ = [
     "KINDS",
     "AstroError",
+    "AttemptLog",
     "Pages",
     "PollError",
+    "RunBundle",
     "RunTasks",
     "airflow_call",
     "airflow_get",
     "classify_astro_error",
     "detect_version",
     "fetch_log",
+    "fetch_run_bundle",
     "fetch_run_tasks",
     "fetch_snapshot",
     "list_deployments",
@@ -102,9 +106,11 @@ MAX_WORKERS = 8
 #
 # These ceilings bound one poll's cost. Hitting one truncates the list *visibly*
 # — the Snapshot carries the server's total, and the UI says "N of M" — because a
-# truncation nobody can see is the bug being fixed.
+# truncation nobody can see is the bug being fixed. Runs get the deepest ceiling:
+# the default window is ten pages (`cli.DEFAULT_RUN_LIMIT`) and scrolling the
+# runs list grows the window further, so the ceiling is where scrolling stops.
 MAX_DAG_PAGES = 12
-MAX_RUN_PAGES = 8
+MAX_RUN_PAGES = 20
 MAX_TASK_PAGES = 12
 
 
@@ -728,6 +734,7 @@ def fetch_snapshot(
         calls=calls,
         elapsed=elapsed,
         runs_total=run_pages.total,
+        runs_truncated=run_pages.truncated,
         dags_total=known.total or len(known.dags),
         dags_truncated=known.truncated,
     )
@@ -864,6 +871,112 @@ def _bounded(log: TaskLog) -> TaskLog:
     cut = head.rfind("\n")
     return dataclasses.replace(
         log, content=head[:cut] if cut > 0 else head, truncated=True
+    )
+
+
+# --- the investigation bundle -----------------------------------------------
+
+# How many log fetches one investigation may spend. Every attempt of a failed
+# task is fetched (the failure is the point of the exercise) and the latest
+# attempt of everything else; past this ceiling the bundle lists what was
+# skipped, so the report can say so instead of implying completeness.
+MAX_INVESTIGATION_LOGS = 100
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptLog:
+    """One attempt's log inside a `RunBundle` — or the concise, already-redacted
+    reason it could not be fetched. A failed fetch is a fact worth reporting,
+    not grounds to abandon the rest of the bundle."""
+
+    task: TaskInstance
+    try_number: int
+    log: TaskLog | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RunBundle:
+    """Everything the `i` hand-off gathers about one run before writing the
+    report `gw` is pointed at: the task instances (in dependency order, as
+    `rows`), their logs, and the honesty fields — what was skipped, whether the
+    task list itself was truncated, and what the gathering cost.
+
+    `graph` rides along for the same reason it does on `RunTasks`: the caller
+    caches it, because a DAG's structure only changes on deploy.
+    """
+
+    run: DagRun
+    tasks: tuple[TaskInstance, ...]
+    rows: tuple[TaskRow, ...]
+    logs: tuple[AttemptLog, ...]
+    skipped: tuple[str, ...]
+    tasks_total: int
+    tasks_truncated: bool
+    graph: dict[str, tuple[str, ...]]
+    calls: int
+    elapsed: float
+
+
+def fetch_run_bundle(
+    deployment: Deployment,
+    run: DagRun,
+    *,
+    graph: dict[str, tuple[str, ...]] | None = None,
+    max_logs: int = MAX_INVESTIGATION_LOGS,
+) -> RunBundle:
+    """One run's full context — task instances plus their logs — for the report
+    `gw scratch` is handed.
+
+    Log fetches fan out in parallel like everything else here: a 30-task run is
+    ~30 calls, which is seconds fanned out and a minute serial. Failed tasks
+    contribute *every* attempt (the earlier tries are usually where the answer
+    is); everything else contributes only its latest. A single log that cannot
+    be fetched becomes a note in the bundle rather than a failure of the whole
+    gather — the run may be worth summarizing precisely because one of its
+    tasks is misbehaving.
+    """
+    started = time.monotonic()
+    run_tasks = fetch_run_tasks(deployment, run, graph=graph)
+    wanted: list[tuple[TaskInstance, int]] = []
+    for row in run_tasks.rows:
+        task = row.task
+        tries = task.tries if task.failed else task.tries[-1:]
+        wanted += [(task, number) for number in tries]
+    to_fetch, dropped = wanted[:max_logs], wanted[max_logs:]
+
+    logs: list[AttemptLog] = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = [
+            (task, number, pool.submit(fetch_log, deployment, run, task, number))
+            for task, number in to_fetch
+        ]
+        for task, number, future in futures:
+            try:
+                logs.append(
+                    AttemptLog(task=task, try_number=number, log=future.result())
+                )
+            except (AstroError, api.UnsupportedAirflowVersion) as exc:
+                logs.append(
+                    AttemptLog(
+                        task=task,
+                        try_number=number,
+                        error=classify_astro_error(exc).message,
+                    )
+                )
+    return RunBundle(
+        run=run,
+        tasks=run_tasks.tasks,
+        rows=run_tasks.rows,
+        logs=tuple(logs),
+        skipped=tuple(
+            f"{task.display_id} attempt {number}" for task, number in dropped
+        ),
+        tasks_total=run_tasks.total,
+        tasks_truncated=run_tasks.truncated,
+        graph=run_tasks.graph,
+        calls=run_tasks.calls + len(to_fetch),
+        elapsed=time.monotonic() - started,
     )
 
 

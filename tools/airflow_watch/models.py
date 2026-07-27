@@ -5,10 +5,11 @@ API-version knowledge so the version seam stays in one place (`api.py`): these
 are the *normalized* shapes the UI renders, not the wire shapes.
 
 Run and task states are deliberately **plain strings, not enums**. A monitoring
-tool must survive an Airflow patch release inventing a state it has never heard
-of, so nothing here validates a state — `ui.state_style` buckets unknown values
-into a neutral fallback instead (see the airflow-2-only-behind-a-version-seam
-ADR).
+tool must survive an Airflow release inventing a state it has never heard of —
+Airflow 3's `awaiting_input` is the worked example — so nothing here validates a
+state; `ui.state_style` buckets unknown values into a neutral fallback instead
+(see the airflow-2-only-behind-a-version-seam ADR and the
+airflow-3-joins-the-version-seam ADR that widened it).
 """
 
 from __future__ import annotations
@@ -103,6 +104,11 @@ class DagRun:
     state: str
     run_type: str = ""
     logical_date: datetime | None = None
+    # When the run was eligible to run. Airflow 3 stamps this on every run and
+    # allows `logical_date` to be null (a manually triggered run often has no
+    # logical date at all); Airflow 2 has no such field, so it stays None there.
+    # Version-free data: which wire name fills it is the seam's business.
+    run_after: datetime | None = None
     start_date: datetime | None = None
     end_date: datetime | None = None
     note: str | None = None
@@ -129,8 +135,13 @@ class DagRun:
 
     @property
     def sort_date(self) -> datetime:
-        """Newest-first ordering key: when the run happened."""
-        return self.start_date or self.logical_date or _EPOCH
+        """Newest-first ordering key: when the run happened.
+
+        `run_after` is the last resort for a run that has not started and has
+        no logical date — without it, a just-triggered Airflow 3 run would sort
+        to the bottom of the list instead of the top until it started.
+        """
+        return self.start_date or self.logical_date or self.run_after or _EPOCH
 
     @property
     def search_text(self) -> str:
@@ -281,11 +292,11 @@ class TaskLog:
     """One attempt's log, as fetched for the log pane.
 
     `continuation_token` is what Airflow returns to resume a log read from where
-    this one stopped. It is carried, not used: v1 answers a `full_content`
-    request with the entire body and returns a token regardless, so there is
-    nothing here to page through — and the token is signed with the webserver's
-    secret, so we cannot read the `end_of_log` flag inside it. Incremental
-    tailing of a running task's log would use it; nothing does today.
+    this one stopped. It is carried, not used: a `full_content` request is
+    answered with the entire body and a token regardless, so there is nothing
+    here to page through — and the token is signed with the webserver's secret,
+    so we cannot read the `end_of_log` flag inside it. Incremental tailing of a
+    running task's log would use it; nothing does today.
 
     `truncated` says the fetch stopped short of the whole body
     (`astro.MAX_LOG_CHARS`), so the pane can say so instead of implying the log
@@ -384,10 +395,15 @@ class Action:
     """A requested mutation, fully specified before anyone confirms it.
 
     Built by the app, described to the user by the confirmation modal, and only
-    then handed to the client. `dry_run` is carried explicitly because Airflow
-    2's clear/set-state endpoints default it to *true* — a call that omits it
-    returns 200 and does nothing, so "did it actually fire?" has to be a
-    property of the request, not an assumption.
+    then handed to the client. `dry_run` is carried explicitly rather than left
+    to a default, because "did it actually fire?" has to be a property of the
+    request: the seam maps the flag to whichever dry-run mechanism the target's
+    version has, and every one of those defaults to *doing nothing*.
+
+    `map_index` is the selected task instance's own — `-1` for an unmapped task,
+    which is Airflow's sentinel too. It is the instance's coordinate rather than
+    a wire name, so it belongs here; what a version *does* with it (a body
+    field, a path segment, or nothing) is the seam's business.
     """
 
     kind: str
@@ -396,6 +412,7 @@ class Action:
     task_ids: tuple[str, ...] = ()
     state: str = ""
     dry_run: bool = False
+    map_index: int = -1
 
     @property
     def mutates(self) -> bool:

@@ -9,8 +9,9 @@ that wire the app to the `astro` transport — so `app.py` stays free of I/O and
 `astro.py` stays free of UI. `--once` prints a snapshot and returns before the
 App is ever constructed.
 
-Airflow 2 only for this cut. A 3.x target is refused by name rather than
-attempted; see `api.py` and the airflow-2-only-behind-a-version-seam ADR.
+Airflow 2 and Airflow 3 are both spoken; anything else is refused by name rather
+than attempted. See `api.py` and the airflow-2-only-behind-a-version-seam and
+airflow-3-joins-the-version-seam ADRs.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ from .astro import (
     PollError,
     RunTasks,
     classify_astro_error,
+    detect_version,
     fetch_log,
     fetch_run_tasks,
     fetch_snapshot,
@@ -131,8 +133,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--airflow-version",
         default=None,
         help=(
-            "Airflow version of the --api-url target, when it cannot be "
-            "discovered (default: assume the supported line)."
+            "Airflow version of the --api-url target (default: detected by "
+            "probing /version once at startup)."
         ),
     )
     parser.add_argument(
@@ -155,12 +157,13 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 def _plain_deployment(args: argparse.Namespace) -> Deployment:
     """A `--api-url` target, which skips Astro discovery entirely.
 
-    The version cannot be discovered for a plain Airflow (there is no
-    ListDeployments to ask), so it is either stated with `--airflow-version` or
-    assumed to be the supported line — and if it turns out not to be, the
-    refusal happens at the first request with the version named.
+    There is no ListDeployments to ask for a plain Airflow, so the version is
+    either stated with `--airflow-version` — which is taken at its word and
+    costs nothing — or detected by probing the target's `/version` once. It is
+    never assumed: guessing 2.x at an Airflow 3 server would fail as an obscure
+    404 on the first real request, which is what the seam exists to prevent.
     """
-    version = args.airflow_version or api.assumed_version()
+    version = args.airflow_version or detect_version(args.api_url)
     return Deployment(
         id="",
         name=args.api_url,
@@ -168,6 +171,28 @@ def _plain_deployment(args: argparse.Namespace) -> Deployment:
         status="",
         api_url=args.api_url,
     )
+
+
+class _PlainTarget:
+    """The `--api-url` deployment, resolved at most once per session.
+
+    Here for the same reason `_DagCache` is: `poll` runs on a timer, and how
+    often to re-establish something is a policy decision about the refresh loop.
+    Resolving a plain target can cost a `/version` probe, and the ADR is explicit
+    that the probe is a startup cost — a per-poll probe would spend ~0.7s every
+    refresh re-learning a number that cannot change without a redeploy.
+
+    A failed resolution is deliberately *not* remembered: an unreachable target
+    at 09:00 should be retried at 09:01 rather than wedging the session.
+    """
+
+    def __init__(self) -> None:
+        self._resolved: Deployment | None = None
+
+    def get(self, args: argparse.Namespace) -> Deployment:
+        if self._resolved is None:
+            self._resolved = _plain_deployment(args)
+        return self._resolved
 
 
 class _DagCache:
@@ -245,6 +270,7 @@ def main(argv: list[str] | None = None) -> int:
     states = _states(args)
     dag_cache = _DagCache()
     graph_cache = _GraphCache()
+    plain_target = _PlainTarget()
 
     try:
         require_astro()
@@ -279,13 +305,13 @@ def main(argv: list[str] | None = None) -> int:
         it staying current.
 
         `request.dag_pattern` is only non-empty when the app decided the DAG list
-        is too large to filter client-side, in which case it becomes v1's
+        is too large to filter client-side, in which case it becomes Airflow's
         server-side `dag_id_pattern`. Because that changes what a page contains,
         it also bypasses the DAG cache.
         """
         try:
             if args.api_url:
-                chosen = _plain_deployment(args)
+                chosen = plain_target.get(args)
                 deployments = [chosen]
             else:
                 deployments = list_deployments()

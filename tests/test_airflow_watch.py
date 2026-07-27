@@ -2,9 +2,10 @@
 error classification, redaction), the single subprocess seam, and the Textual
 app including its drill-down and its confirmation gate.
 
-Fixtures below are trimmed and anonymised captures of real Airflow 2.11.0
-responses from a live Astro deployment — deployment ids, hostnames and DAG names
-are renamed, and no fixture carries a credential.
+Fixtures below are trimmed and anonymised captures of real responses from live
+Astro deployments — Airflow 2.11.0 for the `*_PAYLOAD` fixtures and Airflow
+3.3.0 for the `*_V2_PAYLOAD` ones. Deployment ids, hostnames and DAG names are
+renamed, and no fixture carries a credential.
 
 The mutating actions are exercised **only** against fakes. Nothing here talks to
 a real Airflow, and nothing here may: the transport is faked at one seam
@@ -213,11 +214,25 @@ DEPLOYMENTS_PAYLOAD = {
             "status": "HEALTHY",
             "apiUrl": "https://dep-next-3.example.invalid/dnext/api/v2",
         },
+        # A major this build does not speak. Invented rather than captured —
+        # there is no Airflow 4 — and it exists so every refusal path keeps a
+        # target now that 3.x is supported.
+        {
+            "id": "dep-future-4",
+            "name": "Future",
+            "workspaceName": "Engineering",
+            "airflowVersion": "4.0.0",
+            "status": "HEALTHY",
+            "apiUrl": "https://dep-future-4.example.invalid/dfut/api/v4",
+        },
     ],
     "limit": 20,
     "offset": 0,
-    "totalCount": 3,
+    "totalCount": 4,
 }
+
+# The version this build refuses, named once so the refusal tests agree.
+UNSUPPORTED_VERSION = "4.0.0"
 
 DAG_RUN_ROWS: list[dict] = [
     {
@@ -352,15 +367,104 @@ LOG_PAYLOAD = {
 }
 
 
+# --- Airflow 3.3.0 captures ------------------------------------------------
+#
+# The three responses whose *shape* differs from v1, taken from the live 3.3.0
+# deployment (read-only GETs) rather than from the spec. Everything else the
+# tool reads — runs, task instances, the task graph, import errors — comes back
+# with the same field names in both majors and is covered by the v1 fixtures.
+
+DAGS_V2_PAYLOAD = {
+    "dags": [
+        {
+            "dag_id": "sync_alpha",
+            "dag_display_name": "sync_alpha",
+            "description": "Sync alpha",
+            "fileloc": "/usr/local/airflow/dags/jobs.py",
+            "has_import_errors": False,
+            # `is_stale`, not `is_active` — and the sense is inverted.
+            "is_stale": False,
+            "is_paused": True,
+            # `next_dagrun` is gone; the run-after form is what the UI wants.
+            "next_dagrun_logical_date": "2026-07-24T21:40:00+00:00",
+            "next_dagrun_run_after": "2026-07-24T22:40:00+00:00",
+            "owners": ["data"],
+            # A plain cron string where v1 had a typed `schedule_interval` object.
+            "timetable_summary": "40 * * * *",
+            "timetable_description": "At minute 40",
+            "tags": [{"name": "databricks"}, {"name": "data"}],
+        },
+        {
+            "dag_id": "cw_beta",
+            "fileloc": "/usr/local/airflow/dags/broken.py",
+            "has_import_errors": True,
+            "is_stale": True,
+            "is_paused": False,
+            "next_dagrun_run_after": None,
+            "owners": ["cs", "data"],
+            "timetable_summary": None,
+            "timetable_description": "Never, external triggers only",
+            "tags": [],
+        },
+    ],
+    "total_entries": 2,
+}
+
+# v2 answers a log request with a JSON array of structured events. The trailing
+# bare string is real: the source-details preamble arrives unstructured.
+LOG_V2_PAYLOAD = {
+    "content": [
+        {
+            "event": "::group::Log message source details",
+            "level": "info",
+            "logger": "airflow.task",
+            "timestamp": "2026-07-27T09:12:01.004+00:00",
+            "sources": ["s3://logs/dag_id=sync_alpha/attempt=1.log"],
+        },
+        {
+            "event": "start",
+            "level": "info",
+            "timestamp": "2026-07-27T09:12:02.561+00:00",
+            "chan": "stdout",
+        },
+        {
+            "event": "Task failed with exception",
+            "level": "error",
+            "timestamp": "2026-07-27T09:41:13.710+00:00",
+        },
+        "*** Found logs in s3:",
+    ],
+    "continuation_token": "eyJlbmRfb2ZfbG9nIjp0cnVlfQ.Zm9vYmFy",
+}
+
+# FastAPI reports a validation failure with `detail` as a *list*, which the
+# string-shaped RFC-7807 reader walks straight past.
+VALIDATION_ERROR_V2_PAYLOAD = {
+    "detail": [
+        {
+            "type": "missing",
+            "loc": ["body", "logical_date"],
+            "msg": "Field required",
+            "input": {"conf": {}},
+        },
+        {"type": "missing", "loc": ["body", "conf"], "msg": "Field required"},
+    ]
+}
+
+
 # --- the version seam ------------------------------------------------------
 
 
-def test_supports_airflow_2_only() -> None:
+def test_supports_airflow_2_and_3_and_nothing_else() -> None:
     assert api.supports("2.11.0")
     assert api.supports("2.10")
     assert api.supports("v2.11.0+astro.1")
-    assert not api.supports("3.0.0")
-    assert not api.supports("3.1")
+    assert api.supports("3.0.0")
+    assert api.supports("3.3.0")
+    assert api.supports("v3.3.0+astro.2")
+    # The refusal machinery stays in place; it just fires for other majors now.
+    assert not api.supports("1.10.15")
+    assert not api.supports(UNSUPPORTED_VERSION)
     assert not api.supports("")
     assert not api.supports("banana")
 
@@ -369,19 +473,21 @@ def test_major_version_is_lenient() -> None:
     assert api.major_version("2.11.0") == 2
     assert api.major_version(" v2.11 ") == 2
     assert api.major_version("3.0.2") == 3
+    assert api.major_version("3.3.0+astro.2") == 3
     assert api.major_version("nonsense") is None
 
 
-def test_base_path_refuses_airflow_3_by_name() -> None:
+def test_base_path_is_per_major_and_refuses_the_rest_by_name() -> None:
     assert api.base_path("2.11.0") == "/api/v1"
+    assert api.base_path("3.3.0") == "/api/v2"
     try:
-        api.base_path("3.0.2")
+        api.base_path(UNSUPPORTED_VERSION)
     except api.UnsupportedAirflowVersion as exc:
-        assert exc.version == "3.0.2"
-        assert "3.0.2" in str(exc)  # the refusal names the detected version
-        assert "Airflow 2.x" in str(exc)
+        assert exc.version == UNSUPPORTED_VERSION
+        assert UNSUPPORTED_VERSION in str(exc)  # the refusal names what it saw
+        assert "Airflow 2.x" in str(exc) and "Airflow 3.x" in str(exc)
     else:  # pragma: no cover - the raise is the behaviour under test
-        raise AssertionError("3.0.2 must be refused")
+        raise AssertionError(f"{UNSUPPORTED_VERSION} must be refused")
 
 
 def test_unsupported_message_names_version_even_when_blank() -> None:
@@ -397,30 +503,114 @@ def test_api_url_for_appends_base_path_only_when_missing() -> None:
         api.api_url_for("https://airflow.example.invalid/api/v1/", "2.11.0")
         == "https://airflow.example.invalid/api/v1"
     )
+    assert (
+        api.api_url_for("https://airflow.example.invalid", "3.3.0")
+        == "https://airflow.example.invalid/api/v2"
+    )
+    assert (
+        api.api_url_for("https://airflow.example.invalid/api/v2", "3.3.0")
+        == "https://airflow.example.invalid/api/v2"
+    )
 
 
-def test_assumed_version_is_concrete_and_supported() -> None:
-    # It is handed straight to `astro --airflow-version`, which uses it to pick a
-    # bundled OpenAPI spec, so "2.x" would not do.
-    assumed = api.assumed_version()
-    assert api.supports(assumed)
-    assert re.fullmatch(r"\d+\.\d+\.\d+", assumed)
+def test_api_url_for_replaces_the_other_majors_suffix() -> None:
+    """A URL copied from a 3.x deployment but pinned to 2.x (or the reverse)
+    must not become `…/api/v2/api/v1` — every request would 404."""
+    assert (
+        api.api_url_for("https://airflow.example.invalid/api/v2", "2.11.0")
+        == "https://airflow.example.invalid/api/v1"
+    )
+    assert (
+        api.api_url_for("https://airflow.example.invalid/api/v1/", "3.3.0")
+        == "https://airflow.example.invalid/api/v2"
+    )
+
+
+def test_probe_pins_are_concrete_and_ordered_by_the_urls_hint() -> None:
+    """Each pin is handed straight to `astro --airflow-version`, which uses it to
+    pick a bundled OpenAPI spec, so "2.x" would not do."""
+    pins = api.probe_pins("https://airflow.example.invalid")
+    assert len(pins) == 2
+    for pin in pins:
+        assert api.supports(pin)
+        assert re.fullmatch(r"\d+\.\d+\.\d+", pin)
+    # One pin per major, so a probe cannot miss a supported line.
+    assert {api.major_version(pin) for pin in pins} == {2, 3}
+    # No hint: the 2.x line first, which is what the old assume-2.11 behaviour
+    # did — an existing plain-2.x user still succeeds on call one.
+    assert api.major_version(pins[0]) == 2
+    # A URL that already names a base path is asked in that dialect first.
+    v2_first = api.probe_pins("https://airflow.example.invalid/api/v2")
+    assert api.major_version(v2_first[0]) == 3
+    assert set(v2_first) == set(pins)
+    assert api.major_version(api.probe_pins("https://x/api/v1/")[0]) == 2
+
+
+def test_version_path_and_parse_version() -> None:
+    assert api.version_path() == "/version"
+    assert api.parse_version({"version": "2.11.0"}) == "2.11.0"
+    assert api.parse_version({"version": " 3.1.2 "}) == "3.1.2"
+    assert api.parse_version({"git_version": "abc"}) == ""
+    assert api.parse_version("2.11.0") == ""
+    assert api.parse_version(None) == ""
+
+
+def test_parse_version_keeps_the_release_and_drops_the_build_suffix() -> None:
+    """What comes back is handed to `astro --airflow-version`, which loads the
+    OpenAPI spec *named by it* — so it has to be a version the CLI can resolve.
+    An Astro Runtime image reports `3.3.0+astro.2`, which is not a released
+    Airflow and 404s the spec fetch, turning a successful probe into a session
+    where every later call fails. The release is kept exactly; only the build
+    metadata goes."""
+    for reported, pinned in (
+        ("3.3.0+astro.2", "3.3.0"),
+        ("2.11.0+astro.7", "2.11.0"),
+        ("2.10.3", "2.10.3"),
+    ):
+        detected = api.parse_version({"version": reported})
+        assert detected == pinned
+        # Shaped like the probe pins, which is the shape the CLI resolves.
+        assert re.fullmatch(r"\d+\.\d+\.\d+", detected)
+        assert api.supports(detected)
+    # An unsupported major still survives intact, so the refusal can name it.
+    assert api.parse_version({"version": "4.0.0+astro.1"}) == UNSUPPORTED_VERSION
 
 
 # --- ADR constraint: nothing version-specific outside api.py ---------------
 
 _PACKAGE = pathlib.Path(__file__).resolve().parent.parent / "tools" / "airflow_watch"
 
-# Airflow-v1 wire names. Each appears as a *string literal* only inside api.py;
-# the same words exist as normalized model attributes, which is fine — it is the
-# wire spelling that is version-specific.
-_V1_WIRE_NAMES = (
+# Version-specific wire names, **both dialects in one list**: the constraint is
+# that no version's spelling appears outside api.py, whichever version it
+# belongs to. Each appears as a *string literal* only inside api.py; the same
+# words exist as normalized model attributes (`Dag.is_stale`, `Action.map_index`),
+# which is fine — it is the wire spelling that is version-specific.
+_VERSIONED_WIRE_NAMES = (
+    # v1
     "execution_date",
     "only_active",
+    "is_active",
+    "schedule_interval",
+    "next_dagrun",
+    # v2
+    "exclude_stale",
+    "is_stale",
+    "run_after",
+    "next_dagrun_run_after",
+    "timetable_summary",
+    "timetable_description",
+    # The ordering *values*. `order_by` is spelled the same in both majors, but
+    # `-execution_date` does not exist in v2 and an unknown one is ignored
+    # rather than rejected, so the value is the version-specific part. Listed in
+    # their own right because the leading `-` means the bare names above would
+    # not match a leaked `"-run_after"`.
+    "-execution_date",
+    "-run_after",
+    # shared spellings that are still wire names, not model names
     "dag_run_id",
-    # The two endpoints that disagree with each other: `clearTaskInstances` takes
-    # `task_ids`, `updateTaskInstancesState` takes `task_id`. Which is which is
-    # exactly the kind of knowledge that must not leak out of the seam.
+    # The two v1 endpoints that disagree with each other: `clearTaskInstances`
+    # takes `task_ids`, `updateTaskInstancesState` takes `task_id`. Which is
+    # which is exactly the kind of knowledge that must not leak out of the seam.
     "task_id",
     "task_ids",
     "map_index",
@@ -436,16 +626,31 @@ _V1_WIRE_NAMES = (
     "new_state",
     "is_paused",
     "has_import_errors",
-    "next_dagrun",
 )
 
 # The seam's own version-dispatch machinery. A reference to any of these outside
-# api.py would be a version conditional living in the wrong module.
+# api.py would be a version conditional living in the wrong module. (Public
+# helpers the transport legitimately calls — `base_path`, `probe_pins`,
+# `supports` — are not listed: the constraint is on *dispatching*, not on
+# asking.)
 _SEAM_INTERNALS = (
     "_SUPPORTED_MAJORS",
     "_V1_BASE_PATH",
-    "_DEFAULT_SPEC_VERSION",
+    "_V2_BASE_PATH",
+    "_PROBE_PINS",
+    "_serves_v2",
     "major_version",
+)
+
+# Endpoints only one major has. Checked as *bare* substrings, not quoted ones:
+# a path is built by interpolation (`f"/dags/{dag_id}/…"`), so the quoted-literal
+# form used for field names would never see one. This is what holds the
+# airflow-3-joins-the-version-seam decision to move the whole (method, path,
+# body) construction into `api.mutation_request` — the transport used to build
+# these itself, and nothing else stops it doing so again.
+_VERSIONED_ENDPOINTS = (
+    "updateTaskInstancesState",  # v1's set-state collection endpoint
+    "/dry_run",  # v2's separate side-effect-free mark endpoint
 )
 
 
@@ -458,7 +663,10 @@ def test_no_api_version_literal_outside_api_module() -> None:
     assert _modules_outside_api(), "expected other modules to check"
     for path in _modules_outside_api():
         assert "/api/v" not in path.read_text(), f"{path.name} contains an /api/v literal"
-    assert "/api/v1" in (_PACKAGE / "api.py").read_text()
+    # Both dialects' base paths live in the seam, and only there.
+    seam = (_PACKAGE / "api.py").read_text()
+    assert "/api/v1" in seam
+    assert "/api/v2" in seam
 
 
 def test_no_version_conditional_outside_api_module() -> None:
@@ -468,40 +676,88 @@ def test_no_version_conditional_outside_api_module() -> None:
             assert name not in text, f"{path.name} reaches into the version seam ({name})"
 
 
-def test_no_v1_field_name_outside_api_module() -> None:
+def test_no_versioned_field_name_outside_api_module() -> None:
     for path in _modules_outside_api():
         text = path.read_text()
-        for name in _V1_WIRE_NAMES:
-            assert f'"{name}"' not in text, f"{path.name} spells the v1 field {name}"
-            assert f"'{name}'" not in text, f"{path.name} spells the v1 field {name}"
+        for name in _VERSIONED_WIRE_NAMES:
+            assert f'"{name}"' not in text, f"{path.name} spells the wire field {name}"
+            assert f"'{name}'" not in text, f"{path.name} spells the wire field {name}"
+
+
+def test_no_version_specific_endpoint_outside_api_module() -> None:
+    """A mutation's *shape* is version knowledge too, so the path belongs to the
+    seam as much as the field names do."""
+    seam = (_PACKAGE / "api.py").read_text()
+    for name in _VERSIONED_ENDPOINTS:
+        assert name in seam, f"{name} should be built in api.py"
+        for path in _modules_outside_api():
+            assert name not in path.read_text(), (
+                f"{path.name} builds the version-specific endpoint {name}"
+            )
 
 
 # --- ADR constraint: query params in the path, never -f/-F ------------------
 
 
+V1 = "2.11.0"
+V2 = "3.3.0"
+
+
 def test_built_paths_embed_query_parameters() -> None:
     # -f/-F would silently flip the request to POST and return 405 on a GET
     # endpoint, so every filter has to ride in the path string.
-    runs = api.dag_runs_path(limit=25, states=("failed", "running"))
-    assert runs.startswith("/dags/~/dagRuns?")
-    assert "limit=25" in runs
-    assert runs.count("state=") == 2  # repeated key, not a comma list
-    assert "order_by=" in runs
+    for version in (V1, V2):
+        runs = api.dag_runs_path(version=version, limit=25, states=("failed", "running"))
+        assert runs.startswith("/dags/~/dagRuns?"), version
+        assert "limit=25" in runs
+        assert runs.count("state=") == 2  # repeated key, not a comma list
+        assert "order_by=" in runs
 
-    dags = api.dags_path(limit=10)
-    assert dags.startswith("/dags?")
-    assert "limit=10" in dags
+        dags = api.dags_path(version=version, limit=10)
+        assert dags.startswith("/dags?"), version
+        assert "limit=10" in dags
 
     assert api.import_errors_path(limit=5) == "/importErrors?limit=5"
     assert "?update_mask=is_paused" in api.pause_dag_path("d")
     assert "full_content=true" in api.log_path("d", "r", "t", 1)
 
 
+def test_dags_path_turns_off_the_hide_stale_filter_in_both_dialects() -> None:
+    """The filter defaults to hiding in both majors, and v2 *ignores* the v1
+    spelling silently — so sending the wrong one would quietly drop rows rather
+    than fail. The name is the whole test."""
+    v1 = api.dags_path(version=V1, dag_id_pattern="sync")
+    assert "only_active=false" in v1
+    assert "exclude_stale" not in v1
+    v2 = api.dags_path(version=V2, dag_id_pattern="sync")
+    assert "exclude_stale=false" in v2
+    assert "only_active" not in v2
+    # The rest of the query is shared.
+    for path in (v1, v2):
+        assert "dag_id_pattern=sync" in path
+        assert f"limit={api.DEFAULT_LIMIT}" in path
+
+
+def test_dag_runs_path_orders_newest_first_in_each_dialect() -> None:
+    """Pinned to the exact values: `-execution_date` does not exist in Airflow 3,
+    and an unknown `order_by` there is ignored rather than rejected — the runs
+    list would come back in an arbitrary order and look plausible."""
+    assert "order_by=-execution_date" in api.dag_runs_path(version=V1)
+    assert "order_by=-run_after" in api.dag_runs_path(version=V2)
+    # Same wildcard, same paging, either way.
+    for version in (V1, V2):
+        path = api.dag_runs_path(version=version, limit=7, offset=100)
+        assert path.startswith("/dags/~/dagRuns?")
+        assert "limit=7" in path and "offset=100" in path
+
+
 def test_built_paths_have_no_trailing_slash() -> None:
     paths = [
-        api.dags_path(),
+        api.dags_path(version=V1),
+        api.dags_path(version=V2),
         api.dag_path("d"),
-        api.dag_runs_path(),
+        api.dag_runs_path(version=V1),
+        api.dag_runs_path(version=V2),
         api.task_instances_path("d", "r"),
         api.log_path("d", "r", "t", 2),
         api.import_errors_path(),
@@ -509,6 +765,8 @@ def test_built_paths_have_no_trailing_slash() -> None:
         api.trigger_run_path("d"),
         api.clear_task_instances_path("d"),
         api.mark_task_state_path("d"),
+        api.mark_task_instance_path("d", "r", "t"),
+        api.mark_task_instance_path("d", "r", "t", map_index=3, dry_run=True),
     ]
     for path in paths:
         assert path.startswith("/")
@@ -551,11 +809,21 @@ def test_astro_never_passes_field_flags() -> None:
 
 
 def test_trigger_body_uses_logical_date_not_execution_date() -> None:
-    body = api.trigger_body(NOW)
-    assert body["logical_date"] == NOW.isoformat()
-    assert "execution_date" not in body  # removed from the Airflow 3 payload
-    assert api.trigger_body()["conf"] == {}
-    assert "logical_date" not in api.trigger_body()
+    for version in (V1, V2):
+        body = api.trigger_body(version, NOW)
+        assert body["logical_date"] == NOW.isoformat()
+        assert "execution_date" not in body  # gone from the Airflow 3 payload
+        assert api.trigger_body(version)["conf"] == {}
+
+
+def test_trigger_body_states_a_null_logical_date_only_for_v2() -> None:
+    """v2 makes the field required-but-nullable: omitting it is a validation
+    error, and an explicit null is how you ask the server to stamp the date.
+    v1 has no such rule and omitting it is the documented way."""
+    v2 = api.trigger_body(V2)
+    assert "logical_date" in v2
+    assert v2["logical_date"] is None
+    assert "logical_date" not in api.trigger_body(V1)
 
 
 def test_clear_and_mark_bodies_always_state_dry_run() -> None:
@@ -593,21 +861,166 @@ def test_pause_body() -> None:
     assert api.pause_body(False) == {"is_paused": False}
 
 
+# --- mutations: the whole request, per major -------------------------------
+
+
+def _mark(
+    *,
+    task_ids: tuple[str, ...] = ("sensor",),
+    state: str = "success",
+    dry_run: bool = False,
+    map_index: int = -1,
+) -> Action:
+    return Action(
+        kind="mark",
+        dag_id="sync_alpha",
+        run_id="manual__2026-07-27T09:00:00+00:00",
+        task_ids=task_ids,
+        state=state,
+        dry_run=dry_run,
+        map_index=map_index,
+    )
+
+
+def test_mutation_request_shares_pause_trigger_and_clear_across_majors() -> None:
+    """Three of the five actions were verified identical in 3.3.0 — including
+    `clearTaskInstances`, which the original seam ADR recorded as removed."""
+    for kind in ("pause", "unpause"):
+        v1 = api.mutation_request(V1, Action(kind=kind, dag_id="sync_alpha"))
+        assert v1 == api.mutation_request(V2, Action(kind=kind, dag_id="sync_alpha"))
+        assert v1[0] == "PATCH"
+        assert "update_mask=is_paused" in v1[1]
+
+    trigger = Action(kind="trigger", dag_id="sync_alpha")
+    assert api.mutation_request(V1, trigger)[:2] == api.mutation_request(V2, trigger)[:2]
+    assert api.mutation_request(V1, trigger)[0] == "POST"
+
+    clear = Action(kind="clear", dag_id="d", run_id="r", task_ids=("t",), dry_run=True)
+    assert api.mutation_request(V1, clear) == api.mutation_request(V2, clear)
+    method, path, body = api.mutation_request(V2, clear)
+    assert (method, path) == ("POST", "/dags/d/clearTaskInstances")
+    assert body["dry_run"] is True
+
+
+def test_mutation_request_marks_a_task_with_v1s_collection_endpoint() -> None:
+    method, path, body = api.mutation_request(V1, _mark())
+    assert method == "POST"
+    assert path == "/dags/sync_alpha/updateTaskInstancesState"
+    assert body["task_id"] == "sensor"  # not a `task_ids` list
+    assert body["new_state"] == "success"
+    assert body["dry_run"] is False
+    # v1 says "dry run" in the body, so the path never moves.
+    assert api.mutation_request(V1, _mark(dry_run=True))[1] == path
+    assert api.mutation_request(V1, _mark(dry_run=True))[2]["dry_run"] is True
+    # ...and a mapped instance is expanded by the endpoint, not addressed.
+    assert api.mutation_request(V1, _mark(map_index=3))[1] == path
+
+
+def test_mutation_request_marks_a_task_by_patching_the_instance_on_v2() -> None:
+    """Airflow 3 removed `updateTaskInstancesState`. Its replacement addresses
+    the instance by path, so both of the things v1 carried in the body — which
+    task, and whether this is a dry run — become path segments."""
+    method, path, body = api.mutation_request(V2, _mark())
+    assert method == "PATCH"
+    assert path == (
+        "/dags/sync_alpha/dagRuns/manual__2026-07-27T09%3A00%3A00%2B00%3A00"
+        "/taskInstances/sensor"
+    )
+    assert body == {"new_state": "success"}  # exactly this, nothing else
+
+    # The dry run is a *different endpoint*, side-effect-free by construction,
+    # not a flag — and the body stays identical.
+    dry_method, dry_path, dry_body = api.mutation_request(V2, _mark(dry_run=True))
+    assert dry_method == "PATCH"
+    assert dry_path == path + "/dry_run"
+    assert dry_body == body
+    assert "dry_run" not in dry_body
+
+    # A mapped instance names its index in the path; -1 means "not mapped" and
+    # stays off, exactly as it does for a log request.
+    assert api.mutation_request(V2, _mark(map_index=3))[1] == path + "/3"
+    assert api.mutation_request(V2, _mark(map_index=-1))[1] == path
+    assert (
+        api.mutation_request(V2, _mark(map_index=3, dry_run=True))[1]
+        == path + "/3/dry_run"
+    )
+
+
+def test_mutation_request_marks_exactly_one_task_in_both_majors() -> None:
+    """v1's endpoint names one `task_id` in its body and v2's addresses one
+    instance by path: different reasons, same contract. Marking one of several
+    silently is the failure being refused."""
+    for version in (V1, V2):
+        for task_ids in ((), ("a", "b")):
+            try:
+                api.mutation_request(version, _mark(task_ids=task_ids))
+            except ValueError as exc:
+                assert "exactly one task instance" in str(exc)
+                assert str(len(task_ids)) in str(exc)
+            else:  # pragma: no cover
+                raise AssertionError(f"{version} {task_ids!r} must be refused")
+
+
+def test_mutation_request_refuses_an_unscoped_clear_or_mark_in_both_majors() -> None:
+    for version in (V1, V2):
+        for kind in ("clear", "mark"):
+            try:
+                api.mutation_request(
+                    version,
+                    Action(kind=kind, dag_id="d", task_ids=("t",), state="success"),
+                )
+            except ValueError as exc:
+                assert "every run" in str(exc), (version, kind)
+            else:  # pragma: no cover
+                raise AssertionError(f"an unscoped {kind} must be refused")
+
+
+def test_mutation_request_refuses_an_unknown_kind() -> None:
+    for version in (V1, V2):
+        try:
+            api.mutation_request(version, Action(kind="delete_everything", dag_id="d"))
+        except ValueError as exc:
+            assert "delete_everything" in str(exc)
+        else:  # pragma: no cover
+            raise AssertionError("an unknown action must not be built")
+
+
+def test_every_action_kind_has_a_request_in_both_majors() -> None:
+    """The modal offers exactly `ACTION_KINDS`; a kind with no request would be
+    a dead key on one major and a working one on the other."""
+    for version in (V1, V2):
+        for kind in ACTION_KINDS:
+            method, path, _ = api.mutation_request(
+                version,
+                Action(
+                    kind=kind,
+                    dag_id="d",
+                    run_id="r",
+                    task_ids=("t",),
+                    state="success",
+                ),
+            )
+            assert method in ("POST", "PATCH"), (version, kind)
+            assert path.startswith("/dags/d"), (version, kind)
+
+
 # --- parsers ---------------------------------------------------------------
 
 
 def test_parse_deployments_reads_version_status_and_hibernation() -> None:
     deployments = api.parse_deployments(DEPLOYMENTS_PAYLOAD)
-    assert [d.name for d in deployments] == ["Production", "Dev", "Next"]
-    prod, dev, nxt = deployments
+    assert [d.name for d in deployments] == ["Production", "Dev", "Next", "Future"]
+    prod, dev, nxt, future = deployments
     assert prod.airflow_version == "2.11.0"
     assert prod.label == "Customers / Production"
     assert prod.key == "dep-prod-1"
     assert prod.is_astro
     assert not prod.is_hibernating
     assert dev.is_hibernating  # from scalingStatus.hibernationStatus
-    # An unsupported deployment is kept, not hidden — the switcher explains it.
-    assert not api.supports(nxt.airflow_version)
+    # A 3.x deployment is a first-class target now, not a refusal.
+    assert api.supports(nxt.airflow_version)
+    # An unsupported one is kept, not hidden — the switcher explains it.
+    assert not api.supports(future.airflow_version)
 
 
 def test_parse_deployments_tolerates_junk() -> None:
@@ -627,6 +1040,33 @@ def test_parse_dag_runs() -> None:
     assert running.duration is None  # started, not ended: no total yet
     assert running.note == "kicked off by hand"
     assert ok.run_type == "scheduled"
+
+
+def test_a_null_logical_date_run_still_says_when_it_belongs() -> None:
+    """A manually triggered Airflow 3 run can have no logical date at all —
+    v2's `logical_date` is nullable and our own trigger body sends null. Its
+    `run_after` (v2-only, absent on v1) is what keeps the run sorting to the
+    top of the list while it is still queued, instead of to the bottom."""
+    queued = api.parse_dag_run(
+        {
+            "dag_id": "d",
+            "dag_run_id": "manual__2026-07-27T15:00:00+00:00",
+            "state": "queued",
+            "run_type": "manual",
+            "logical_date": None,
+            "run_after": "2026-07-27T15:00:00Z",
+            "start_date": None,
+            "end_date": None,
+        }
+    )
+    assert queued is not None
+    assert queued.logical_date is None
+    assert queued.run_after is not None
+    assert queued.sort_date == queued.run_after
+    # v1 rows have no `run_after`; the parse stays lenient and the sort falls
+    # back exactly as before.
+    v1 = api.parse_dag_runs(DAG_RUNS_PAYLOAD)
+    assert all(r.run_after is None for r in v1)
 
 
 def test_parse_dag_run_reads_the_bare_trigger_response() -> None:
@@ -655,17 +1095,59 @@ def test_parse_task_instances() -> None:
 
 
 def test_parse_dags() -> None:
-    dags = api.parse_dags(DAGS_PAYLOAD)
+    dags = api.parse_dags(DAGS_PAYLOAD, V1)
     alpha, beta = dags
     assert alpha.dag_id == "sync_alpha"
     assert alpha.is_paused
     assert alpha.owners == ("data",)
     assert alpha.tags == ("databricks", "data")
     assert alpha.next_dagrun is not None
+    assert alpha.schedule == "40 * * * *"  # out of v1's typed schedule_interval
+    assert alpha.is_active and not alpha.is_stale
     assert not beta.is_paused
     assert beta.has_import_errors
     assert beta.tags == ()
     assert beta.next_dagrun is None
+
+
+def test_parse_dags_v2_reads_the_renamed_fields() -> None:
+    """Three fields moved in Airflow 3 and one of them inverted. Reading the v1
+    names off a v2 row would report every DAG as active with no schedule."""
+    alpha, beta = api.parse_dags(DAGS_V2_PAYLOAD, V2)
+    # `is_stale` is the inverse of v1's `is_active`.
+    assert alpha.is_active and not alpha.is_stale
+    assert beta.is_stale and not beta.is_active
+    # `next_dagrun_run_after`, not `next_dagrun`.
+    assert alpha.next_dagrun is not None
+    assert alpha.next_dagrun.hour == 22
+    assert beta.next_dagrun is None
+    # `timetable_summary` (a plain cron string), falling back to the prose form.
+    assert alpha.schedule == "40 * * * *"
+    assert beta.schedule == "Never, external triggers only"
+    # Everything else is spelled the same as v1 and still lands.
+    assert alpha.is_paused and not beta.is_paused
+    assert alpha.tags == ("databricks", "data")
+    assert alpha.owners == ("data",)
+    assert beta.has_import_errors
+    assert beta.fileloc.endswith("broken.py")
+
+
+def test_parse_dags_v2_treats_an_absent_is_stale_as_present() -> None:
+    """Lenient in the same direction v1 is: the exceptional case has to be
+    stated, so a row missing the flag is a live DAG rather than a stale one."""
+    dags = api.parse_dags({"dags": [{"dag_id": "d"}]}, V2)
+    assert dags[0].is_active
+    assert not dags[0].is_stale
+    assert dags[0].schedule == ""
+
+
+def test_parse_dags_reads_each_dialect_only_in_its_own_version() -> None:
+    """The dispatch is the point: v2's names mean nothing to the v1 reader and
+    vice versa, which is why the version has to be passed rather than sniffed."""
+    v2_row_as_v1 = api.parse_dags(DAGS_V2_PAYLOAD, V1)[1]
+    assert v2_row_as_v1.is_active  # `is_stale: true` is invisible to the v1 reader
+    v1_row_as_v2 = api.parse_dags(DAGS_PAYLOAD, V2)[0]
+    assert v1_row_as_v2.next_dagrun is None  # v1's `next_dagrun` likewise
 
 
 # --- a stale DAG's leftover import-error flag ---------------------------------
@@ -723,7 +1205,7 @@ def test_live_import_error_files_reads_the_filenames() -> None:
 
 
 def test_parse_dags_reads_fileloc() -> None:
-    _, beta = api.parse_dags(DAGS_PAYLOAD)
+    _, beta = api.parse_dags(DAGS_PAYLOAD, V1)
     assert beta.fileloc  # needed to match against the import-error list
 
 
@@ -738,7 +1220,7 @@ def test_parse_import_errors() -> None:
 
 
 def test_parse_log_unwraps_v1s_tuple_repr() -> None:
-    log = api.parse_log(LOG_PAYLOAD, 1)
+    log = api.parse_log(LOG_PAYLOAD, 1, V1)
     assert log.try_number == 1
     assert log.continuation_token == LOG_PAYLOAD["continuation_token"]
     # The `[('', "...")]` wrapper is gone and the text is readable lines.
@@ -749,19 +1231,71 @@ def test_parse_log_unwraps_v1s_tuple_repr() -> None:
 
 
 def test_parse_log_falls_back_to_the_raw_string() -> None:
-    plain = api.parse_log({"content": "just some text"}, 2)
+    plain = api.parse_log({"content": "just some text"}, 2, V1)
     assert plain.content == "just some text"
     assert plain.try_number == 2
     assert plain.continuation_token is None
     # A repr we cannot evaluate is shown rather than swallowed.
-    broken = api.parse_log({"content": "[('', unterminated"}, 1)
+    broken = api.parse_log({"content": "[('', unterminated"}, 1, V1)
     assert broken.content == "[('', unterminated"
-    assert api.parse_log(None, 1).content == ""
+    assert api.parse_log(None, 1, V1).content == ""
 
 
 def test_parse_log_accepts_a_real_list_too() -> None:
-    log = api.parse_log({"content": [["host-a", "line one\n"], ["host-b", "line two"]]}, 1)
+    log = api.parse_log(
+        {"content": [["host-a", "line one\n"], ["host-b", "line two"]]}, 1, V1
+    )
     assert log.content == "line one\nline two"
+
+
+def test_parse_log_v2_flattens_structured_events_to_lines() -> None:
+    """Airflow 3 returns log *events*, not text. The pane renders lines and the
+    `/` filter matches lines, so each event becomes one — timestamp, level and
+    the event itself, with the bookkeeping keys dropped."""
+    log = api.parse_log(LOG_V2_PAYLOAD, 1, V2)
+    assert log.try_number == 1
+    assert log.continuation_token == LOG_V2_PAYLOAD["continuation_token"]
+    lines = log.lines
+    assert len(lines) == 4  # three events plus the bare string
+    assert lines[0] == (
+        "2026-07-27T09:12:01.004+00:00 info ::group::Log message source details"
+    )
+    assert lines[2] == "2026-07-27T09:41:13.710+00:00 error Task failed with exception"
+    # The keys we do not render are gone rather than dumped into the line.
+    assert "logger" not in log.content
+    assert "sources" not in log.content
+    assert "chan" not in log.content
+    # A bare string in the array passes straight through.
+    assert lines[3] == "*** Found logs in s3:"
+
+
+def test_parse_log_v2_shows_something_for_a_shape_it_cannot_read() -> None:
+    """Never nothing: an unreadable log is a monitoring failure, and the whole
+    point of the pane is that the text arrives."""
+    # An event dict with no `event` key still shows its contents.
+    odd = api.parse_log({"content": [{"msg": "no event key"}]}, 1, V2)
+    assert "no event key" in odd.content
+    # A partial event drops the missing pieces rather than printing blanks.
+    assert api.parse_log({"content": [{"event": "bare"}]}, 1, V2).content == "bare"
+    # A non-string event is stringified rather than skipped.
+    assert "42" in api.parse_log({"content": [{"event": 42}]}, 1, V2).content
+    # Whole-body fallbacks: a plain string body, junk, and nothing at all.
+    assert api.parse_log({"content": "plain text body"}, 1, V2).content == "plain text body"
+    assert api.parse_log({"content": {"unexpected": "dict"}}, 1, V2).content
+    assert api.parse_log({"content": None}, 1, V2).content == ""
+    assert api.parse_log(None, 1, V2).content == ""
+
+
+def test_parse_log_v2_output_is_lines_the_pane_can_work_with() -> None:
+    """The flattened form is what everything downstream operates on — the line
+    counter, the `/` filter, the truncation cut — so it has to behave like the
+    v1 text did."""
+    events = [{"event": f"line {n:04d}", "level": "info"} for n in range(200)]
+    log = api.parse_log({"content": events}, 1, V2)
+    assert len(log.lines) == 200
+    hits, total = filter_log(log.content, "line 0007")
+    assert total == 200 and len(hits) == 1
+    assert hits[0][0] == 8  # 1-based line number in the unfiltered log
 
 
 def test_parse_error_detail_prefers_detail() -> None:
@@ -770,6 +1304,22 @@ def test_parse_error_detail_prefers_detail() -> None:
     assert api.parse_error_detail({"title": "Bad"}) == "Bad"
     assert api.parse_error_detail({}) is None
     assert api.parse_error_detail("nope") is None
+
+
+def test_parse_error_detail_reads_a_v2_validation_list() -> None:
+    """FastAPI answers a bad body with `detail` as a *list*, which the RFC-7807
+    string lookup walks straight past — leaving the user a raw JSON tail."""
+    detail = api.parse_error_detail(VALIDATION_ERROR_V2_PAYLOAD)
+    assert detail is not None
+    assert "Field required" in detail
+    assert "body.logical_date" in detail  # says *which* field
+    assert "+1 more" in detail  # and that it was not the only one
+    # A single error needs no count, and an unreadable entry still says
+    # something rather than falling back to None.
+    one = api.parse_error_detail({"detail": [{"msg": "Bad value", "loc": ["query", "limit"]}]})
+    assert one == "query.limit: Bad value"
+    assert api.parse_error_detail({"detail": ["just a string"]}) == "just a string"
+    assert api.parse_error_detail({"detail": []}) is None
 
 
 # --- ADR constraint: no state enum is closed -------------------------------
@@ -1249,9 +1799,9 @@ def test_classify_hibernating() -> None:
 
 
 def test_classify_unsupported_version() -> None:
-    error = astro.classify_astro_error(api.UnsupportedAirflowVersion("3.0.2"))
+    error = astro.classify_astro_error(api.UnsupportedAirflowVersion(UNSUPPORTED_VERSION))
     assert error.kind == "unsupported_version"
-    assert "3.0.2" in error.message
+    assert UNSUPPORTED_VERSION in error.message
     assert not error.recoverable
 
 
@@ -1328,7 +1878,7 @@ def test_every_error_kind_is_reachable() -> None:
             AstroError("`astro` is not installed or not on PATH."),
             AstroError("`x` failed: no context set"),
             AstroError("`x` failed: hibernating"),
-            api.UnsupportedAirflowVersion("3.0.0"),
+            api.UnsupportedAirflowVersion(UNSUPPORTED_VERSION),
             AstroError("`x` failed: 429"),
             AstroError("`x` failed: status 403"),
             AstroError("`x` failed: status 404"),
@@ -1383,35 +1933,37 @@ def test_list_deployments_calls_the_cloud_api(monkeypatch) -> None:
     captured: list[list[str]] = []
     monkeypatch.setattr(astro, "_run", _fake_run(captured, [json.dumps(DEPLOYMENTS_PAYLOAD)]))
     deployments = astro.list_deployments()
-    assert [d.name for d in deployments] == ["Production", "Dev", "Next"]
+    assert [d.name for d in deployments] == ["Production", "Dev", "Next", "Future"]
     assert captured[0] == ["astro", "api", "cloud", "ListDeployments"]
 
 
 def test_every_airflow_invocation_pins_the_airflow_version(monkeypatch) -> None:
-    """ADR constraint: no call may pay for version auto-detection."""
-    captured: list[list[str]] = []
-    monkeypatch.setattr(astro, "_run", _fake_routed_run(captured))
-    deployment = _deployment()
-    run = _run_()
-    task = _task()
-    astro.fetch_snapshot(deployment, limit=5)
-    astro.fetch_run_tasks(deployment, run)
-    astro.fetch_log(deployment, run, task, 1)
-    astro.perform(
-        deployment,
-        Action(kind="clear", dag_id="d", run_id="r", task_ids=("t",), dry_run=True),
-    )
+    """ADR constraint: no call may pay for version auto-detection. Checked on
+    both majors, since the version now decides paths as well as pinning."""
+    for version in (V1, V2):
+        captured: list[list[str]] = []
+        monkeypatch.setattr(astro, "_run", _fake_routed_run(captured))
+        deployment = _deployment(version=version)
+        run = _run_()
+        task = _task()
+        astro.fetch_snapshot(deployment, limit=5)
+        astro.fetch_run_tasks(deployment, run)
+        astro.fetch_log(deployment, run, task, 1)
+        astro.perform(
+            deployment,
+            Action(kind="clear", dag_id="d", run_id="r", task_ids=("t",), dry_run=True),
+        )
 
-    # 3 for the snapshot fan-out, 2 for the drill (task instances + DAG
-    # structure), 1 log, 1 mutation.
-    assert len(captured) == 7
-    for args in captured:
-        assert args[:3] == ["astro", "api", "airflow"]
-        assert "--airflow-version" in args
-        assert args[args.index("--airflow-version") + 1] == "2.11.0"
-        assert args[args.index("-d") + 1] == "dep-prod-1"
-        # And never the flags that would flip the method to POST.
-        assert "-f" not in args and "-F" not in args
+        # 3 for the snapshot fan-out, 2 for the drill (task instances + DAG
+        # structure), 1 log, 1 mutation.
+        assert len(captured) == 7, version
+        for args in captured:
+            assert args[:3] == ["astro", "api", "airflow"]
+            assert "--airflow-version" in args
+            assert args[args.index("--airflow-version") + 1] == version
+            assert args[args.index("-d") + 1] == "dep-prod-1"
+            # And never the flags that would flip the method to POST.
+            assert "-f" not in args and "-F" not in args
 
 
 def test_fetch_snapshot_issues_one_call_per_pane(monkeypatch) -> None:
@@ -1566,16 +2118,37 @@ def test_total_entries_is_read_leniently() -> None:
     assert api.total_entries(None) == 0
 
 
-def test_fetch_snapshot_refuses_an_airflow_3_deployment(monkeypatch) -> None:
+def test_fetch_snapshot_refuses_an_unsupported_major(monkeypatch) -> None:
     called: list[list[str]] = []
     monkeypatch.setattr(astro, "_run", _fake_run(called, []))
-    try:
-        astro.fetch_snapshot(_deployment(version="3.0.2"))
-    except api.UnsupportedAirflowVersion as exc:
-        assert "3.0.2" in str(exc)
-    else:  # pragma: no cover
-        raise AssertionError("a 3.x deployment must be refused")
+    for version in (UNSUPPORTED_VERSION, "1.10.15", ""):
+        try:
+            astro.fetch_snapshot(_deployment(version=version))
+        except api.UnsupportedAirflowVersion as exc:
+            assert (version or "unknown") in str(exc)
+        else:  # pragma: no cover
+            raise AssertionError(f"Airflow {version!r} must be refused")
     assert called == []  # refused at the boundary, before any request
+
+
+def test_fetch_snapshot_accepts_an_airflow_3_deployment(monkeypatch) -> None:
+    """The other half of the widened seam: 3.x is no longer a refusal, and the
+    calls it makes carry the v2 spellings."""
+    captured: list[list[str]] = []
+    monkeypatch.setattr(
+        astro, "_run", _fake_routed_run(captured, {"/dags?": json.dumps(DAGS_V2_PAYLOAD)})
+    )
+    snapshot = astro.fetch_snapshot(_deployment(version="3.3.0"), limit=5)
+    assert snapshot.calls == 3
+    dags_call = next(a[-1] for a in captured if a[-1].startswith("/dags?"))
+    assert "exclude_stale=false" in dags_call and "only_active" not in dags_call
+    runs_call = next(a[-1] for a in captured if "dagRuns?" in a[-1])
+    assert "order_by=-run_after" in runs_call
+    # ...and the v2 DAG rows were read with the v2 field names.
+    assert snapshot.stale_count == 1
+    assert snapshot.paused_count == 1
+    alpha = snapshot.dag("sync_alpha")
+    assert alpha is not None and alpha.schedule == "40 * * * *"
 
 
 def test_fetch_snapshot_names_a_hibernating_deployment(monkeypatch) -> None:
@@ -1592,14 +2165,129 @@ def test_fetch_snapshot_names_a_hibernating_deployment(monkeypatch) -> None:
 
 
 def test_plain_airflow_uses_api_url_instead_of_deployment_id(monkeypatch) -> None:
+    for version, suffix in ((V1, "/api/v1"), (V2, "/api/v2")):
+        captured: list[list[str]] = []
+        monkeypatch.setattr(astro, "_run", _fake_routed_run(captured))
+        plain = Deployment(
+            id="", name="local", airflow_version=version, api_url="http://localhost:8080"
+        )
+        astro.fetch_snapshot(plain)
+        assert captured
+        for args in captured:
+            assert "-d" not in args
+            assert args[args.index("--api-url") + 1] == "http://localhost:8080" + suffix
+            assert args[args.index("--airflow-version") + 1] == version
+
+
+# --- the startup version probe (plain `--api-url` targets) -----------------
+#
+# Astro targets never probe: discovery reports `airflowVersion`. These cover the
+# only case that has no oracle.
+
+# What Airflow 3 answers a /api/v1 path with — distinctive enough to fall
+# through on, and the reason probing the wrong major is cheap.
+_V1_REMOVED = "`astro …` failed: API request failed with status 404 {\"detail\": \"/api/v1 has been removed in Airflow 3\"}"
+
+
+def _probe_run(captured: list[list[str]], answer):
+    """A `_run` stand-in that answers /version per pinned version."""
+
+    def run(args: list[str], *, timeout: float = 30.0, input_text: str | None = None) -> str:
+        captured.append(args)
+        pinned = args[args.index("--airflow-version") + 1]
+        result = answer(pinned)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    return run
+
+
+def test_detect_version_pins_what_the_server_reports(monkeypatch) -> None:
+    """One call, and the version that gets pinned afterwards is the server's own
+    release — not the pin that happened to make the probe succeed, and not the
+    build suffix the CLI could not load a spec for."""
     captured: list[list[str]] = []
-    monkeypatch.setattr(astro, "_run", _fake_routed_run(captured))
-    plain = Deployment(id="", name="local", airflow_version="2.11.0", api_url="http://localhost:8080")
-    astro.fetch_snapshot(plain)
-    for args in captured:
-        assert "-d" not in args
-        assert args[args.index("--api-url") + 1] == "http://localhost:8080/api/v1"
-        assert "--airflow-version" in args
+    monkeypatch.setattr(
+        astro,
+        "_run",
+        _probe_run(captured, lambda pinned: json.dumps({"version": "2.10.3+astro.7"})),
+    )
+    detected = astro.detect_version("http://localhost:8080")
+    assert detected == "2.10.3"  # not the "2.11.0" pin that answered
+    assert len(captured) == 1  # one call, not one per major
+    args = captured[0]
+    assert args[-1] == "/version"
+    assert args[args.index("--api-url") + 1] == "http://localhost:8080/api/v1"
+
+
+def test_detect_version_falls_through_to_the_other_major(monkeypatch) -> None:
+    """Airflow 3 answers a v1 path with a distinctive 404, so a wrong first
+    guess costs one call rather than a wrong answer."""
+    captured: list[list[str]] = []
+
+    def answer(pinned: str) -> object:
+        if api.major_version(pinned) == 2:
+            return AstroError(_V1_REMOVED)
+        return json.dumps({"version": "3.3.0"})
+
+    monkeypatch.setattr(astro, "_run", _probe_run(captured, answer))
+    assert astro.detect_version("http://airflow.example.invalid") == "3.3.0"
+    assert len(captured) == 2
+    assert captured[0][captured[0].index("--api-url") + 1].endswith("/api/v1")
+    assert captured[1][captured[1].index("--api-url") + 1].endswith("/api/v2")
+
+
+def test_detect_version_tries_the_dialect_the_url_names_first(monkeypatch) -> None:
+    captured: list[list[str]] = []
+    monkeypatch.setattr(
+        astro,
+        "_run",
+        _probe_run(captured, lambda pinned: json.dumps({"version": "3.3.0"})),
+    )
+    assert astro.detect_version("http://airflow.example.invalid/api/v2") == "3.3.0"
+    assert len(captured) == 1
+    assert captured[0][captured[0].index("--api-url") + 1].endswith("/api/v2")
+
+
+def test_detect_version_exhaustion_says_what_the_user_can_do(monkeypatch) -> None:
+    """On an ingress that 401s every unauthenticated path — Astro's does — a
+    failed probe cannot tell "wrong version" from "no access", so the message
+    must name both rather than picking one."""
+    captured: list[list[str]] = []
+    monkeypatch.setattr(
+        astro,
+        "_run",
+        _probe_run(captured, lambda pinned: AstroError("`astro …` failed: 401 Not authorized")),
+    )
+    try:
+        astro.detect_version("http://airflow.example.invalid")
+    except AstroError as exc:
+        raw = str(exc)
+        assert "airflow.example.invalid" in raw  # names the target
+        assert "/api/v1" in raw and "/api/v2" in raw  # ...and what it tried
+        assert "credentials" in raw  # the "no access" reading
+        assert "is not Airflow" in raw  # ...and the "wrong version" one
+        assert "--airflow-version" in raw  # ...and the way out
+        # And it survives classification with the actionable part intact: the
+        # summary bar shows the classified message, truncated from the right.
+        error = astro.classify_astro_error(exc)
+        assert error.kind in astro.KINDS
+        assert "--airflow-version" in error.message
+    else:  # pragma: no cover
+        raise AssertionError("an exhausted probe must be reported")
+    assert len(captured) == 2  # one per major, then it stops
+
+
+def test_detect_version_treats_an_unreadable_body_as_a_miss(monkeypatch) -> None:
+    captured: list[list[str]] = []
+
+    def answer(pinned: str) -> str:
+        return "{}" if api.major_version(pinned) == 2 else json.dumps({"version": "3.3.0"})
+
+    monkeypatch.setattr(astro, "_run", _probe_run(captured, answer))
+    assert astro.detect_version("http://airflow.example.invalid") == "3.3.0"
+    assert len(captured) == 2
 
 
 def test_fetch_log_addresses_a_mapped_task_instance(monkeypatch) -> None:
@@ -1671,21 +2359,61 @@ def test_mutations_send_their_body_on_stdin_with_an_explicit_method(monkeypatch)
         assert "--input" in args and args[args.index("--input") + 1] == "-"
 
 
+def test_mutations_use_the_v2_shapes_against_an_airflow_3_target(monkeypatch) -> None:
+    """The seam decides the *method and path*, not just the field names — so a
+    3.x deployment marks a task with a PATCH of the instance and reaches its dry
+    run through a separate endpoint."""
+    captured: list[list[str]] = []
+    monkeypatch.setattr(astro, "_run", _fake_run(captured, ["{}"] * 3))
+    deployment = _deployment(version=V2)
+
+    astro.perform(deployment, Action(kind="trigger", dag_id="sync_alpha"))
+    astro.perform(
+        deployment,
+        Action(kind="mark", dag_id="d", run_id="r", task_ids=("t",), state="success"),
+    )
+    astro.perform(
+        deployment,
+        Action(
+            kind="mark",
+            dag_id="d",
+            run_id="r",
+            task_ids=("t",),
+            state="failed",
+            dry_run=True,
+            map_index=3,
+        ),
+    )
+
+    trigger, mark, dry = captured
+    # v2's trigger must carry an explicit null date rather than omitting it.
+    assert json.loads(trigger[-1])["logical_date"] is None
+    assert mark[mark.index("-X") + 1] == "PATCH"
+    assert mark[-3] == "/dags/d/dagRuns/r/taskInstances/t"
+    assert json.loads(mark[-1]) == {"new_state": "success"}
+    assert dry[-3] == "/dags/d/dagRuns/r/taskInstances/t/3/dry_run"
+    assert "dry_run" not in json.loads(dry[-1])
+
+
 def test_mark_refuses_anything_but_exactly_one_task(monkeypatch) -> None:
-    """v1's set-state endpoint names one task. Sending several would silently
-    mark one of them, so it is refused as typed data instead."""
+    """One task at a time in both majors — v1's endpoint names one `task_id`,
+    v2's addresses one instance. Sending several would silently mark one of
+    them, so it is refused as typed data instead."""
     captured: list[list[str]] = []
     monkeypatch.setattr(astro, "_run", _fake_run(captured, []))
-    for task_ids in ((), ("a", "b")):
-        try:
-            astro.perform(
-                _deployment(),
-                Action(kind="mark", dag_id="d", run_id="r", task_ids=task_ids, state="success"),
-            )
-        except AstroError as exc:
-            assert "exactly one task instance" in str(exc)
-        else:  # pragma: no cover
-            raise AssertionError(f"{task_ids!r} must be refused")
+    for version in (V1, V2):
+        for task_ids in ((), ("a", "b")):
+            try:
+                astro.perform(
+                    _deployment(version=version),
+                    Action(kind="mark", dag_id="d", run_id="r", task_ids=task_ids, state="success"),
+                )
+            except AstroError as exc:
+                # The seam raises a plain ValueError; the transport is what
+                # types it, so the app's one error path still catches it.
+                assert "exactly one task instance" in str(exc)
+            else:  # pragma: no cover
+                raise AssertionError(f"{version} {task_ids!r} must be refused")
     assert captured == []  # and nothing was sent
 
 
@@ -1894,8 +2622,13 @@ def test_render_deployments_explains_why_one_is_unusable() -> None:
     out = _plain_renderable(ui.render_deployments(deployments, "dep-prod-1"))
     assert "Customers / Production" in out
     assert "hibernating" in out  # Dev
-    assert "unsupported" in out  # the 3.0.2 one, named rather than hidden
-    assert "3.0.2" in out
+    # The 4.0.0 one is named rather than hidden...
+    assert "unsupported" in out
+    assert UNSUPPORTED_VERSION in out
+    # ...and the 3.x one is now offered like any other target.
+    next_line = next(line for line in out.splitlines() if "Next" in line)
+    assert "3.0.2" in next_line
+    assert "unsupported" not in next_line
     assert "No deployments" in _plain_renderable(ui.render_deployments((), ""))
 
 
@@ -1994,15 +2727,77 @@ def test_cli_state_is_repeatable_and_unvalidated() -> None:
     assert _states(_parse_args([])) == ()
 
 
-def test_cli_plain_airflow_target_gets_a_concrete_version() -> None:
+def test_cli_plain_airflow_target_probes_for_its_version(monkeypatch) -> None:
+    captured: list[list[str]] = []
+    monkeypatch.setattr(
+        astro,
+        "_run",
+        _probe_run(captured, lambda pinned: json.dumps({"version": "3.3.0"})),
+    )
     plain = _plain_deployment(_parse_args(["--api-url", "http://localhost:8080"]))
     assert plain.api_url == "http://localhost:8080"
     assert not plain.is_astro
+    assert plain.airflow_version == "3.3.0"
     assert api.supports(plain.airflow_version)
+    assert len(captured) == 1
+
+
+def test_cli_plain_target_probes_once_per_session(monkeypatch) -> None:
+    """ADR constraint: the probe is a startup cost. `poll` runs on a timer, so a
+    per-poll probe would spend ~0.7s a minute re-learning a fixed number."""
+    from tools.airflow_watch.cli import _PlainTarget
+
+    captured: list[list[str]] = []
+    monkeypatch.setattr(
+        astro,
+        "_run",
+        _probe_run(captured, lambda pinned: json.dumps({"version": "2.11.0"})),
+    )
+    args = _parse_args(["--api-url", "http://localhost:8080"])
+    target = _PlainTarget()
+    first = target.get(args)
+    assert target.get(args) is first
+    assert target.get(args) is first
+    assert len(captured) == 1
+
+
+def test_cli_plain_target_retries_after_a_failed_probe(monkeypatch) -> None:
+    """A target that was unreachable once must not wedge the session: nothing is
+    remembered until something succeeded."""
+    from tools.airflow_watch.cli import _PlainTarget
+
+    captured: list[list[str]] = []
+    # The first `get()` exhausts its pins; everything after it answers.
+    remaining_failures = [len(api.probe_pins("http://localhost:8080"))]
+
+    def answer(pinned: str) -> object:
+        if remaining_failures[0] > 0:
+            remaining_failures[0] -= 1
+            return AstroError("`x` failed: 401 Not authorized")
+        return json.dumps({"version": "2.11.0"})
+
+    monkeypatch.setattr(astro, "_run", _probe_run(captured, answer))
+    args = _parse_args(["--api-url", "http://localhost:8080"])
+    target = _PlainTarget()
+    try:
+        target.get(args)
+    except AstroError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("the first probe must fail")
+    assert target.get(args).airflow_version == "2.11.0"
+
+
+def test_cli_a_stated_airflow_version_never_probes(monkeypatch) -> None:
+    """The probe is the fallback, not the rule: a user who says what the target
+    is should not pay ~0.7s to have it re-established."""
+    captured: list[list[str]] = []
+    monkeypatch.setattr(astro, "_run", _probe_run(captured, lambda pinned: "{}"))
     stated = _plain_deployment(
         _parse_args(["--api-url", "http://x", "--airflow-version", "2.10.5"])
     )
     assert stated.airflow_version == "2.10.5"
+    assert captured == []
 
 
 # --- layout ---------------------------------------------------------------
@@ -2343,14 +3138,16 @@ async def test_app_hibernating_deployment_shows_its_own_state() -> None:
 
 
 async def test_app_unsupported_version_is_refused_by_name() -> None:
-    refusal = astro.classify_astro_error(api.UnsupportedAirflowVersion("3.0.2"))
+    refusal = astro.classify_astro_error(
+        api.UnsupportedAirflowVersion(UNSUPPORTED_VERSION)
+    )
     app = _app([(None, refusal)])
     async with app.run_test(size=(150, 40)) as pilot:
         await app.workers.wait_for_complete()
         await pilot.pause()
         assert app._error is not None and app._error.kind == "unsupported_version"
         summary = _plain(app.query_one("#summary", Static))
-        assert "3.0.2" in summary
+        assert UNSUPPORTED_VERSION in summary
         assert "not supported" in summary
 
 
@@ -2486,6 +3283,35 @@ async def test_mark_defaults_to_success_for_a_failed_task() -> None:
         await pilot.press("escape")  # escape cancels too
         await pilot.pause()
         assert fired == []
+
+
+async def test_mark_carries_the_selected_instances_map_index() -> None:
+    """A mapped task is several instances sharing one task id. v2 addresses the
+    one being marked by `map_index` in the path, so the coordinate has to travel
+    with the action — and has to survive the dry-run → real-call handoff."""
+    fired: list[Action] = []
+    app = _app(
+        tasks=[_task("fan", state="failed", map_index=3)],
+        performed=fired,
+        graph={},
+    )
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("enter")  # drill to task instances
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("m")
+        await pilot.pause()
+        await pilot.press("y")  # the dry run
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("y")  # ...then the real call it offers
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+    assert [a.map_index for a in fired] == [3, 3]
+    assert [a.dry_run for a in fired] == [True, False]
+    assert all(a.task_ids == ("fan",) for a in fired)
 
 
 async def test_action_failure_is_logged_and_does_not_retry() -> None:
@@ -2798,7 +3624,7 @@ async def test_unrecoverable_failure_stops_retrying_on_the_minute() -> None:
     poll stretches to the ceiling instead of respawning a doomed process."""
     for error in (
         astro.classify_astro_error(AstroError("`astro` is not on PATH")),
-        astro.classify_astro_error(api.UnsupportedAirflowVersion("3.0.2")),
+        astro.classify_astro_error(api.UnsupportedAirflowVersion(UNSUPPORTED_VERSION)),
     ):
         app = _app([(None, error)])
         async with app.run_test(size=(150, 40)) as pilot:

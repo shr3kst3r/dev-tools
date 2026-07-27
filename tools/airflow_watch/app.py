@@ -1067,9 +1067,9 @@ class AirflowWatchApp(App[None]):
     def action_clear_tasks(self) -> None:
         """Clear (retry) the drilled-into task instance.
 
-        Defaults to a dry run: v1's clear endpoint reports what it *would* touch
-        when `dry_run` is true, which is the preview the ADR's caution asks for.
-        Confirming the dry run then offers the real thing.
+        Defaults to a dry run: Airflow's clear endpoint reports what it *would*
+        touch rather than touching it, which is the preview the ADR's caution
+        asks for. Confirming the dry run then offers the real thing.
         """
         run, task = self._drill.run, self._selected_task()
         if run is None or task is None:
@@ -1086,7 +1086,12 @@ class AirflowWatchApp(App[None]):
 
     def action_mark_tasks(self) -> None:
         """Mark the drilled-into task instance. A failed task marks success (the
-        common "I fixed it downstream" case); anything else marks failed."""
+        common "I fixed it downstream" case); anything else marks failed.
+
+        The instance's `map_index` travels with the action: a mapped task is one
+        of several instances sharing a task id, and marking it means naming
+        which one.
+        """
         run, task = self._drill.run, self._selected_task()
         if run is None or task is None:
             return
@@ -1099,6 +1104,7 @@ class AirflowWatchApp(App[None]):
                 task_ids=(task.task_id,),
                 state=state,
                 dry_run=True,
+                map_index=task.map_index,
             )
         )
 
@@ -1148,6 +1154,7 @@ class AirflowWatchApp(App[None]):
                     task_ids=action.task_ids,
                     state=action.state,
                     dry_run=False,
+                    map_index=action.map_index,
                 )
             )
             return

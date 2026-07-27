@@ -60,6 +60,7 @@ __all__ = [
     "airflow_call",
     "airflow_get",
     "classify_astro_error",
+    "detect_version",
     "fetch_log",
     "fetch_run_tasks",
     "fetch_snapshot",
@@ -79,13 +80,13 @@ DEFAULT_TIMEOUT = 30.0
 # Log fetches can be large and are worth waiting a little longer for.
 LOG_TIMEOUT = 60.0
 
-# How much of one attempt's log we are willing to keep in memory. v1 returns the
-# whole body in one response — there is no server-side offset we can mint, since
-# the continuation token is signed with the webserver's secret — so this is the
-# boundary that keeps a runaway log (a retry loop printing a stack trace per
-# second for a day) from being held, re-parsed and searched in full. ~2 MB is
-# far more than the pane renders (`ui.MAX_LOG_LINES`) and enough to hold any
-# normal task's log whole.
+# How much of one attempt's log we are willing to keep in memory. Airflow returns
+# the whole body in one response — there is no server-side offset we can mint,
+# since the continuation token is signed with the webserver's secret — so this is
+# the boundary that keeps a runaway log (a retry loop printing a stack trace per
+# second for a day) from being held, re-parsed and searched in full. ~2 MB is far
+# more than the pane renders (`ui.MAX_LOG_LINES`) and enough to hold any normal
+# task's log whole.
 MAX_LOG_CHARS = 2_000_000
 
 # How many `astro` processes may be in flight at once. Six calls serial measured
@@ -93,8 +94,8 @@ MAX_LOG_CHARS = 2_000_000
 # feeling broken; the cap keeps us from stampeding a webserver humans also use.
 MAX_WORKERS = 8
 
-# v1 caps a page at `api.PAGE_LIMIT` whatever you ask for — a `limit=1000` request
-# returns 100 records and no error — and the CLI cannot paginate for us
+# Airflow caps a page at `api.PAGE_LIMIT` whatever you ask for — a `limit=1000`
+# request returns 100 records and no error — and the CLI cannot paginate for us
 # (`--paginate --slurp` was verified against 2.11 to return page one and drop
 # `total_entries`). So every list is paged by `offset` here, off the server's own
 # `total_entries`, and never by guessing from `len(rows) < limit`.
@@ -455,6 +456,45 @@ def airflow_call(
     return _json(raw)
 
 
+def detect_version(api_url: str, *, timeout: float = DEFAULT_TIMEOUT) -> str:
+    """Ask a plain Airflow which version it is, by calling `/version` once.
+
+    Only a `--api-url` target needs this: Astro discovery reports
+    `airflowVersion`, so an Astro deployment never probes. Every `astro` call has
+    to name a version, including this one, so probing means trying one concrete
+    pin per major (`api.probe_pins`, ordered by what the URL's suffix implies)
+    until one answers — and then pinning the release the *server* reports, not
+    the pin that happened to work (`api.parse_version` decides what "the release"
+    means, because what is pinnable is the seam's business).
+
+    Costs one call, once per session, and only when the user did not state
+    `--airflow-version`. Probing the wrong major fails distinctively — Airflow 3
+    answers a removed Airflow 2 path with a 404 that says exactly that — so the
+    fall-through costs one call rather than a wrong answer.
+    """
+    attempted: list[str] = []
+    for pin in api.probe_pins(api_url):
+        attempted.append(api.base_path(pin))
+        probe = Deployment(id="", name=api_url, airflow_version=pin, api_url=api_url)
+        try:
+            payload = airflow_get(probe, api.version_path(), timeout=timeout)
+        except AstroError:
+            continue
+        version = api.parse_version(payload)
+        if version:
+            return version
+    # Deliberately names every possibility rather than guessing between them: on
+    # an ingress that 401s unauthenticated paths — Astro's does — a probe failure
+    # is indistinguishable from a wrong version. The way out leads, because the
+    # classifier truncates a long message from the right.
+    raise AstroError(
+        f"Could not detect the Airflow version of {api_url} — pass "
+        f"--airflow-version to state it. Tried {' then '.join(attempted)}: it is "
+        "unreachable, needs credentials this probe cannot send, or is not "
+        f"{api.supported_range()}."
+    )
+
+
 def list_deployments() -> list[Deployment]:
     """Every deployment in the org, with its Airflow version.
 
@@ -498,7 +538,8 @@ def resolve_deployment(
 
 
 def _require_supported(deployment: Deployment) -> None:
-    """Refuse a non-2.x target at the discovery boundary, by name.
+    """Refuse a target outside the supported majors at the discovery boundary,
+    by name.
 
     The refusal happens here rather than at the first request because a wrong
     API version on Astro looks like a 404 *after* auth, which is indistinguish-
@@ -528,8 +569,8 @@ def _page_offsets(total: int, want: int | None, max_pages: int) -> list[int]:
 
     `want` is how many records the caller asked for (None = all of them). Pages
     are computed from the server's `total_entries` rather than inferred from a
-    short page, because v1 truncates silently and a full page is not evidence of
-    more.
+    short page, because Airflow truncates silently and a full page is not
+    evidence of more.
     """
     reachable = total if want is None else min(total, want)
     return list(range(api.PAGE_LIMIT, reachable, api.PAGE_LIMIT))[: max_pages - 1]
@@ -603,11 +644,19 @@ def fetch_snapshot(
             f"Deployment {deployment.name} is hibernating — no webserver is running."
         )
 
+    # The two builders whose spellings differ between majors; everything else in
+    # this fan-out was verified identical and stays version-free.
+    version = deployment.airflow_version
+
     def runs_path(page: int, offset: int) -> str:
-        return api.dag_runs_path(limit=page, offset=offset, states=states)
+        return api.dag_runs_path(
+            version=version, limit=page, offset=offset, states=states
+        )
 
     def dags_path(page: int, offset: int) -> str:
-        return api.dags_path(limit=page, offset=offset, dag_id_pattern=dag_pattern)
+        return api.dags_path(
+            version=version, limit=page, offset=offset, dag_id_pattern=dag_pattern
+        )
 
     started = time.monotonic()
     first: dict[str, str] = {
@@ -649,7 +698,7 @@ def fetch_snapshot(
         if dag_pages is not None:
             collected: dict[str, Dag] = {}
             for payload in dag_pages.payloads:
-                for dag in api.parse_dags(payload):
+                for dag in api.parse_dags(payload, version):
                     collected.setdefault(dag.key, dag)  # see `by_key` below
             known = DagList(
                 dags=tuple(collected.values()),
@@ -801,7 +850,7 @@ def fetch_log(
         ),
         timeout=LOG_TIMEOUT,
     )
-    return _bounded(api.parse_log(payload, try_number))
+    return _bounded(api.parse_log(payload, try_number, deployment.airflow_version))
 
 
 def _bounded(log: TaskLog) -> TaskLog:
@@ -821,69 +870,29 @@ def _bounded(log: TaskLog) -> TaskLog:
 # --- mutations -------------------------------------------------------------
 #
 # Every one of these is reached only through the app's confirmation modal, and
-# every one is recorded in the activity log. `dry_run` is carried on the Action
-# and always sent, because v1 defaults it to true.
-
-def _mutation_request(action: Action) -> tuple[str, str, dict[str, object]]:
-    """(method, path, body) for one action. Pure — all the version-specific
-    naming comes from `api`."""
-    match action.kind:
-        case "pause" | "unpause":
-            return (
-                "PATCH",
-                api.pause_dag_path(action.dag_id),
-                api.pause_body(action.kind == "pause"),
-            )
-        case "trigger":
-            return "POST", api.trigger_run_path(action.dag_id), api.trigger_body()
-        case "clear":
-            # Both of these endpoints scope by run, and a body that names task
-            # ids but *no* run scopes to the task's whole history instead — so an
-            # unscoped clear is refused here rather than sent and hoped about.
-            return (
-                "POST",
-                api.clear_task_instances_path(action.dag_id),
-                api.clear_body(
-                    _scoped_run(action), action.task_ids, dry_run=action.dry_run
-                ),
-            )
-        case "mark":
-            # v1's set-state endpoint names a *single* `task_id` (see
-            # api.mark_body); refuse rather than silently marking one of several
-            # or sending a body the API will reject.
-            if len(action.task_ids) != 1:
-                raise AstroError(
-                    "Marking a task state takes exactly one task instance "
-                    f"(asked for {len(action.task_ids)})."
-                )
-            return (
-                "POST",
-                api.mark_task_state_path(action.dag_id),
-                api.mark_body(
-                    _scoped_run(action),
-                    action.task_ids[0],
-                    action.state,
-                    dry_run=action.dry_run,
-                ),
-            )
-        case _:
-            raise AstroError(f"Unknown action {action.kind!r}.")
+# every one is recorded in the activity log. The request itself — method, path
+# and body, all three of which can differ between majors — is built by the seam;
+# this module only sends it and reads the outcome.
 
 
-def _scoped_run(action: Action) -> str:
-    """The run a clear/set-state must be confined to.
+def _request_for(
+    deployment: Deployment, action: Action
+) -> tuple[str, str, dict[str, object]]:
+    """The seam's (method, path, body) for an action, as typed transport errors.
 
-    Not defaulted: with task ids and no run id, Airflow clears or re-states those
-    tasks in *every* run of the DAG. The app always drills into a run before
-    offering either action, so an absent run id is a programming error — and the
-    one place it could do real damage is the one place to refuse it.
+    `api.mutation_request` refuses a request that must not be sent — an unknown
+    kind, an unscoped clear or mark, a mark naming anything but one task — with a
+    `ValueError`, because it knows nothing about this module's error taxonomy.
+    Converting it here is what keeps those refusals on the same path as every
+    other failure the UI shows. A refused *version* is already typed and passes
+    straight through.
     """
-    if not action.run_id:
-        raise AstroError(
-            f"Refusing to {action.kind} {action.dag_id} with no DAG run named — "
-            "that would affect every run of the task."
-        )
-    return action.run_id
+    try:
+        return api.mutation_request(deployment.airflow_version, action)
+    except api.UnsupportedAirflowVersion:
+        raise
+    except ValueError as exc:
+        raise AstroError(str(exc)) from exc
 
 
 def perform(deployment: Deployment, action: Action) -> str:
@@ -893,7 +902,7 @@ def perform(deployment: Deployment, action: Action) -> str:
     answers "did my retry actually fire?" — the question that matters more here
     than in a read-only tool.
     """
-    method, path, body = _mutation_request(action)
+    method, path, body = _request_for(deployment, action)
     payload = airflow_call(deployment, path, method=method, body=body)
     return f"{action.summary} — {_outcome(action, payload)}"
 

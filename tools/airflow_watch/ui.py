@@ -6,9 +6,10 @@ app (see app.py) owns the polling and the windows; nothing in this module knows
 about I/O, Textual, or API versions.
 
 The one rule worth stating: `state_style` is the *only* place a state string
-turns into a colour, and it never rejects one. An Airflow patch release that
-invents a task state renders it in a neutral bucket, per the
-airflow-2-only-behind-a-version-seam ADR.
+turns into a colour, and it never rejects one. An Airflow release that invents a
+task state — 3.x's `awaiting_input`, say — renders it in a neutral bucket, per
+the airflow-2-only-behind-a-version-seam ADR and the
+airflow-3-joins-the-version-seam ADR that widened it.
 """
 
 from __future__ import annotations
@@ -138,7 +139,14 @@ def list_row(run: DagRun, now: datetime) -> tuple[Text, ...]:
         Text(_elide(run.run_id, _RUN_ID_WIDTH), style="dim"),
         Text(run.run_type or "—"),
         state_cell(run.state),
-        Text(format_relative(run.start_date or run.logical_date, now), style="dim"),
+        # `run_after` is the last resort for an Airflow 3 run with a null
+        # logical date that has not started yet — the row still says *when*.
+        Text(
+            format_relative(
+                run.start_date or run.logical_date or run.run_after, now
+            ),
+            style="dim",
+        ),
         _duration_cell(run.duration, run.start_date, now),
     )
 
@@ -383,6 +391,10 @@ def render_run(run: DagRun, dag: Dag | None, now: datetime) -> RenderableType:
         ("ended", Text(format_relative(run.end_date, now))),
         ("duration", _duration_cell(run.duration, run.start_date, now)),
     ]
+    if run.run_after is not None:
+        # Airflow 3 only; a run with a null logical date still says when it
+        # belongs. Absent on Airflow 2, so the pane is unchanged there.
+        stats.insert(1, ("run after", Text(_stamp(run.run_after))))
     if dag is not None:
         stats.append(("owners", Text(", ".join(dag.owners) or "—")))
         stats.append(("next run", Text(_stamp(dag.next_dagrun))))
@@ -776,7 +788,8 @@ def _deployment_note(deployment: Deployment) -> tuple[str, str]:
     """The right-hand annotation in the switcher: why you can or cannot use it.
 
     Asks the version seam (`api.supports`) rather than testing a version number
-    itself — no module outside `api.py` may contain a version conditional.
+    itself — no module outside `api.py` may contain a version conditional, and
+    which majors are supported is exactly the thing that moves.
     """
     if deployment.is_hibernating:
         return "hibernating", "yellow"

@@ -15,7 +15,7 @@ name = "dev-tools"
 
 [commands.airflow-watch]
 run = "uv run airflow-watch"
-description = "Live Textual dashboard of an Astro Airflow deployment: failing DAG runs, task instances in dependency order, and their logs — all searchable with `/`. Airflow 2 only. Uses the astro CLI for auth."
+description = "Live Textual dashboard of an Astro Airflow deployment: failing DAG runs, task instances in dependency order, and their logs — all searchable with `/`. Airflow 2 & 3. Uses the astro CLI for auth."
 args = [
     { name = "--deployment", description = "Astro deployment name or id to watch (default: last used)" },
     { name = "--interval", description = "seconds between refreshes (default: 60, minimum 15)" },

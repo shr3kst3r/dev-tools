@@ -107,18 +107,22 @@ uv run airflow-watch --once              # one snapshot, no live loop
 uv run airflow-watch --once --view dags  # every DAG, paused and stale included
 ```
 
-**No silent truncation.** Airflow 2 caps a page at 100 records whatever you ask
+**No silent truncation.** Airflow caps a page at 100 records whatever you ask
 for, and the `astro` CLI's own `--paginate` does not work against this API — so
 every list is paged explicitly off the server's `total_entries`, and the header
 says `N of M` whenever it is holding less than the whole thing.
 
 Uses the `astro` CLI for auth and transport, so `astro login` must be done once —
-there is no HTTP client and no credential handling in this repo. **Airflow 2
-only**: the version is detected during deployment discovery, and a non-2.x target
-is refused by name rather than half-supported. All version-specific knowledge
-lives behind one seam (`tools/airflow_watch/api.py`). See
-`docs/adrs/2026-07-24-airflow-access-via-astro-cli.md` and
-`docs/adrs/2026-07-24-airflow-2-only-behind-a-version-seam.md`.
+there is no HTTP client and no credential handling in this repo. **Airflow 2 and
+Airflow 3**: the version is detected during deployment discovery (or, for a plain
+`--api-url` target, by probing `/version` once at startup), and any other major is
+refused by name rather than half-supported. The two dialects differ in more than
+spelling — `/api/v1` against `/api/v2`, `only_active` against `exclude_stale`,
+one set-state endpoint against another — and all of it lives behind one seam
+(`tools/airflow_watch/api.py`). See
+`docs/adrs/2026-07-24-airflow-access-via-astro-cli.md`,
+`docs/adrs/2026-07-24-airflow-2-only-behind-a-version-seam.md` and
+`docs/adrs/2026-07-27-airflow-3-joins-the-version-seam.md`.
 
 ## Skills
 

@@ -1,22 +1,27 @@
 """The Airflow API version seam — the *only* module that knows a version exists.
 
-Per the airflow-2-only-behind-a-version-seam ADR, every piece of
+Per the airflow-2-only-behind-a-version-seam ADR and the
+airflow-3-joins-the-version-seam ADR that widened it, every piece of
 version-dependent knowledge lives here and nowhere else:
 
-* the base path (`/api/v1`),
-* every endpoint path,
-* every query-parameter name (`execution_date_*`, `only_active`, …),
-* every request-body field name (`logical_date`, `dry_run`, …),
-* and the response→model mapping.
+* the base path (`/api/v1` for Airflow 2, `/api/v2` for Airflow 3),
+* every endpoint path, and — since the two majors mark a task state through
+  different HTTP verbs on different paths — every mutation's *shape*,
+* every query-parameter name (`only_active` vs `exclude_stale`, …),
+* every request-body field name (`logical_date`, `dry_run`, `new_state`, …),
+* and the response→model mapping (`is_active` vs `is_stale`, and v1's
+  repr-of-tuples log against v2's structured events).
 
 No other module contains an ``/api/v`` literal, a version conditional, or a
-v1-only field name. `tests/test_airflow_watch.py::test_no_api_version_literal_outside_api_module`
+version-specific field name. `tests/test_airflow_watch.py::test_no_api_version_literal_outside_api_module`
 enforces that by grepping the package, so a reviewer does not have to.
 
-Airflow 3 support is an *extension* of this module: a second set of builders and
-parsers chosen by `supports()`/`base_path()`, with the refusal path already in
-place. Until then `supports()` returns False for 3.x and the discovery boundary
-refuses those targets by name.
+Two dialects, not two stacks: builders and parsers that the two majors were
+*verified* to share stay version-free, and only the ones that genuinely differ
+take a `version` and dispatch on `major_version()`. Guessing stays forbidden in
+both directions — Airflow 3 silently ignores a query parameter it does not know
+(measured: `only_active=false` against 3.3.0 returns 200 and filters nothing),
+so a v1 spelling sent to a v2 server misreports rather than failing.
 
 Two behaviours of the `astro` CLI shape the builders here, both measured rather
 than assumed (see the airflow-access-via-astro-cli ADR):
@@ -35,6 +40,7 @@ from datetime import datetime
 from urllib.parse import quote, urlencode
 
 from .models import (
+    Action,
     Dag,
     DagRun,
     Deployment,
@@ -46,7 +52,6 @@ from .models import (
 __all__ = [
     "UnsupportedAirflowVersion",
     "api_url_for",
-    "assumed_version",
     "base_path",
     "clear_body",
     "clear_task_instances_path",
@@ -57,7 +62,9 @@ __all__ = [
     "log_path",
     "major_version",
     "mark_body",
+    "mark_task_instance_path",
     "mark_task_state_path",
+    "mutation_request",
     "pause_body",
     "pause_dag_path",
     "parse_dag_run",
@@ -69,6 +76,8 @@ __all__ = [
     "parse_log",
     "parse_task_graph",
     "parse_task_instances",
+    "parse_version",
+    "probe_pins",
     "tasks_path",
     "supported_range",
     "supports",
@@ -77,38 +86,49 @@ __all__ = [
     "trigger_body",
     "trigger_run_path",
     "unsupported_message",
+    "version_path",
 ]
 
-# The one API-version literal in the tool. Airflow 2.x serves this; Airflow 3.x
-# removed it entirely in favour of /api/v2, which is why a 3.x target is refused
-# rather than attempted.
+# The two API-version literals in the tool. Airflow 2.x serves `/api/v1`;
+# Airflow 3.x removed it entirely and serves `/api/v2`. No release serves both
+# and there is no compatibility shim, so the base path is picked from the
+# target's major and never guessed.
 _V1_BASE_PATH = "/api/v1"
+_V2_BASE_PATH = "/api/v2"
+
+# Every base path we recognize, for stripping a suffix a caller already typed.
+_BASE_PATHS = (_V1_BASE_PATH, _V2_BASE_PATH)
 
 # The Airflow major versions this build understands, as a closed set — unlike
-# task and run states, which are deliberately open.
-_SUPPORTED_MAJORS = (2,)
+# task and run states, which are deliberately open. Both are verified live
+# (2.11.0 and 3.3.0 on Astro); a 1.x, a 4.x or an unparseable version is refused
+# by name rather than attempted.
+_SUPPORTED_MAJORS = (2, 3)
 
-# The spec version to pin when the target's real version is unknowable, which
-# only happens for a plain `--api-url` Airflow. 2.11 is the final 2.x line, and
-# one of the OpenAPI specs the `astro` CLI bundles.
-_DEFAULT_SPEC_VERSION = "2.11.0"
+# The concrete spec versions to pin while probing a plain `--api-url` target,
+# one per major. They are handed to `astro --airflow-version`, which uses them
+# to pick a bundled OpenAPI spec, so "2.x" would not do — and naming them here
+# keeps the last invented version number inside the seam.
+_PROBE_PINS = ("2.11.0", "3.3.0")
 
-# Airflow 2's default page limit is 100; we ask explicitly everywhere so a
-# version that changes the default cannot silently change what we show. (Airflow
-# 3 changed the default to 50, which is exactly why this lives here.)
+# Airflow 2's default page limit is 100 and Airflow 3's is 50; we ask explicitly
+# everywhere so neither default decides what we show.
 DEFAULT_LIMIT = 50
 
-# The largest page v1 will serve, whatever you ask for: `maximum_page_limit`
-# defaults to 100 and a request for more is silently truncated to it. Callers
-# that need everything must page with `offset`, because the `astro` CLI's own
-# `--paginate`/`--slurp` do not paginate this API (verified against 2.11: it
-# returns page one and drops `total_entries`).
+# The largest page either major will serve, whatever you ask for:
+# `maximum_page_limit` defaults to 100 and a request for more is silently
+# truncated to it (verified live on both 2.11.0 and 3.3.0 — `limit=150` returns
+# 100 rows). Callers that need everything must page with `offset`, because the
+# `astro` CLI's own `--paginate`/`--slurp` do not paginate this API (verified
+# against 2.11: it returns page one and drops `total_entries`).
 PAGE_LIMIT = 100
 
-# Newest-first, using v1's date field name. Airflow 3 renamed this to
-# `logical_date` / `run_after`, which is exactly the kind of knowledge that
-# must not leak out of this module.
-_RUNS_ORDER_BY = "-execution_date"
+# Newest-first, per major. v1 orders runs by `-execution_date`; Airflow 3
+# removed that field name outright, and `-run_after` is the verified
+# replacement. Sending the wrong one is not an error on v2 — it is silently
+# ignored, so the list would come back in an arbitrary order.
+_V1_RUNS_ORDER_BY = "-execution_date"
+_V2_RUNS_ORDER_BY = "-run_after"
 
 
 class UnsupportedAirflowVersion(ValueError):
@@ -154,30 +174,26 @@ def supported_range() -> str:
     return " / ".join(f"Airflow {major}.x" for major in _SUPPORTED_MAJORS)
 
 
-def assumed_version() -> str:
-    """The version to assume when there is nothing to discover it from.
+def _serves_v2(version: str) -> bool:
+    """True when this target serves `/api/v2` — i.e. it is an Airflow 3.
 
-    Only a plain `--api-url` Airflow reaches this: Astro discovery always
-    reports `airflowVersion`. It must be a *concrete* version because it is
-    handed straight to `astro --airflow-version`, which uses it to pick a
-    bundled OpenAPI spec. Naming the assumption here keeps it inside the seam —
-    no caller spells a version number itself.
+    The single dispatch predicate in the module: every version branch below
+    goes through it, so "which dialect?" is answered in exactly one place.
     """
-    return _DEFAULT_SPEC_VERSION
+    return major_version(version) == 3
 
 
 def unsupported_message(version: str) -> str:
     """Why we are declining, naming the detected version.
 
-    Deliberately an honest refusal rather than a degraded attempt: Airflow 3
-    serves a different API with renamed filters and removed endpoints, so a
-    monitoring tool that guessed would misreport state.
+    Deliberately an honest refusal rather than a degraded attempt: an Airflow
+    outside the supported range serves an API we have not verified against, and
+    a monitoring tool that guessed would misreport state rather than fail.
     """
     shown = version.strip() or "unknown"
     return (
         f"Airflow {shown} is not supported — airflow-watch speaks "
-        f"{supported_range()} only. Airflow 3 serves a different API "
-        f"(/api/v2) with no compatibility shim."
+        f"{supported_range()} only, and this target serves neither."
     )
 
 
@@ -185,22 +201,78 @@ def base_path(version: str) -> str:
     """The API base path for an Airflow version, or raise."""
     if not supports(version):
         raise UnsupportedAirflowVersion(version)
-    return _V1_BASE_PATH
+    return _V2_BASE_PATH if _serves_v2(version) else _V1_BASE_PATH
 
 
 def api_url_for(url: str, version: str) -> str:
     """Normalize a user-supplied Airflow base URL for `astro --api-url`.
 
     Astro's discovery already reports an `apiUrl` carrying the version suffix,
-    but a human typing `--api-url https://airflow.example.com` has not. Append
-    the base path when it is missing so both spellings work, and raise for an
-    unsupported version rather than constructing a URL we cannot read.
+    but a human typing `--api-url https://airflow.example.com` has not. Any
+    suffix we recognize is stripped and the *right* one appended, so a URL
+    copied from a 3.x deployment cannot end up as `…/api/v2/api/v1` when it is
+    pinned to 2.x. An unsupported version raises rather than producing a URL we
+    could not read anyway.
     """
     suffix = base_path(version)
     trimmed = url.rstrip("/")
-    if trimmed.endswith(suffix):
-        return trimmed
+    for known in _BASE_PATHS:
+        if trimmed.endswith(known):
+            trimmed = trimmed[: -len(known)]
+            break
     return trimmed + suffix
+
+
+# --- version detection (plain `--api-url` targets only) --------------------
+#
+# Astro targets never reach any of this: discovery reports `airflowVersion`, so
+# their version arrives before the first request. A plain Airflow has no such
+# oracle, so the version is either stated with `--airflow-version` or probed
+# once at startup — never assumed, because assuming 2.x against an Airflow 3
+# server is exactly the obscure-404 failure the seam exists to prevent.
+
+
+def version_path() -> str:
+    """`GET /version` — the probe endpoint, which both majors serve."""
+    return "/version"
+
+
+def probe_pins(url: str) -> tuple[str, ...]:
+    """The spec versions to pin while probing, best guess first.
+
+    Every `astro` call must name a version (transport ADR), including the probe
+    itself — so probing means trying one concrete pin per major until one
+    answers. The URL is the only hint available before the first call: a target
+    whose URL already ends in a base path is asked in that dialect first. Failing
+    that the 2.x line goes first, which is what the previous assume-2.11
+    behaviour did, so an existing plain-2.x user still succeeds on call one.
+    """
+    trimmed = url.rstrip("/")
+    hinted = [pin for pin in _PROBE_PINS if trimmed.endswith(base_path(pin))]
+    return tuple(hinted + [pin for pin in _PROBE_PINS if pin not in hinted])
+
+
+def parse_version(payload: object) -> str:
+    """`{"version": "3.3.0+astro.2"}` → `"3.3.0"`, or "" if unreadable.
+
+    What the *server* reports is what gets pinned from then on, rather than the
+    pin that happened to make the probe succeed — a 2.10 target must not be
+    addressed with a 2.11 spec.
+
+    The one thing dropped is the build suffix an image adds to the release. An
+    Astro Runtime Airflow answers `/version` with `2.11.0+astro.7`, and the
+    pinned string is not a label: `astro --airflow-version` loads the OpenAPI
+    spec *named by it*, and a version it cannot resolve fails the same way a
+    nonexistent one does ("loading OpenAPI spec: unexpected status code: 404").
+    Pinning the build suffix would therefore turn a successful probe into a
+    session where every subsequent call fails. Semver already says build
+    metadata is not part of the version's identity; the seam agrees, and keeps
+    the release — major, minor and patch — exactly as reported.
+    """
+    if not isinstance(payload, dict):
+        return ""
+    reported = _text(payload.get("version")).strip()
+    return reported.split("+", 1)[0].strip()
 
 
 # --- endpoint paths --------------------------------------------------------
@@ -222,8 +294,8 @@ def _segment(value: str) -> str:
 def _with_query(path: str, params: list[tuple[str, str]]) -> str:
     """Attach a query string, dropping empty values and keeping repeats.
 
-    Repeated keys matter: v1's `state` filter is an array parameter, so
-    `?state=failed&state=running` is how you ask for two states.
+    Repeated keys matter: the `state` filter is an array parameter in both
+    majors, so `?state=failed&state=running` is how you ask for two states.
     """
     kept = [(key, value) for key, value in params if value != ""]
     if not kept:
@@ -233,27 +305,32 @@ def _with_query(path: str, params: list[tuple[str, str]]) -> str:
 
 def dags_path(
     *,
+    version: str,
     limit: int = DEFAULT_LIMIT,
     offset: int = 0,
     dag_id_pattern: str = "",
 ) -> str:
     """List DAGs — *all* of them, including paused and stale ones.
 
-    `only_active` is v1's name for "hide DAGs whose file is gone" (Airflow 3
-    renamed it `exclude_stale`) and it **defaults to true**, which silently hides
-    rows. A monitoring tool must not do that: we send `only_active=false`
-    explicitly and let the UI label a stale DAG instead of omitting it. Paused
-    DAGs are never filtered either — `is_paused` is shown, not applied.
+    "Hide DAGs whose file is gone" is spelled `only_active` in v1 and
+    `exclude_stale` in v2, and it **defaults to hiding** in both. A monitoring
+    tool must not do that: we turn it off explicitly and let the UI label a
+    stale DAG instead of omitting it. The version dispatch is not cosmetic —
+    Airflow 3 ignores `only_active` silently, so the v1 spelling against a v2
+    server would quietly hide rows rather than complain. Paused DAGs are never
+    filtered either: `is_paused` is shown, not applied.
 
-    `dag_id_pattern` is v1's server-side substring match on the dag id, used when
-    the full list is too large to have loaded client-side.
+    `dag_id_pattern` is the server-side substring match on the dag id (same
+    name in both majors), used when the full list is too large to have loaded
+    client-side.
     """
+    hide_stale = "exclude_stale" if _serves_v2(version) else "only_active"
     return _with_query(
         "/dags",
         [
             ("limit", str(limit)),
             ("offset", str(offset) if offset else ""),
-            ("only_active", "false"),
+            (hide_stale, "false"),
             ("dag_id_pattern", dag_id_pattern),
         ],
     )
@@ -275,14 +352,22 @@ def dag_path(dag_id: str) -> str:
 def dag_runs_path(
     dag_id: str = "~",
     *,
+    version: str,
     limit: int = DEFAULT_LIMIT,
     offset: int = 0,
     states: tuple[str, ...] = (),
-    order_by: str = _RUNS_ORDER_BY,
+    order_by: str = "",
 ) -> str:
-    """Recent runs, newest first. `dag_id="~"` is v1's cross-DAG wildcard —
-    one call for the whole deployment's run history, which is what makes the
-    primary view a single request."""
+    """Recent runs, newest first. `dag_id="~"` is the cross-DAG wildcard —
+    verified in both majors — so one call covers the whole deployment's run
+    history, which is what makes the primary view a single request.
+
+    Only the ordering differs: an empty `order_by` means "this version's
+    newest-first", which is `-execution_date` on v1 and `-run_after` on v2.
+    """
+    order_by = order_by or (
+        _V2_RUNS_ORDER_BY if _serves_v2(version) else _V1_RUNS_ORDER_BY
+    )
     params = [
         ("limit", str(limit)),
         ("offset", str(offset) if offset else ""),
@@ -310,15 +395,18 @@ def log_path(
     map_index: int = -1,
     full_content: bool = True,
 ) -> str:
-    """One attempt's log. `full_content=true` asks v1 for the whole body rather
-    than a pointer, which is what we want since we cannot stream.
+    """One attempt's log. `full_content=true` asks for the whole body rather
+    than a pointer, which is what we want since we cannot stream. Both majors
+    take the parameter (v2 flipped its *default* to false, which is moot: we
+    always send it).
 
-    `map_index` is required for a *mapped* task instance: v1 looks the instance
-    up by `(dag_id, run_id, task_id, map_index)` and defaults the last to `-1`,
-    so omitting it on a mapped task returns 404 "TaskInstance not found" rather
-    than the log. `-1` is v1's own default and our sentinel for "not mapped", so
-    it is left off the path in that case. There is no path-segment form of this
-    for logs — only the query parameter.
+    `map_index` is required for a *mapped* task instance: Airflow looks the
+    instance up by `(dag_id, run_id, task_id, map_index)` and defaults the last
+    to `-1`, so omitting it on a mapped task returns 404 "TaskInstance not
+    found" rather than the log. `-1` is Airflow's own default and our sentinel
+    for "not mapped", so it is left off the path in that case. There is no
+    path-segment form of this for logs — only the query parameter, in both
+    majors.
     """
     return _with_query(
         f"/dags/{_segment(dag_id)}/dagRuns/{_segment(run_id)}"
@@ -348,36 +436,83 @@ def trigger_run_path(dag_id: str) -> str:
 
 
 def clear_task_instances_path(dag_id: str) -> str:
-    """v1's dedicated clear endpoint. Airflow 3 removed it in favour of a
-    generic PATCH."""
+    """The dedicated clear endpoint — **the same in both majors**.
+
+    Worth stating because it is easy to assume otherwise: Airflow 3 removed the
+    neighbouring `updateTaskInstancesState` endpoint, and the original seam ADR
+    recorded this one as removed too. It is not. Verified against the 3.3.0
+    spec, with every field `clear_body` sends still present and `dry_run` still
+    defaulting to true.
+    """
     return f"/dags/{_segment(dag_id)}/clearTaskInstances"
 
 
 def mark_task_state_path(dag_id: str) -> str:
-    """v1's dedicated set-state endpoint, likewise removed in Airflow 3."""
+    """**v1 only.** Its dedicated set-state endpoint, which takes one task id in
+    the body; Airflow 3 removed it in favour of patching the task instance
+    itself (see `mark_task_instance_path`)."""
     return f"/dags/{_segment(dag_id)}/updateTaskInstancesState"
+
+
+def mark_task_instance_path(
+    dag_id: str,
+    run_id: str,
+    task_id: str,
+    *,
+    map_index: int = -1,
+    dry_run: bool = False,
+) -> str:
+    """**v2 only.** The task instance to PATCH a new state onto.
+
+    Airflow 3 addresses the instance by path rather than naming it in a body, so
+    both of the things v1 carried as fields become path segments here: a mapped
+    instance appends its `map_index`, and a dry run goes to a separate,
+    side-effect-free `…/dry_run` endpoint instead of setting a body flag. That
+    is why the whole (method, path, body) triple is built in this module — with
+    two majors the path *shape* is version knowledge too.
+    """
+    path = (
+        f"/dags/{_segment(dag_id)}/dagRuns/{_segment(run_id)}"
+        f"/taskInstances/{_segment(task_id)}"
+    )
+    if map_index >= 0:
+        path += f"/{map_index}"
+    if dry_run:
+        path += "/dry_run"
+    return path
 
 
 # --- request bodies --------------------------------------------------------
 #
-# v1 field names. `dry_run` is always sent explicitly: it defaults to *true* on
-# both clear and set-state, so a body that omits it returns 200 and does
-# nothing at all.
+# Wire field names. Where a body carries `dry_run` (v1 clear and set-state, v2
+# clear) it is always sent explicitly: it defaults to *true*, so a body that
+# omits it returns 200 and does nothing at all.
 
 
 def pause_body(paused: bool) -> dict[str, object]:
+    """Pause/unpause payload — identical in both majors, alongside the
+    `update_mask=is_paused` query parameter `pause_dag_path` adds."""
     return {"is_paused": paused}
 
 
 def trigger_body(
+    version: str,
     logical_date: datetime | None = None,
     conf: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    """Trigger payload. v1 accepts `logical_date`; the older `execution_date`
-    spelling is gone from Airflow 3, so we never send it."""
+    """Trigger payload. Both majors take `logical_date`; the older
+    `execution_date` spelling is gone from Airflow 3, so we never send it.
+
+    The one difference is what "no date chosen" looks like. v1 omits the field
+    and the server stamps one. v2 makes it **required but nullable**, so an
+    omitted field is a validation error and an explicit `null` is how you ask
+    the server to stamp it.
+    """
     body: dict[str, object] = {"conf": conf or {}}
     if logical_date is not None:
         body["logical_date"] = logical_date.isoformat()
+    elif _serves_v2(version):
+        body["logical_date"] = None
     return body
 
 
@@ -407,14 +542,14 @@ def mark_body(
     *,
     dry_run: bool,
 ) -> dict[str, object]:
-    """Set-state payload.
+    """**v1's** set-state payload.
 
     Note the asymmetry with `clear_body`, which is v1's and not ours: the clear
     endpoint takes a `task_ids` *array*, while set-state takes a single
     **`task_id`** string and expands from it via the four `include_*` flags. A
     body carrying `task_ids` here fails validation (`unknown field`, and
     `task_id` missing) — which is why one task at a time is the caller's
-    contract, enforced in `astro._mutation_request`.
+    contract, enforced in `mutation_request`.
 
     All four `include_*` flags are required by this endpoint's schema, so they
     are always sent rather than left to a default.
@@ -429,6 +564,108 @@ def mark_body(
         "include_future": False,
         "include_past": False,
     }
+
+
+# --- mutations: the whole request, not just its names ----------------------
+
+
+def mutation_request(
+    version: str, action: Action
+) -> tuple[str, str, dict[str, object]]:
+    """The (method, path, body) that performs one confirmed action.
+
+    Pure, and the only place a mutation's *shape* is decided. It lives here
+    rather than in the transport because with two majors the verb and the path
+    are version knowledge too, not merely field names: marking a task state is a
+    POST to a collection endpoint on v1 and a PATCH of the instance itself on
+    v2. Callers hand over an `Action` and send back exactly what they get.
+
+    Dry runs are equivalent from the caller's side either way — it sets
+    `Action.dry_run` and this function picks the body flag (v1) or the dedicated
+    endpoint (v2).
+
+    Raises `ValueError` for a request that must not be sent *at all*: an unknown
+    action kind, an unscoped clear or mark, or a mark naming anything but one
+    task. This module raises no transport error because it knows nothing about
+    the transport; the caller converts.
+    """
+    match action.kind:
+        case "pause" | "unpause":
+            return (
+                "PATCH",
+                pause_dag_path(action.dag_id),
+                pause_body(action.kind == "pause"),
+            )
+        case "trigger":
+            return "POST", trigger_run_path(action.dag_id), trigger_body(version)
+        case "clear":
+            # Both majors' clear endpoints scope by run, and a body that names
+            # task ids but *no* run scopes to the task's whole history instead —
+            # so an unscoped clear is refused here rather than sent and hoped
+            # about.
+            return (
+                "POST",
+                clear_task_instances_path(action.dag_id),
+                clear_body(
+                    _scoped_run(action), action.task_ids, dry_run=action.dry_run
+                ),
+            )
+        case "mark":
+            return _mark_request(version, action)
+        case _:
+            raise ValueError(f"Unknown action {action.kind!r}.")
+
+
+def _mark_request(
+    version: str, action: Action
+) -> tuple[str, str, dict[str, object]]:
+    """Marking one task instance's state, in whichever shape the target takes.
+
+    The one-task-at-a-time contract holds across both majors, for different
+    reasons that land in the same place: v1's endpoint names a single `task_id`
+    in the body (see `mark_body`) and v2's addresses a single instance by path.
+    Refusing here rather than marking one of several is the point.
+    """
+    if len(action.task_ids) != 1:
+        raise ValueError(
+            "Marking a task state takes exactly one task instance "
+            f"(asked for {len(action.task_ids)})."
+        )
+    run_id = _scoped_run(action)
+    task_id = action.task_ids[0]
+    if _serves_v2(version):
+        return (
+            "PATCH",
+            mark_task_instance_path(
+                action.dag_id,
+                run_id,
+                task_id,
+                map_index=action.map_index,
+                dry_run=action.dry_run,
+            ),
+            {"new_state": action.state},
+        )
+    return (
+        "POST",
+        mark_task_state_path(action.dag_id),
+        mark_body(run_id, task_id, action.state, dry_run=action.dry_run),
+    )
+
+
+def _scoped_run(action: Action) -> str:
+    """The run a clear or a mark must be confined to.
+
+    Not defaulted: with task ids and no run id, Airflow clears or re-states those
+    tasks in *every* run of the DAG. The app always drills into a run before
+    offering either action, so an absent run id is a programming error — and the
+    one place it could do real damage is the one place to refuse it.
+    """
+    if not action.run_id:
+        raise ValueError(
+            f"Refusing to {action.kind} {action.dag_id} with no DAG run named — "
+            "that would affect every run of the task."
+        )
+    return action.run_id
 
 
 # --- pure parsing (unit-tested) --------------------------------------------
@@ -458,8 +695,9 @@ def _int(value: object, default: int = 0) -> int:
 def total_entries(payload: object) -> int:
     """How many records the server says exist, across all pages.
 
-    v1 reports this as `total_entries` on every list envelope; a response that
-    omits it reads as 0, which callers treat as "one page is all there is".
+    Both majors report this as `total_entries` on every list envelope (verified
+    live on 3.3.0); a response that omits it reads as 0, which callers treat as
+    "one page is all there is".
     """
     if not isinstance(payload, dict):
         return 0
@@ -515,6 +753,11 @@ def _dag_run(row: dict) -> DagRun:
         state=_text(row.get("state"), "none"),
         run_type=_text(row.get("run_type")),
         logical_date=_dt(row.get("logical_date")),
+        # v2 only; absent on v1 and read leniently rather than dispatched. It
+        # matters because v2's `logical_date` is nullable — a manually
+        # triggered Airflow 3 run can have no logical date at all, and
+        # `run_after` is what still says when it belongs.
+        run_after=_dt(row.get("run_after")),
         start_date=_dt(row.get("start_date")),
         end_date=_dt(row.get("end_date")),
         note=note if isinstance(note, str) else None,
@@ -541,10 +784,12 @@ def parse_dag_run(payload: object) -> DagRun | None:
 def parse_task_instances(payload: object) -> list[TaskInstance]:
     """`GET .../taskInstances` → TaskInstances.
 
-    Also reads the `TaskInstanceReferenceCollection` that `clearTaskInstances`
-    and `updateTaskInstancesState` answer with — same `task_instances` envelope,
-    fewer fields — which is how a mutation reports what it touched. (`.../tries`
-    is *not* this shape: it nests under `task_instances_history`.)
+    Also reads the collection that every mutation answers with — v1's
+    `clearTaskInstances` and `updateTaskInstancesState`, v2's clear and its
+    task-instance PATCH (dry run or not) — because all four use the same
+    `task_instances` envelope with fewer fields, which is how a mutation reports
+    what it touched. That shared shape is why the outcome line needs no version.
+    (`.../tries` is *not* this shape: it nests under `task_instances_history`.)
     """
     out: list[TaskInstance] = []
     for row in _rows(payload, "task_instances"):
@@ -580,16 +825,54 @@ def _schedule(value: object) -> str:
 
 
 def _tag_names(value: object) -> tuple[str, ...]:
-    """v1 spells tags as `[{"name": "cs"}, …]`."""
+    """Tags arrive as `[{"name": "cs"}, …]` in both majors."""
     if not isinstance(value, list):
         return ()
     names = (_text(item.get("name")) for item in value if isinstance(item, dict))
     return tuple(name for name in names if name)
 
 
-def parse_dags(payload: object) -> list[Dag]:
+# The three DAG fields the two majors disagree about, read per major. Kept as
+# two separate readers rather than one field-name lookup table so each version's
+# spellings can be seen whole, next to what they mean.
+
+
+def _v1_dag_fields(row: dict) -> tuple[bool, datetime | None, str]:
+    """`(is_active, next_dagrun, schedule)` out of a v1 DAG row.
+
+    `is_active` is missing from some 2.x builds; absent means "present", since a
+    stale DAG is the exceptional case.
+    """
+    return (
+        bool(row.get("is_active", True)),
+        _dt(row.get("next_dagrun")),
+        _schedule(row.get("schedule_interval")) or _text(row.get("timetable_description")),
+    )
+
+
+def _v2_dag_fields(row: dict) -> tuple[bool, datetime | None, str]:
+    """`(is_active, next_dagrun, schedule)` out of a v2 DAG row.
+
+    Airflow 3 renamed all three and **inverted the first**: `is_stale` where v1
+    said `is_active`, so reading the wrong one would report every DAG as stale.
+    Absent still means "not stale", matching v1's lenient default. The schedule
+    is a plain cron string in `timetable_summary` rather than v1's typed object,
+    with `timetable_description` (prose, e.g. "At 07:23") as the fallback both
+    majors share.
+    """
+    return (
+        not bool(row.get("is_stale", False)),
+        _dt(row.get("next_dagrun_run_after")),
+        _text(row.get("timetable_summary")) or _text(row.get("timetable_description")),
+    )
+
+
+def parse_dags(payload: object, version: str) -> list[Dag]:
+    """`GET /dags` → Dags. Everything but the three renamed fields is shared."""
+    read_renamed = _v2_dag_fields if _serves_v2(version) else _v1_dag_fields
     out: list[Dag] = []
     for row in _rows(payload, "dags"):
+        is_active, next_dagrun, schedule = read_renamed(row)
         out.append(
             Dag(
                 dag_id=_text(row.get("dag_id"), "?"),
@@ -597,16 +880,13 @@ def parse_dags(payload: object) -> list[Dag]:
                 owners=_str_tuple(row.get("owners")),
                 tags=_tag_names(row.get("tags")),
                 has_import_errors=bool(row.get("has_import_errors")),
-                next_dagrun=_dt(row.get("next_dagrun")),
+                next_dagrun=next_dagrun,
                 description=_text(row.get("description")),
-                # v1 omits `is_active` in some builds; absent means "present",
-                # since a stale DAG is the exceptional case.
-                is_active=bool(row.get("is_active", True)),
+                is_active=is_active,
                 # Matched against `/importErrors` filenames so a stale DAG's
                 # leftover `has_import_errors` flag is not shown as a live error.
                 fileloc=_text(row.get("fileloc")),
-                schedule=_schedule(row.get("schedule_interval"))
-                or _text(row.get("timetable_description")),
+                schedule=schedule,
             )
         )
     return out
@@ -641,19 +921,25 @@ def parse_import_errors(payload: object) -> list[ImportErrorEntry]:
     return out
 
 
-def parse_log(payload: object, try_number: int) -> TaskLog:
-    """`GET .../logs/{n}` → TaskLog.
+def parse_log(payload: object, try_number: int, version: str) -> TaskLog:
+    """`GET .../logs/{n}` → TaskLog. The one parser where the two majors return
+    genuinely different *kinds* of thing, not just different names.
 
-    v1 returns `content` as the *repr of a list of (host, text) tuples* rather
-    than plain text, e.g. ``[('', ' INFO - ...\\n')]``. We unwrap that into
-    readable lines when it parses and fall back to the raw string when it does
-    not, so an unexpected shape shows something rather than nothing.
+    v1 hands back `content` as the *repr of a list of (host, text) tuples*
+    rather than plain text, e.g. ``[('', ' INFO - ...\\n')]``. v2 hands back a
+    JSON array of structured events. Either way this returns readable lines, and
+    either way an unexpected shape shows something rather than nothing.
+
+    `continuation_token` is read the same way in both: it exists in both schemas
+    and is carried, not used (see `models.TaskLog`).
     """
     if not isinstance(payload, dict):
         return TaskLog(content="", try_number=try_number)
     token = payload.get("continuation_token")
+    raw = payload.get("content")
+    read = _flatten_log_events if _serves_v2(version) else _unwrap_log_content
     return TaskLog(
-        content=_unwrap_log_content(payload.get("content")),
+        content=read(raw),
         try_number=try_number,
         continuation_token=token if isinstance(token, str) else None,
     )
@@ -684,12 +970,49 @@ def _log_chunk(chunk: object) -> str:
     return chunk if isinstance(chunk, str) else str(chunk)
 
 
+def _flatten_log_events(raw: object) -> str:
+    """Turn v2's structured log events into one readable line each.
+
+    Airflow 3 answers with a JSON array of event objects
+    (`{"event": …, "timestamp": …, "level": …, "logger": …, …}`) instead of v1's
+    text blob. The log pane renders lines and the `/` filter matches lines, so
+    the events are flattened rather than pretty-printed: the fields a human
+    reads (`timestamp level event`) are kept in that order and the rest dropped.
+
+    Anything that is not the expected array — a plain string body, an older
+    shape, junk — is shown as-is rather than swallowed.
+    """
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    if not isinstance(raw, list):
+        return str(raw)
+    return "\n".join(_log_event(item) for item in raw)
+
+
+def _log_event(item: object) -> str:
+    """One v2 log event as a line. Bare strings in the array pass through."""
+    if isinstance(item, str):
+        return item
+    if not isinstance(item, dict):
+        return str(item)
+    event = item.get("event")
+    message = _text(event) or ("" if event is None else str(event))
+    if not message:
+        return str(item)  # an event we cannot read still shows something
+    parts = (_text(item.get("timestamp")), _text(item.get("level")), message)
+    return " ".join(part for part in parts if part)
+
+
 def parse_error_detail(payload: object) -> str | None:
     """The human-readable message out of an Airflow error body.
 
     v1 answers failures with an RFC-7807 problem document
-    (`{"title": …, "detail": …, "status": 404}`); the `detail` is the only part
-    worth showing a user.
+    (`{"title": …, "detail": …, "status": 404}`) and v2 with FastAPI's
+    `{"detail": …}`; either way the `detail` is the only part worth showing a
+    user. Version-free because both shapes are read by the same lookup — except
+    for one v2 addition, below.
     """
     if not isinstance(payload, dict):
         return None
@@ -697,4 +1020,26 @@ def parse_error_detail(payload: object) -> str | None:
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
-    return None
+    return _validation_detail(payload.get("detail"))
+
+
+def _validation_detail(detail: object) -> str | None:
+    """FastAPI reports a *validation* failure as a list, not a string.
+
+    `[{"type": …, "loc": ["body", "logical_date"], "msg": "Field required"}, …]`
+    — which the string lookup above skips straight past, leaving the user with
+    a raw JSON tail. The first entry is what says what went wrong; the rest are
+    counted, not printed.
+    """
+    if not isinstance(detail, list) or not detail:
+        return None
+    first = detail[0]
+    if not isinstance(first, dict):
+        return str(first)
+    message = _text(first.get("msg")) or _text(first.get("type")) or "invalid request"
+    location = first.get("loc")
+    where = (
+        ".".join(str(part) for part in location) if isinstance(location, list) else ""
+    )
+    more = f" (+{len(detail) - 1} more)" if len(detail) > 1 else ""
+    return f"{where}: {message}{more}" if where else f"{message}{more}"

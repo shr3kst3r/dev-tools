@@ -12,10 +12,12 @@ PR exactly as pr-watch would render it — checks, unresolved threads, metrics.
 `[` / `]` move the divider to resize the two windows. These and the active
 view are remembered in a state file (see layout.py) when the app is given a
 `layout_path`, so the dashboard reopens the way you left it.
-`?` floats a keybinding reference over the dashboard, and `l` floats a live
-activity log of every background poll — its PR counts, and any rate-limit
-backoffs or failures. A summary bar is docked at the top, the refresh status
-bar at the bottom.
+`?` floats a keybinding reference over the dashboard — the full key list
+lives there, not in the bottom bar — and `l` floats a live activity log of
+every background poll — its PR counts, and any rate-limit backoffs or
+failures. A summary bar is docked at the top; the status bar at the bottom
+shows the refresh timing plus the last 10 GitHub requests as a strip of dots
+(green success, red failure, blue still in flight).
 
 `g` hands the selected PR to goblin-watcher: the app suspends itself and runs
 `gw new --pr <url>` on the real terminal (gw needs it to attach tmux when run
@@ -67,6 +69,9 @@ MAX_BACKOFF_SECONDS = 900
 
 # How many activity-log lines to keep in memory (a rolling tail).
 MAX_LOG_ENTRIES = 200
+
+# How many recent GitHub requests the status bar shows as dots.
+POLL_HISTORY_LIMIT = 10
 
 
 class HelpScreen(ModalScreen[None]):
@@ -238,6 +243,9 @@ class MyPrsApp(App[None]):
         self._error: PollError | None = None
         # A rolling log of what each background poll did, for the `l` overlay.
         self._activity_log: list[LogEntry] = []
+        # The last few GitHub requests, oldest first, for the status bar's
+        # dots: "running" while in flight, then settled to "ok" or "error".
+        self._poll_history: list[str] = []
         # Each view keeps its own cursor, so flipping back lands where you were.
         self._selected: dict[str, str | None] = {view: None for view in VIEWS}
         self._updated = datetime.now()
@@ -296,6 +304,10 @@ class MyPrsApp(App[None]):
         if self._polling:
             return
         self._polling = True
+        # The request goes on the status bar's dot strip as in-flight;
+        # _apply_poll settles it to ok/error when the worker lands.
+        self._poll_history.append("running")
+        del self._poll_history[:-POLL_HISTORY_LIMIT]
         self._refresh_view()
         # gh runs a subprocess + network call; keep it off the UI thread.
         self.run_worker(self._poll_in_thread, thread=True, exclusive=True)
@@ -312,6 +324,8 @@ class MyPrsApp(App[None]):
         self._current_delay = self._delay_after(error)
         self._seconds_left = self._current_delay
         self._polling = False
+        if self._poll_history and self._poll_history[-1] == "running":
+            self._poll_history[-1] = "ok" if error is None else "error"
         self._record_poll(data, error)
         self._rebuild_table()
         self._refresh_view()
@@ -531,11 +545,11 @@ class MyPrsApp(App[None]):
             )
         self.query_one("#detail", Static).update(detail)
         self.query_one("#status", Static).update(
-            pr_ui.render_footer(
+            ui.render_status_bar(
                 self._updated,
                 max(0, self._seconds_left),
                 self._current_delay,
+                self._poll_history,
                 refreshing=self._polling,
-                quit_hint="q quit · v view · r refresh · o open · g gw · l log · [ ] resize · ? help",
             )
         )

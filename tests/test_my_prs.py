@@ -9,7 +9,13 @@ from rich.console import Console
 from textual.widgets import DataTable, Static
 
 from tools.my_prs import gw, layout, ui
-from tools.my_prs.app import GwRmScreen, HelpScreen, LogScreen, MyPrsApp
+from tools.my_prs.app import (
+    POLL_HISTORY_LIMIT,
+    GwRmScreen,
+    HelpScreen,
+    LogScreen,
+    MyPrsApp,
+)
 from tools.my_prs.cli import _parse_args
 from tools.my_prs.github import (
     GitHubError,
@@ -401,6 +407,37 @@ def test_render_log_empty_and_with_entries() -> None:
     assert "Activity log" in out
 
 
+# --- status bar --------------------------------------------------------------
+
+
+def test_render_poll_dots_one_colored_dot_per_request() -> None:
+    dots = ui.render_poll_dots(["ok", "error", "running"])
+    assert dots.plain == "●●●"
+    assert [span.style for span in dots.spans] == [
+        "bold green",
+        "bold red",
+        "bold blue",
+    ]
+
+
+def test_render_status_bar_shows_dots_and_help_pointer_not_key_list() -> None:
+    bar = ui.render_status_bar(NOW, 42, 60, ["ok", "error", "running"], refreshing=True)
+    text = bar.plain
+    assert "●●●" in text
+    assert "refreshing…" in text
+    # The keybindings live in the `?` popup now, not the bar.
+    assert "? help" in text
+    assert "v view" not in text
+    assert "resize" not in text
+
+
+def test_render_status_bar_countdown_and_no_dots_before_first_request() -> None:
+    bar = ui.render_status_bar(NOW, 42, 60, [])
+    assert "refresh in 42s" in bar.plain
+    assert "(every 60s)" in bar.plain
+    assert "●" not in bar.plain
+
+
 # --- cli -------------------------------------------------------------------
 
 
@@ -584,6 +621,41 @@ async def test_app_logs_each_poll() -> None:
         assert "rate limited" in app.activity_log[-1].message
 
 
+async def test_status_bar_tracks_github_request_history() -> None:
+    polls: list[tuple[dict[str, list[PrItem]] | None, PollError | None]] = [
+        (_data(), None),
+        (None, PollError(message="boom")),
+    ]
+    app = MyPrsApp(poll=lambda: polls.pop(0), interval=60)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app._poll_history == ["ok"]
+
+        app.action_poll_now()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app._poll_history == ["ok", "error"]
+        status = _plain(app.query_one("#status", Static))
+        assert status.count("●") == 2  # one dot per request so far
+        assert "? help" in status
+        assert "v view" not in status  # keys moved to the `?` popup
+
+
+async def test_poll_history_keeps_only_the_last_ten() -> None:
+    app = MyPrsApp(poll=lambda: (_data(), None), interval=60)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app._poll_history[:] = ["error"] * POLL_HISTORY_LIMIT
+        app.action_poll_now()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert len(app._poll_history) == POLL_HISTORY_LIMIT
+        assert app._poll_history[-1] == "ok"  # newest kept…
+        assert app._poll_history[0] == "error"  # …oldest dropped
+
+
 async def test_log_overlay_opens_and_closes_and_is_live() -> None:
     app = MyPrsApp(poll=lambda: (_data(), None), interval=60)
     async with app.run_test(size=(140, 40)) as pilot:
@@ -740,6 +812,7 @@ async def test_help_overlay_opens_and_closes() -> None:
         help_text = _plain(app.screen.query_one("#help", Static))
         assert "Quit" in help_text
         assert "Cycle the detail pane" in help_text
+        assert "last 10 GitHub requests" in help_text  # the dots legend
 
         # `q` closes the overlay without quitting the app.
         await pilot.press("q")

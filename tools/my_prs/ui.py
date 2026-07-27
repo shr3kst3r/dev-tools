@@ -7,6 +7,7 @@ cells and the summary/footer live here; the *detail* pane reuses pr-watch's
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 
 from rich.align import Align
@@ -142,6 +143,51 @@ def render_summary(items: list[PrItem] | None, error: str | None, view: str = "m
     return summary
 
 
+# One dot per recent GitHub request, keyed by its status in the app's history.
+_POLL_DOT_STYLES = {
+    "ok": "bold green",
+    "error": "bold red",
+    "running": "bold blue",
+}
+
+
+def render_poll_dots(history: Sequence[str]) -> Text:
+    """The recent GitHub requests as a strip of dots, oldest first: green for
+    success, red for failure, blue for a request still in flight."""
+    dots = Text()
+    for status in history:
+        dots.append("●", style=_POLL_DOT_STYLES.get(status, "dim"))
+    return dots
+
+
+def render_status_bar(
+    updated: datetime,
+    seconds_to_refresh: int,
+    interval: int,
+    history: Sequence[str],
+    *,
+    refreshing: bool = False,
+) -> Text:
+    """The one-line bar docked at the bottom: refresh timing, the recent
+    GitHub-request dots, and a pointer at the `?` popup. The keybindings
+    themselves live in the popup (render_help), not here."""
+    bar = Text(justify="center")
+    bar.append("updated ", style="dim")
+    bar.append(updated.strftime("%H:%M:%S"), style="bold")
+    bar.append("   ·   ", style="dim")
+    if refreshing:
+        bar.append("refreshing…", style="bold cyan")
+    else:
+        bar.append(f"refresh in {seconds_to_refresh:>2}s", style="bold cyan")
+    bar.append(f" (every {interval}s)", style="dim")
+    if history:
+        bar.append("   ·   ", style="dim")
+        bar.append_text(render_poll_dots(history))
+    bar.append("   ·   ", style="dim")
+    bar.append("? help", style="dim")
+    return bar
+
+
 def render_detail_placeholder(
     items: list[PrItem] | None,
     error: str | None,
@@ -251,7 +297,11 @@ HELP_KEYS: tuple[tuple[str, str], ...] = (
     ("q", "Quit"),
 )
 
-HELP_NOTE = "Layout, sizing, and the active view are saved and restored on the next launch."
+HELP_NOTES = (
+    "Layout, sizing, and the active view are saved and restored on the next launch.",
+    "The status-bar dots are the last 10 GitHub requests: "
+    "green ok, red failed, blue in flight.",
+)
 
 
 def render_help() -> RenderableType:
@@ -261,8 +311,9 @@ def render_help() -> RenderableType:
     table.add_column()
     for key, description in HELP_KEYS:
         table.add_row(key, description)
+    notes = Group(*(Text(note, style="dim italic") for note in HELP_NOTES))
     return Panel(
-        Group(table, Text(), Text(HELP_NOTE, style="dim italic")),
+        Group(table, Text(), notes),
         title=Text("Help", style="bold"),
         subtitle=Text("esc to close", style="dim"),
         border_style="cyan",

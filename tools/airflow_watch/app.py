@@ -6,9 +6,11 @@ recent DAG runs across every DAG on the left, and a detail pane that drills
 comes back out, `<`/`>` step through a task's log attempts.
 
 Windowing follows my-prs: `d` cycles the detail pane through right of the list,
-below it, or hidden; `[` / `]` move the divider. Those and the selected
-deployment persist in a state file (see layout.py) when the app is given a
-`layout_path`. `?` floats a keybinding reference, `l` a live activity log of
+below it, or hidden; `[` / `]` move the divider. Under the detail pane sits an
+activity chart — the listed runs (or, drilled in, the run's task instances)
+bucketed over time and coloured by state — which `g` shows or hides. All of
+those and the selected deployment persist in a state file (see layout.py) when
+the app is given a `layout_path`. `?` floats a keybinding reference, `l` a live activity log of
 every poll and every action, `e` the DAG import errors, and `D` a deployment
 switcher.
 
@@ -271,6 +273,7 @@ class AirflowWatchApp(App[None]):
         ("c", "clear_tasks", "Clear task"),
         ("m", "mark_tasks", "Mark task state"),
         ("d", "cycle_detail", "Move/hide detail"),
+        ("g", "toggle_chart", "Show/hide chart"),
         ("left_square_bracket", "shrink_list", "Shrink list window"),
         ("right_square_bracket", "grow_list", "Grow list window"),
         ("l", "toggle_log", "Activity log"),
@@ -294,10 +297,17 @@ class AirflowWatchApp(App[None]):
         width: 50%;
         min-width: 40;
     }
-    #detail-scroll {
+    #detail-pane {
+        layout: vertical;
         width: 1fr;
-        scrollbar-gutter: stable;
         border-left: solid $foreground 30%;
+    }
+    #detail-scroll {
+        height: 1fr;
+        scrollbar-gutter: stable;
+    }
+    #chart {
+        height: 9;
     }
     #body.detail-below {
         layout: vertical;
@@ -308,7 +318,7 @@ class AirflowWatchApp(App[None]):
         height: 50%;
         min-height: 8;
     }
-    #body.detail-below #detail-scroll {
+    #body.detail-below #detail-pane {
         width: 1fr;
         height: 1fr;
         border-left: none;
@@ -317,7 +327,7 @@ class AirflowWatchApp(App[None]):
     #body.detail-hidden #list {
         width: 1fr;
     }
-    #body.detail-hidden #detail-scroll {
+    #body.detail-hidden #detail-pane {
         display: none;
     }
     """
@@ -376,6 +386,7 @@ class AirflowWatchApp(App[None]):
         saved = layout_state.load(layout_path) if layout_path else Layout()
         self._detail_mode = saved.detail_mode
         self._split = saved.split
+        self._chart_shown = saved.chart
         # An explicit --deployment wins over the remembered one.
         self._wanted_deployment = deployment or saved.deployment or None
 
@@ -470,8 +481,10 @@ class AirflowWatchApp(App[None]):
         yield Static(id="summary")
         with Container(id="body"):
             yield DataTable(id="list")
-            with VerticalScroll(id="detail-scroll"):
-                yield Static(id="detail")
+            with Container(id="detail-pane"):
+                with VerticalScroll(id="detail-scroll"):
+                    yield Static(id="detail")
+                yield Static(id="chart")
         yield Static(id="status")
 
     def on_mount(self) -> None:
@@ -1171,6 +1184,13 @@ class AirflowWatchApp(App[None]):
             # A hidden pane can't keep focus; hand it back to the list.
             self.query_one(DataTable).focus()
 
+    def action_toggle_chart(self) -> None:
+        self._chart_shown = not self._chart_shown
+        self._apply_layout()
+        self._save_layout()
+        if self._chart_shown:
+            self._refresh_view()  # the pane went un-updated while hidden
+
     def action_grow_list(self) -> None:
         self._resize_split(+SPLIT_STEP)
 
@@ -1195,6 +1215,7 @@ class AirflowWatchApp(App[None]):
         list_.styles.height = (
             f"{self._split}%" if self._detail_mode == "below" else None
         )
+        self.query_one("#chart").display = self._chart_shown
 
     def _save_layout(self) -> None:
         if self._layout_path is not None:
@@ -1203,6 +1224,7 @@ class AirflowWatchApp(App[None]):
                     detail_mode=self._detail_mode,
                     split=self._split,
                     deployment=self.deployment_key,
+                    chart=self._chart_shown,
                 ),
                 self._layout_path,
             )
@@ -1258,6 +1280,12 @@ class AirflowWatchApp(App[None]):
             )
         )
         now = datetime.now(timezone.utc)
+        if self._chart_shown:
+            # The chart tracks the same selection the detail pane does; when
+            # hidden it is skipped entirely and repainted on toggle instead.
+            self.query_one("#chart", Static).update(
+                ui.render_chart(self._drill, self.visible_runs(), now)
+            )
         if detail:
             self.query_one("#detail", Static).update(
                 ui.render_detail(

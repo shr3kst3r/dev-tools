@@ -2800,6 +2800,110 @@ def test_cli_a_stated_airflow_version_never_probes(monkeypatch) -> None:
     assert captured == []
 
 
+# --- the chart --------------------------------------------------------------
+
+
+def test_chart_group_is_total() -> None:
+    assert ui.chart_group("failed") == "failed"
+    assert ui.chart_group("upstream_failed") == "failed"
+    assert ui.chart_group("running") == "running"
+    assert ui.chart_group("restarting") == "running"
+    assert ui.chart_group("queued") == "queued"
+    assert ui.chart_group("deferred") == "queued"
+    assert ui.chart_group("success") == "success"
+    # Neutral and never-heard-of states land in "other", never raise.
+    assert ui.chart_group("skipped") == "other"
+    assert ui.chart_group("awaiting_input") == "other"
+    assert ui.chart_group("") == "other"
+
+
+def test_chart_counts_places_points_on_the_time_axis() -> None:
+    points = (
+        (NOW - timedelta(hours=2), "success"),  # the window start -> bucket 0
+        (NOW - timedelta(hours=1), "failed"),  # halfway -> the middle
+        (NOW, "running"),  # now -> the last bucket
+        (None, "queued"),  # undated -> skipped
+    )
+    counts = ui.chart_counts(points, NOW, buckets=4)
+    assert counts[0] == {"success": 1}
+    assert counts[2] == {"failed": 1}
+    assert counts[3] == {"running": 1}
+    assert sum(sum(bucket.values()) for bucket in counts) == 3
+
+
+def test_chart_counts_without_dated_points_is_empty() -> None:
+    assert ui.chart_counts((), NOW, buckets=3) == [{}, {}, {}]
+    assert ui.chart_counts(((None, "success"),), NOW, buckets=3) == [{}, {}, {}]
+
+
+def test_chart_counts_single_instant_collapses_to_one_bucket() -> None:
+    counts = ui.chart_counts(((NOW, "success"), (NOW, "failed")), NOW, buckets=5)
+    assert counts[0] == {"success": 1, "failed": 1}
+    assert sum(sum(bucket.values()) for bucket in counts) == 2
+
+
+def test_stack_cells_keeps_a_failure_visible() -> None:
+    """19 successes and 1 failure in a 5-cell bar: red still shows, and at the
+    bottom — rounding it away would hide the one thing worth seeing."""
+    cells = ui.stack_cells({"success": 19, "failed": 1}, height=5)
+    assert len(cells) == 5
+    assert cells[0] == "failed"
+    assert cells.count("success") == 4
+
+
+def test_stack_cells_is_proportional_and_bounded() -> None:
+    assert ui.stack_cells({"success": 2, "failed": 2}, height=4) == (
+        "failed",
+        "failed",
+        "success",
+        "success",
+    )
+    assert ui.stack_cells({}, height=5) == ()
+    assert ui.stack_cells({"success": 3}, height=0) == ()
+    # More groups than cells: the attention-ordered prefix wins.
+    squeezed = ui.stack_cells(
+        {"failed": 1, "running": 1, "queued": 1, "success": 1}, height=2
+    )
+    assert squeezed == ("failed", "running")
+
+
+def test_render_chart_shows_runs_at_the_top_level() -> None:
+    runs = (
+        _run_(state="failed", start=NOW - timedelta(hours=1)),
+        _run_("sync_beta", state="success"),
+    )
+    text = _plain_renderable(ui.render_chart(Drill(), runs, NOW), width=80)
+    assert "Runs over time" in text
+    assert "█" in text
+    assert "now" in text  # the time axis is labelled
+    assert "failed" in text and "success" in text  # the legend names the groups
+
+
+def test_render_chart_follows_the_drill_into_a_run() -> None:
+    drill = Drill(
+        level="tasks",
+        run=_run_(),
+        tasks=(_task(), _task("loader", state="failed")),
+    )
+    text = _plain_renderable(ui.render_chart(drill, (), NOW), width=80)
+    assert "Tasks over time · sync_alpha" in text
+    assert "█" in text
+
+
+def test_render_chart_says_when_nothing_can_be_placed() -> None:
+    assert "No dated runs" in _plain_renderable(ui.render_chart(Drill(), (), NOW))
+    undated = DagRun(dag_id="sync_alpha", run_id="manual", state="queued")
+    text = _plain_renderable(ui.render_chart(Drill(), (undated,), NOW))
+    assert "No dated runs" in text
+    never_started = Drill(
+        level="tasks",
+        run=_run_(),
+        tasks=(TaskInstance(task_id="sensor", state="scheduled"),),
+    )
+    text = _plain_renderable(ui.render_chart(never_started, (), NOW))
+    assert "No task instance has started yet" in text
+
+
 # --- layout ---------------------------------------------------------------
 
 
@@ -2808,6 +2912,8 @@ def test_layout_from_dict_defaults_bad_values() -> None:
     assert layout.from_dict({}) == layout.Layout()
     assert layout.from_dict({"detail_mode": "sideways", "split": "wide"}) == layout.Layout()
     assert layout.from_dict({"deployment": 7}).deployment == ""
+    assert layout.from_dict({"chart": "yes"}).chart is True
+    assert layout.from_dict({"chart": False}).chart is False
     # Booleans are ints in Python; they must not sneak in as a split.
     assert layout.from_dict({"split": True}).split == layout.SPLIT_DEFAULT
     assert layout.from_dict({"split": 5}).split == layout.SPLIT_MIN
@@ -2816,7 +2922,7 @@ def test_layout_from_dict_defaults_bad_values() -> None:
 
 def test_layout_save_load_roundtrip(tmp_path) -> None:
     path = tmp_path / "sub" / "layout.json"  # parent dir is created on save
-    saved = layout.Layout(detail_mode="below", split=35, deployment="dep-prod-1")
+    saved = layout.Layout(detail_mode="below", split=35, deployment="dep-prod-1", chart=False)
     layout.save(saved, path)
     assert layout.load(path) == saved
 
@@ -3468,7 +3574,7 @@ async def test_cycle_detail_moves_then_hides_pane() -> None:
         await pilot.pause()
 
         body = app.query_one("#body")
-        detail_scroll = app.query_one("#detail-scroll")
+        detail_pane = app.query_one("#detail-pane")
         table = app.query_one(DataTable)
 
         await pilot.press("d")
@@ -3479,7 +3585,7 @@ async def test_cycle_detail_moves_then_hides_pane() -> None:
         await pilot.press("d")
         await pilot.pause()
         assert body.has_class("detail-hidden")
-        assert not detail_scroll.display
+        assert not detail_pane.display
         assert table.size.width == app.size.width
 
         await pilot.press("d")
@@ -3487,6 +3593,46 @@ async def test_cycle_detail_moves_then_hides_pane() -> None:
         assert not body.has_class("detail-below")
         assert not body.has_class("detail-hidden")
         assert table.size.width < app.size.width
+
+
+async def test_chart_pane_graphs_runs_and_follows_the_drill() -> None:
+    app = _app()
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        chart = app.query_one("#chart", Static)
+        assert chart.display
+        assert "Runs over time" in _plain(chart)
+
+        await pilot.press("enter")  # drill into the failed run (sync_beta)
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert "Tasks over time · sync_beta" in _plain(chart)
+
+        await pilot.press("escape")
+        await pilot.pause()
+        assert "Runs over time" in _plain(chart)
+
+
+async def test_chart_toggles_and_persists(tmp_path) -> None:
+    path = tmp_path / "layout.json"
+    app = _app(layout_path=path)
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        chart = app.query_one("#chart", Static)
+        assert chart.display
+
+        await pilot.press("g")
+        await pilot.pause()
+        assert not chart.display
+        assert layout.load(path).chart is False
+
+        await pilot.press("g")
+        await pilot.pause()
+        assert chart.display
+        assert layout.load(path).chart is True
+        assert "Runs over time" in _plain(chart)  # repainted on re-show
 
 
 async def test_resize_moves_divider_and_persists(tmp_path) -> None:
@@ -3527,7 +3673,10 @@ async def test_resize_is_a_noop_when_detail_hidden(tmp_path) -> None:
 
 async def test_saved_layout_and_deployment_are_restored(tmp_path) -> None:
     path = tmp_path / "layout.json"
-    layout.save(layout.Layout(detail_mode="below", split=30, deployment="dep-stg-2"), path)
+    layout.save(
+        layout.Layout(detail_mode="below", split=30, deployment="dep-stg-2", chart=False),
+        path,
+    )
     asked: list[PollRequest] = []
     app = _app(layout_path=path, requested=asked)
     async with app.run_test(size=(150, 40)) as pilot:
@@ -3535,6 +3684,7 @@ async def test_saved_layout_and_deployment_are_restored(tmp_path) -> None:
         await pilot.pause()
         assert app.query_one("#body").has_class("detail-below")
         assert app._split == 30
+        assert not app.query_one("#chart", Static).display
         # The remembered deployment is what the first poll was asked to read.
         assert asked[0].deployment is not None and asked[0].deployment.key == "dep-stg-2"
 

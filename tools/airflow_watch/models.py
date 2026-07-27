@@ -134,14 +134,20 @@ class DagRun:
         return self.state in ATTENTION_RUN_STATES
 
     @property
-    def sort_date(self) -> datetime:
-        """Newest-first ordering key: when the run happened.
+    def happened_at(self) -> datetime | None:
+        """When the run happened: started if it did, else its logical date.
 
-        `run_after` is the last resort for a run that has not started and has
-        no logical date — without it, a just-triggered Airflow 3 run would sort
-        to the bottom of the list instead of the top until it started.
+        `run_after` is the last resort for an Airflow 3 run that has not started
+        and has no logical date — without it, a just-triggered run would have no
+        place in time at all. None means the run truly cannot be dated.
         """
-        return self.start_date or self.logical_date or self.run_after or _EPOCH
+        return self.start_date or self.logical_date or self.run_after
+
+    @property
+    def sort_date(self) -> datetime:
+        """Newest-first ordering key: `happened_at`, with an undatable run
+        pinned to the epoch — the bottom of a newest-first list."""
+        return self.happened_at or _EPOCH
 
     @property
     def search_text(self) -> str:

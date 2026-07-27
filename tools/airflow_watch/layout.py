@@ -1,8 +1,8 @@
 """Persisted window layout for airflow-watch.
 
 The dashboard remembers how you left it — where the detail pane lives (`d`),
-where the divider sits (`[` / `]`), and which deployment was selected — in a
-small JSON state file. Parsing/serializing is pure so it can be unit-tested;
+where the divider sits (`[` / `]`), whether the activity chart is shown (`g`),
+and which deployment was selected — in a small JSON state file. Parsing/serializing is pure so it can be unit-tested;
 only `load`/`save` touch the filesystem, and both shrug off a missing,
 malformed, or unwritable file (a broken state file must never take the
 dashboard down — it just means default layout).
@@ -39,6 +39,8 @@ class Layout:
     # The deployment key (its Astro id, or its URL for a plain Airflow) that
     # was selected last. Empty means "no preference — take the first one".
     deployment: str = ""
+    # Whether the activity chart under the detail pane is shown (`g`).
+    chart: bool = True
 
 
 def clamp_split(value: int) -> int:
@@ -58,7 +60,15 @@ def from_dict(data: object) -> Layout:
     deployment = data.get("deployment")
     if not isinstance(deployment, str):
         deployment = ""
-    return Layout(detail_mode=mode, split=clamp_split(split), deployment=deployment)
+    chart = data.get("chart")
+    if not isinstance(chart, bool):
+        chart = True
+    return Layout(
+        detail_mode=mode,
+        split=clamp_split(split),
+        deployment=deployment,
+        chart=chart,
+    )
 
 
 def to_dict(layout: Layout) -> dict[str, object]:
@@ -66,6 +76,7 @@ def to_dict(layout: Layout) -> dict[str, object]:
         "detail_mode": layout.detail_mode,
         "split": layout.split,
         "deployment": layout.deployment,
+        "chart": layout.chart,
     }
 
 

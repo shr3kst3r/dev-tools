@@ -14,10 +14,12 @@ airflow-3-joins-the-version-seam ADR that widened it.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime
 
 from rich.align import Align
-from rich.console import Group, RenderableType
+from rich.console import Console, ConsoleOptions, Group, RenderableType, RenderResult
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -139,14 +141,7 @@ def list_row(run: DagRun, now: datetime) -> tuple[Text, ...]:
         Text(_elide(run.run_id, _RUN_ID_WIDTH), style="dim"),
         Text(run.run_type or "—"),
         state_cell(run.state),
-        # `run_after` is the last resort for an Airflow 3 run with a null
-        # logical date that has not started yet — the row still says *when*.
-        Text(
-            format_relative(
-                run.start_date or run.logical_date or run.run_after, now
-            ),
-            style="dim",
-        ),
+        Text(format_relative(run.happened_at, now), style="dim"),
         _duration_cell(run.duration, run.start_date, now),
     )
 
@@ -733,6 +728,195 @@ def render_detail(
     return render_run(run, known, now)
 
 
+# --- the chart pane ---------------------------------------------------------
+#
+# A stacked-bar timeline under the detail pane (`g` toggles it): activity
+# bucketed over time, one bucket per column, coloured by state. Bucketing and
+# stacking are pure functions asserted on directly in tests; only the bucket
+# count depends on the pane's width, which is why the body is a renderable
+# (resolved at render time) rather than a function of the data alone.
+
+# chart group -> style, in stacking order: the bottom of the bar first. Failure
+# sits at the bottom so a tall stack of successes can never hide it.
+CHART_GROUPS: tuple[tuple[str, str], ...] = (
+    ("failed", "red"),
+    ("running", "cyan"),
+    ("queued", "yellow"),
+    ("success", "green"),
+    ("other", "magenta"),
+)
+
+# state -> chart group. Coarser than `_STATE_STYLE` on purpose: a one-character
+# column can carry four or five colours legibly, not thirteen.
+_CHART_GROUP_OF = {
+    "failed": "failed",
+    "upstream_failed": "failed",
+    "running": "running",
+    "restarting": "running",
+    "queued": "queued",
+    "scheduled": "queued",
+    "up_for_retry": "queued",
+    "up_for_reschedule": "queued",
+    "deferred": "queued",
+    "success": "success",
+}
+
+# When the point happened (None for one that cannot be dated), and its state.
+ChartPoint = tuple[datetime | None, str]
+
+# The chart body's fixed geometry: how many rows of bars, and the y-axis gutter
+# ("  12┤") to the left of them.
+CHART_BAR_ROWS = 5
+_CHART_GUTTER = 5
+
+
+def chart_group(state: str) -> str:
+    """Which chart colour a state contributes to. Total, like `state_style`:
+    an unknown state lands in "other" rather than raising."""
+    return _CHART_GROUP_OF.get((state or "none").strip().lower(), "other")
+
+
+def chart_counts(
+    points: Sequence[ChartPoint], now: datetime, buckets: int
+) -> list[dict[str, int]]:
+    """Group counts per bucket, over `buckets` equal slices of the time window.
+
+    The window runs from the oldest dated point to `now` (or to the newest
+    point, should one somehow sit in the future). Undated points are skipped —
+    there is nowhere on a time axis to put them; `render_chart` reports them.
+    """
+    counts: list[dict[str, int]] = [{} for _ in range(max(1, buckets))]
+    timed = [(when, state) for when, state in points if when is not None]
+    if not timed:
+        return counts
+    start = min(when for when, _ in timed)
+    end = max(now, max(when for when, _ in timed))
+    span = max((end - start).total_seconds(), 1.0)
+    for when, state in timed:
+        index = int((when - start).total_seconds() / span * len(counts))
+        index = min(max(index, 0), len(counts) - 1)
+        group = chart_group(state)
+        counts[index][group] = counts[index].get(group, 0) + 1
+    return counts
+
+
+def stack_cells(counts: dict[str, int], height: int) -> tuple[str, ...]:
+    """One bucket's bar: `height` cells bottom-up, each named for its group.
+
+    Proportional, with one guarantee worth its own code: every non-empty group
+    gets at least one cell, granted in `CHART_GROUPS` order. A bucket of 19
+    successes and 1 failure must still show red — rounding away the failure
+    would hide exactly what a monitoring chart exists to show.
+    """
+    total = sum(counts.values())
+    if total <= 0 or height <= 0:
+        return ()
+    present = [group for group, _ in CHART_GROUPS if counts.get(group, 0) > 0]
+    cells = dict.fromkeys(present[:height], 1)  # the visibility guarantee
+    remaining = height - len(cells)
+    if remaining > 0:
+        # The rest goes out proportionally, largest fractional part first;
+        # `sorted` is stable, so ties keep `CHART_GROUPS` order.
+        quotas = {group: counts[group] / total * remaining for group in present}
+        for group in present:
+            cells[group] += int(quotas[group])
+            remaining -= int(quotas[group])
+        by_remainder = sorted(
+            present, key=lambda group: quotas[group] % 1, reverse=True
+        )
+        for group in by_remainder[:remaining]:
+            cells[group] += 1
+    stacked: list[str] = []
+    for group, _ in CHART_GROUPS:
+        stacked.extend([group] * cells.get(group, 0))
+    return tuple(stacked)
+
+
+@dataclass(frozen=True)
+class ChartBody:
+    """The bars, the y-axis peak label, and the time axis.
+
+    `points` must already be dated (no None timestamps) and non-empty —
+    `render_chart` owns the empty state. Width-adaptive: the console's width at
+    render time decides the bucket count, so resizing the pane rescales the
+    chart instead of clipping it.
+    """
+
+    points: tuple[ChartPoint, ...]
+    now: datetime
+
+    def __rich_console__(
+        self, console: Console, options: ConsoleOptions
+    ) -> RenderResult:
+        buckets = options.max_width - _CHART_GUTTER
+        if buckets < 4:
+            return
+        counts = chart_counts(self.points, self.now, buckets)
+        totals = [sum(bucket.values()) for bucket in counts]
+        peak = max(totals)
+        styles = dict(CHART_GROUPS)
+        columns = [
+            stack_cells(bucket, round(total / peak * CHART_BAR_ROWS) or 1)
+            if total
+            else ()
+            for bucket, total in zip(counts, totals)
+        ]
+        for row in range(CHART_BAR_ROWS - 1, -1, -1):
+            top = row == CHART_BAR_ROWS - 1
+            line = Text(f"{peak:>4}┤" if top else "    │", style="dim")
+            for cells in columns:
+                if len(cells) > row:
+                    line.append("█", style=styles[cells[row]])
+                else:
+                    line.append(" ")
+            yield line
+        yield Text("    └" + "─" * buckets, style="dim")
+        start = min(when for when, _ in self.points if when is not None)
+        left = format_relative(start, self.now)
+        pad = buckets - len(left) - len("now")
+        labels = f"     {left}{' ' * pad}now" if pad >= 1 else f"     {left}"
+        yield Text(labels, style="dim")
+
+
+def render_chart(
+    drill: Drill, runs: tuple[DagRun, ...], now: datetime
+) -> RenderableType:
+    """The chart pane under the detail pane: activity over time.
+
+    Follows the drill the way the detail pane does — the recent runs at the top
+    level, the drilled-into run's task instances inside one. Undated points
+    cannot sit on a time axis, so when nothing can be placed the pane says so
+    rather than drawing an empty axis.
+    """
+    if drill.level in ("tasks", "log") and drill.run is not None:
+        title = f"Tasks over time · {drill.run.dag_id}"
+        points = tuple((task.start_date, task.state) for task in drill.tasks)
+        empty = "No task instance has started yet."
+    else:
+        title = "Runs over time"
+        points = tuple((run.happened_at, run.state) for run in runs)
+        empty = "No dated runs to graph."
+    timed = tuple((when, state) for when, state in points if when is not None)
+    if not timed:
+        body: RenderableType = Align.center(Text(empty, style="dim"))
+        legend = Text()
+    else:
+        body = ChartBody(points=timed, now=now)
+        legend = Text()
+        for group, style in CHART_GROUPS:
+            if any(chart_group(state) == group for _, state in timed):
+                if legend.plain:
+                    legend.append("  ")
+                legend.append(f"█ {group}", style=style)
+    return Panel(
+        body,
+        title=Text(title, style="bold"),
+        subtitle=legend or None,
+        border_style="cyan",
+        padding=(0, 1),
+    )
+
+
 def render_filter_prompt(target: str, query: str) -> RenderableType:
     """The `/` bar: what is being filtered, and what has been typed so far.
 
@@ -883,6 +1067,7 @@ HELP_KEYS: tuple[tuple[str, str], ...] = (
     ("c", "Clear (retry) the selected task instance"),
     ("m", "Mark the selected task instance success / failed"),
     ("d", "Cycle the detail pane: right → below → hidden"),
+    ("g", "Show / hide the activity chart under the detail pane"),
     ("[ / ]", "Resize the windows: shrink / grow the list"),
     ("l", "Show / hide the activity log"),
     ("r", "Refresh now"),

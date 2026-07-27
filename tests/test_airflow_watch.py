@@ -3397,6 +3397,37 @@ def test_render_summary_marks_hidden_stale_dags() -> None:
     assert "1 stale" in shown and "hidden" not in shown
 
 
+def test_menu_offers_the_running_filter_at_the_top_level_only() -> None:
+    """`R` narrows the runs and DAGs lists; inside a drill the list belongs to
+    a run's tasks, so the menu does not offer it there."""
+    assert "toggle_running" in [e.action for e in ui.menu_entries("runs", "runs")]
+    assert "toggle_running" in [e.action for e in ui.menu_entries("dags", "runs")]
+    assert "toggle_running" not in [e.action for e in ui.menu_entries("runs", "tasks")]
+    assert "toggle_running" not in [e.action for e in ui.menu_entries("runs", "log")]
+
+
+def test_menu_labels_the_running_filter_by_state_and_view() -> None:
+    def label(entries: tuple[ui.MenuEntry, ...]) -> str:
+        return next(e.label for e in entries if e.action == "toggle_running")
+
+    assert label(ui.menu_entries("runs", "runs")) == "Show only running runs"
+    assert label(ui.menu_entries("runs", "runs", running_only=True)) == "Show all runs"
+    assert label(ui.menu_entries("dags", "runs")) == "Show only running DAGs"
+    assert label(ui.menu_entries("dags", "runs", running_only=True)) == "Show all DAGs"
+
+
+def test_render_summary_marks_the_running_only_narrowing() -> None:
+    """A list narrowed to what is in flight must say so in both views —
+    otherwise it reads as a deployment with nothing else going on."""
+    snapshot = _snapshot()
+    marker = "● running only · R shows all"
+    assert marker in ui.render_summary(snapshot, None, shown=1, running_only=True).plain
+    assert marker in ui.render_summary(
+        snapshot, None, view="dags", shown=0, running_only=True
+    ).plain
+    assert "running only" not in ui.render_summary(snapshot, None).plain
+
+
 # --- layout ---------------------------------------------------------------
 
 
@@ -4609,6 +4640,54 @@ async def test_view_switch_shows_dags_with_stale_hidden_but_counted() -> None:
         await pilot.pause()
         assert table.row_count == 2
         assert not app._show_stale
+
+
+async def test_running_filter_narrows_both_views_and_is_marked() -> None:
+    """`R` is one toggle shared by the two top-level views: the runs list
+    keeps only state "running", the DAGs list keeps only DAGs with a run in
+    flight — and the summary bar says so, so a narrowed list can never read
+    as a short one."""
+    runs = (
+        _run_("sync_alpha", run_id="r-live", state="running", start=NOW - timedelta(minutes=5)),
+        _run_("sync_beta", run_id="r-broken", state="failed", start=NOW - timedelta(minutes=10)),
+        _run_("sync_beta", run_id="r-ok", state="success", end=NOW),
+    )
+    app = _app([(_snapshot(runs=runs), None)])
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        table = app.query_one(DataTable)
+        assert table.row_count == 3
+
+        await pilot.press("R")
+        await pilot.pause()
+        assert [run.run_id for run in app.visible_runs()] == ["r-live"]
+        assert table.row_count == 1
+        assert "running only" in _plain(app.query_one("#summary", Static))
+
+        # The same toggle narrows the DAGs view to DAGs with a run in flight.
+        await pilot.press("v")
+        await pilot.pause()
+        assert [dag.dag_id for dag in app.visible_dags()] == ["sync_alpha"]
+        assert table.row_count == 1
+        assert "running only" in _plain(app.query_one("#summary", Static))
+
+        # Toggling again widens both views.
+        await pilot.press("R")
+        await pilot.pause()
+        assert len(app.visible_dags()) == 2
+        assert "running only" not in _plain(app.query_one("#summary", Static))
+        await pilot.press("v")
+        await pilot.pause()
+        assert table.row_count == 3
+
+        # Inside a drill the list is a run's tasks; `R` has nothing to narrow.
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("R")
+        await pilot.pause()
+        assert not app._only_running
 
 
 async def test_dag_view_detail_labels_the_dags_state() -> None:

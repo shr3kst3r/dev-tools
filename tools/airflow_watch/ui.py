@@ -318,6 +318,7 @@ def render_summary(
     view: str = "runs",
     shown: int | None = None,
     stale_hidden: bool = False,
+    running_only: bool = False,
 ) -> Text:
     """The one-line status bar docked at the top: which view, which deployment,
     what state its rows are in, and whether any DAG file is failing to parse.
@@ -326,6 +327,8 @@ def render_summary(
     so the bar never claims more than is on screen. `stale_hidden` marks the
     stale count as hidden rows — the count itself never goes away, because rows
     silently absent is exactly the failure mode this bar exists to prevent.
+    `running_only` marks the `R` narrowing for the same reason: a list showing
+    only what is in flight must never read as a deployment with nothing else.
     """
     bar = view_tabs(view)
     if snapshot is not None:
@@ -377,6 +380,9 @@ def render_summary(
         if snapshot.runs_truncated:
             bar.append("   ")
             bar.append("⋯ run list truncated", style="bold yellow")
+    if running_only:
+        bar.append("   ")
+        bar.append("● running only · R shows all", style="bold cyan")
     if snapshot.import_errors:
         bar.append("   ")
         bar.append(
@@ -1194,6 +1200,7 @@ def menu_entries(
     *,
     chart_shown: bool = True,
     stale_shown: bool = False,
+    running_only: bool = False,
 ) -> tuple[MenuEntry, ...]:
     """The actions available right now, for the `o` menu.
 
@@ -1230,6 +1237,11 @@ def menu_entries(
                 "Hide stale DAGs" if stale_shown else "Show stale DAGs",
                 "toggle_stale",
             ),
+            MenuEntry(
+                "R",
+                "Show all DAGs" if running_only else "Show only running DAGs",
+                "toggle_running",
+            ),
             MenuEntry("p", "Pause / unpause the selected DAG", "toggle_pause"),
             MenuEntry("t", "Trigger a run of the selected DAG", "trigger_run"),
             MenuEntry("e", "Show DAG import errors", "show_import_errors"),
@@ -1239,6 +1251,11 @@ def menu_entries(
             MenuEntry("enter", "Drill into the selected run's tasks", "drill_in"),
             MenuEntry("v", "Switch view: DAG runs → DAGs", "switch_view"),
             MenuEntry("/", "Filter the runs list", "start_filter"),
+            MenuEntry(
+                "R",
+                "Show all runs" if running_only else "Show only running runs",
+                "toggle_running",
+            ),
             MenuEntry("p", "Pause / unpause the selected DAG", "toggle_pause"),
             MenuEntry("t", "Trigger a run of the selected DAG", "trigger_run"),
             MenuEntry("i", "Hand the selected run to gw for a summary", "investigate"),
@@ -1323,6 +1340,7 @@ HELP_KEYS: tuple[tuple[str, str], ...] = (
     ("D", "Switch deployment"),
     ("e", "Show / hide DAG import errors"),
     ("s", "Show / hide stale DAGs (hidden by default)"),
+    ("R", "Show only running runs / DAGs (press again for all)"),
     ("p", "Pause or unpause the selected DAG"),
     ("t", "Trigger a new run of the selected DAG"),
     ("c", "Clear (retry) the selected task instance"),

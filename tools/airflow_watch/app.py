@@ -24,9 +24,10 @@ and its drop-down lists every command in that group with its direct key,
 the footer stopped trying to name every key long ago. `?` floats a keybinding
 reference, `l` a live activity log of every poll and every action, `e` the DAG
 import errors, and `D` a deployment switcher. Stale DAGs are hidden from the DAGs view by default
-(`s` shows them); the summary bar always counts them. `R` narrows both
-top-level views to what is running right now — runs in state "running", DAGs
-with a run in flight — and the summary bar says so while it is on. `w` marks
+(`s` shows them); the summary bar always counts them. `R` cycles a run-state
+filter over both top-level views — running, failed, queued, success, then all
+again — keeping the runs in that state and the DAGs with such a run in the
+loaded window; the summary bar names the state while a filter is on. `w` marks
 the selected run as watched (a yellow ★ in the runs list); the third view in
 the `v` cycle shows only watched runs, and `W` clears the list. The watch list
 is session state, like `s` and `R` — deliberately not persisted, and dropped
@@ -412,7 +413,7 @@ class AirflowWatchApp(App[None]):
         ("D", "switch_deployment", "Switch deployment"),
         ("e", "show_import_errors", "Import errors"),
         ("s", "toggle_stale", "Show/hide stale DAGs"),
-        ("R", "toggle_running", "Only running"),
+        ("R", "cycle_state_filter", "Filter by state"),
         ("w", "toggle_watch", "Watch/unwatch run"),
         ("W", "clear_watched", "Clear watched runs"),
         ("M", "open_menu_bar", "Menu bar"),
@@ -559,11 +560,11 @@ class AirflowWatchApp(App[None]):
         # Whether the DAGs view shows stale DAGs. Deliberately not persisted:
         # "hidden by default" is the promise, and `s` is one keystroke.
         self._show_stale = False
-        # Whether both top-level views are narrowed to what is running right
-        # now (`R`). One flag shared by both views — "show me what's in
-        # flight" is a question about the deployment, not about one list.
+        # The run state both top-level views are narrowed to (`R` cycles it;
+        # None means all). One value shared by both views — "show me what's
+        # failed" is a question about the deployment, not about one list.
         # Not persisted for the same reason `_show_stale` is not.
-        self._only_running = False
+        self._state_filter: str | None = None
         # The run keys `w` has marked as watched; the Watched view shows only
         # these. Session state like `_show_stale`, and dropped on a deployment
         # switch — a run key only means anything within one deployment.
@@ -670,7 +671,7 @@ class AirflowWatchApp(App[None]):
             run
             for run in self._runs
             if (not watched_only or run.key in self._watched)
-            and (not self._only_running or run.state == "running")
+            and (self._state_filter is None or run.state == self._state_filter)
             and matches(query, run.search_text)
         )
 
@@ -682,22 +683,22 @@ class AirflowWatchApp(App[None]):
 
     def visible_dags(self) -> tuple[Dag, ...]:
         """The DAG rows the list shows: the `/` filter, and — unless `s` has
-        shown them — stale DAGs dropped, narrowed to DAGs with a run in flight
-        while `R` is on. Hiding is view-side only: the snapshot keeps every
-        stale DAG, so the summary count stays real and showing them costs no
-        fetch."""
+        shown them — stale DAGs dropped, narrowed to DAGs with a run in the
+        filtered state while `R`'s state filter is on. Hiding is view-side
+        only: the snapshot keeps every stale DAG, so the summary count stays
+        real and showing them costs no fetch."""
         dags = self._snapshot.dags if self._snapshot is not None else ()
         query = self._queries["dags"]
-        running = (
-            self._snapshot.running_counts()
-            if self._only_running and self._snapshot is not None
+        in_state = (
+            self._snapshot.state_counts(self._state_filter)
+            if self._state_filter is not None and self._snapshot is not None
             else None
         )
         return tuple(
             dag
             for dag in dags
             if (self._show_stale or not dag.is_stale)
-            and (running is None or running.get(dag.dag_id, 0) > 0)
+            and (in_state is None or in_state.get(dag.dag_id, 0) > 0)
             and matches(query, dag.search_text)
         )
 
@@ -1623,20 +1624,22 @@ class AirflowWatchApp(App[None]):
         self._rebuild_table()
         self._refresh_view()
 
-    def action_toggle_running(self) -> None:
-        """Narrow both top-level views to what is running right now, or widen
-        them back. In the runs list that is runs in state "running"; in the
-        DAGs list, DAGs with a running run in the current window (the same
-        derivation the Running column shows). Client-side, like the `/`
-        filter — the rows are already loaded — and marked in the summary bar
-        so a narrowed list can never read as a short one."""
+    def action_cycle_state_filter(self) -> None:
+        """Cycle the run-state filter over both top-level views: all →
+        running → failed → queued → success → all. The runs list keeps runs
+        in that state; the DAGs list keeps DAGs with such a run in the current
+        window (for "running", the same derivation the Running column shows).
+        Client-side, like the `/` filter — the rows are already loaded — and
+        marked in the summary bar so a narrowed list can never read as a
+        short one."""
         if self._showing_tasks:
             return  # the list belongs to a run's tasks; nothing here to narrow
-        self._only_running = not self._only_running
+        index = ui.STATE_FILTERS.index(self._state_filter)
+        self._state_filter = ui.STATE_FILTERS[(index + 1) % len(ui.STATE_FILTERS)]
         self._append_log(
             "info",
-            "Showing only running runs and DAGs."
-            if self._only_running
+            f"Showing only {self._state_filter} runs and DAGs."
+            if self._state_filter is not None
             else "Showing all runs and DAGs.",
         )
         self._rebuild_table()
@@ -1699,7 +1702,7 @@ class AirflowWatchApp(App[None]):
         categories = ui.menu_categories(
             chart_shown=self._chart_shown,
             stale_shown=self._show_stale,
-            running_only=self._only_running,
+            state_filter=self._state_filter,
         )
         index %= len(categories)
         anchor = self.query_one(f"#menu-title-{index}", MenuTitle).region.x
@@ -1806,7 +1809,7 @@ class AirflowWatchApp(App[None]):
                 view=self._view,
                 shown=self._shown_count(),
                 stale_hidden=not self._show_stale,
-                running_only=self._only_running,
+                state_filter=self._state_filter,
                 watched_runs=self._watched_in_window(),
                 watched_total=len(self._watched),
             )

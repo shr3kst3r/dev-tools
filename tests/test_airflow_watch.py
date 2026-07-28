@@ -2730,6 +2730,8 @@ def test_dags_view_shows_which_dags_are_running() -> None:
         ),
     )
     assert snapshot.running_counts() == {"sync_alpha": 2}
+    assert snapshot.state_counts("success") == {"sync_beta": 1}
+    assert snapshot.state_counts("failed") == {}
     out = _plain_renderable(ui.render_once(snapshot, NOW, view="dags"), width=170)
     assert "Running" in out  # the column is named
     alpha = next(line for line in out.splitlines() if "sync_alpha" in line)
@@ -3440,8 +3442,18 @@ def test_menu_categories_label_their_toggles_by_state() -> None:
     assert label(ui.menu_categories(stale_shown=True), "toggle_stale") == "Hide stale DAGs"
     assert label(ui.menu_categories(stale_shown=False), "toggle_stale") == "Show stale DAGs"
     assert label(ui.menu_categories(chart_shown=False), "toggle_chart") == "Show the charts"
+    # The `R` entry always names where the cycle goes next: into the first
+    # state from off, state → state in the middle, and back to all at the end.
     assert (
-        label(ui.menu_categories(running_only=True), "toggle_running")
+        label(ui.menu_categories(state_filter=None), "cycle_state_filter")
+        == "Show only running runs / DAGs"
+    )
+    assert (
+        label(ui.menu_categories(state_filter="running"), "cycle_state_filter")
+        == "State filter: running → failed"
+    )
+    assert (
+        label(ui.menu_categories(state_filter="success"), "cycle_state_filter")
         == "Show all runs and DAGs"
     )
 
@@ -3453,22 +3465,27 @@ def test_menu_bar_titles_are_stable_whatever_the_state() -> None:
     toggled = [
         category.title
         for category in ui.menu_categories(
-            chart_shown=False, stale_shown=True, running_only=True
+            chart_shown=False, stale_shown=True, state_filter="failed"
         )
     ]
     assert default == toggled
 
 
-def test_render_summary_marks_the_running_only_narrowing() -> None:
-    """A list narrowed to what is in flight must say so in both views —
-    otherwise it reads as a deployment with nothing else going on."""
+def test_render_summary_marks_the_state_filter_narrowing() -> None:
+    """A list narrowed to one state must say which in both views — otherwise
+    it reads as a deployment with nothing else going on."""
     snapshot = _snapshot()
-    marker = "● running only · R shows all"
-    assert marker in ui.render_summary(snapshot, None, shown=1, running_only=True).plain
+    marker = "● running only · R cycles"
     assert marker in ui.render_summary(
-        snapshot, None, view="dags", shown=0, running_only=True
+        snapshot, None, shown=1, state_filter="running"
     ).plain
-    assert "running only" not in ui.render_summary(snapshot, None).plain
+    assert marker in ui.render_summary(
+        snapshot, None, view="dags", shown=0, state_filter="running"
+    ).plain
+    assert "✖ failed only · R cycles" in ui.render_summary(
+        snapshot, None, shown=1, state_filter="failed"
+    ).plain
+    assert "only · R cycles" not in ui.render_summary(snapshot, None).plain
 
 
 # --- layout ---------------------------------------------------------------
@@ -4689,11 +4706,12 @@ async def test_view_switch_shows_dags_with_stale_hidden_but_counted() -> None:
         assert not app._show_stale
 
 
-async def test_running_filter_narrows_both_views_and_is_marked() -> None:
-    """`R` is one toggle shared by the two top-level views: the runs list
-    keeps only state "running", the DAGs list keeps only DAGs with a run in
-    flight — and the summary bar says so, so a narrowed list can never read
-    as a short one."""
+async def test_state_filter_cycles_and_narrows_both_views() -> None:
+    """`R` cycles one state filter shared by the two top-level views — all →
+    running → failed → queued → success → all. The runs list keeps runs in the
+    filtered state, the DAGs list keeps DAGs with such a run in the window —
+    and the summary bar names the state, so a narrowed list can never read as
+    a short one."""
     runs = (
         _run_("sync_alpha", run_id="r-live", state="running", start=NOW - timedelta(minutes=5)),
         _run_("sync_beta", run_id="r-broken", state="failed", start=NOW - timedelta(minutes=10)),
@@ -4706,27 +4724,41 @@ async def test_running_filter_narrows_both_views_and_is_marked() -> None:
         table = app.query_one(DataTable)
         assert table.row_count == 3
 
-        await pilot.press("R")
+        await pilot.press("R")  # first press keeps its old meaning: running
         await pilot.pause()
         assert [run.run_id for run in app.visible_runs()] == ["r-live"]
         assert table.row_count == 1
         assert "running only" in _plain(app.query_one("#summary", Static))
 
-        # The same toggle narrows the DAGs view to DAGs with a run in flight.
+        # The same filter narrows the DAGs view to DAGs with a run in flight.
         await pilot.press("v")
         await pilot.pause()
         assert [dag.dag_id for dag in app.visible_dags()] == ["sync_alpha"]
         assert table.row_count == 1
         assert "running only" in _plain(app.query_one("#summary", Static))
 
-        # Toggling again widens both views.
+        # The next press moves to failed — in both views at once.
         await pilot.press("R")
         await pilot.pause()
-        assert len(app.visible_dags()) == 2
-        assert "running only" not in _plain(app.query_one("#summary", Static))
+        assert [dag.dag_id for dag in app.visible_dags()] == ["sync_beta"]
+        assert "failed only" in _plain(app.query_one("#summary", Static))
         await pilot.press("v", "v")  # dags → watched → runs
         await pilot.pause()
+        assert [run.run_id for run in app.visible_runs()] == ["r-broken"]
+
+        # queued (nothing here) → success → back to all.
+        await pilot.press("R")
+        await pilot.pause()
+        assert app.visible_runs() == ()
+        assert "queued only" in _plain(app.query_one("#summary", Static))
+        await pilot.press("R")
+        await pilot.pause()
+        assert [run.run_id for run in app.visible_runs()] == ["r-ok"]
+        await pilot.press("R")
+        await pilot.pause()
+        assert app._state_filter is None
         assert table.row_count == 3
+        assert "R cycles" not in _plain(app.query_one("#summary", Static))
 
         # Inside a drill the list is a run's tasks; `R` has nothing to narrow.
         await pilot.press("enter")
@@ -4734,7 +4766,7 @@ async def test_running_filter_narrows_both_views_and_is_marked() -> None:
         await pilot.pause()
         await pilot.press("R")
         await pilot.pause()
-        assert not app._only_running
+        assert app._state_filter is None
 
 
 async def test_app_w_watches_and_unwatches_the_selected_run() -> None:

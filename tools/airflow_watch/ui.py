@@ -90,6 +90,11 @@ VIEW_LABELS = {"runs": "DAG runs", "dags": "DAGs", "watched": "Watched"}
 # whole run machinery instead of re-implementing it.
 RUN_VIEWS = ("runs", "watched")
 
+# What `R` cycles the run-state filter through, None meaning "all". Running
+# comes first — `R` grew up as a running-only toggle, so one press still
+# answers "what is in flight?" — then the rest in attention order.
+STATE_FILTERS: tuple[str | None, ...] = (None, "running", "failed", "queued", "success")
+
 
 def state_style(value: str) -> tuple[str, str]:
     """(glyph, style) for a run or task state.
@@ -334,7 +339,7 @@ def render_summary(
     view: str = "runs",
     shown: int | None = None,
     stale_hidden: bool = False,
-    running_only: bool = False,
+    state_filter: str | None = None,
     watched_runs: tuple[DagRun, ...] = (),
     watched_total: int = 0,
 ) -> Text:
@@ -345,8 +350,8 @@ def render_summary(
     so the bar never claims more than is on screen. `stale_hidden` marks the
     stale count as hidden rows — the count itself never goes away, because rows
     silently absent is exactly the failure mode this bar exists to prevent.
-    `running_only` marks the `R` narrowing for the same reason: a list showing
-    only what is in flight must never read as a deployment with nothing else.
+    `state_filter` marks the `R` narrowing for the same reason: a list showing
+    only one state must never read as a deployment with nothing else.
 
     `watched_runs` are the watched runs currently inside the loaded run window
     and `watched_total` is the whole watch list — the gap between them is a
@@ -423,9 +428,10 @@ def render_summary(
         if snapshot.runs_truncated:
             bar.append("   ")
             bar.append("⋯ run list truncated", style="bold yellow")
-    if running_only:
+    if state_filter is not None:
+        glyph, style = state_style(state_filter)
         bar.append("   ")
-        bar.append("● running only · R shows all", style="bold cyan")
+        bar.append(f"{glyph} {state_filter} only · R cycles", style=style)
     if snapshot.import_errors:
         bar.append("   ")
         bar.append(
@@ -1264,11 +1270,24 @@ class MenuCategory:
     entries: tuple[MenuEntry, ...]
 
 
+def _state_filter_menu_label(state_filter: str | None) -> str:
+    """The `R` entry's label: what pressing it moves the state filter *to*,
+    like every other toggle in the bar — the menu must never point the wrong
+    direction."""
+    index = STATE_FILTERS.index(state_filter) if state_filter in STATE_FILTERS else 0
+    following = STATE_FILTERS[(index + 1) % len(STATE_FILTERS)]
+    if following is None:
+        return "Show all runs and DAGs"
+    if state_filter is None:
+        return f"Show only {following} runs / DAGs"
+    return f"State filter: {state_filter} → {following}"
+
+
 def menu_categories(
     *,
     chart_shown: bool = True,
     stale_shown: bool = False,
-    running_only: bool = False,
+    state_filter: str | None = None,
 ) -> tuple[MenuCategory, ...]:
     """Every command, organized for the menu bar's drop-downs.
 
@@ -1321,10 +1340,8 @@ def menu_categories(
                 MenuEntry("/", "Filter the list on screen", "start_filter"),
                 MenuEntry(
                     "R",
-                    "Show all runs and DAGs"
-                    if running_only
-                    else "Show only what is running",
-                    "toggle_running",
+                    _state_filter_menu_label(state_filter),
+                    "cycle_state_filter",
                 ),
                 MenuEntry(
                     "s",
@@ -1398,7 +1415,7 @@ HELP_KEYS: tuple[tuple[str, str], ...] = (
     ("D", "Switch deployment"),
     ("e", "Show / hide DAG import errors"),
     ("s", "Show / hide stale DAGs (hidden by default)"),
-    ("R", "Show only running runs / DAGs (press again for all)"),
+    ("R", "Cycle the state filter: running → failed → queued → success → all"),
     ("w", "Watch / unwatch the selected run — the Watched view shows them"),
     ("W", "Clear the watched runs"),
     ("p", "Pause or unpause the selected DAG"),

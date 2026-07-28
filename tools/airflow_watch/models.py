@@ -378,15 +378,21 @@ class Snapshot:
                 return candidate
         return None
 
+    def state_counts(self, state: str) -> dict[str, int]:
+        """How many runs in `state` each DAG has, from this snapshot's runs
+        window. Derived, not fetched — it is what the `R` state filter narrows
+        the DAGs view by, and only says anything about the loaded window."""
+        counts: dict[str, int] = {}
+        for run in self.runs:
+            if run.state == state:
+                counts[run.dag_id] = counts.get(run.dag_id, 0) + 1
+        return counts
+
     def running_counts(self) -> dict[str, int]:
         """How many currently-running runs each DAG has, from this snapshot's
         runs window. Derived, not fetched: the DAGs view shows it, and a
         running run is by nature recent enough to be inside the window."""
-        counts: dict[str, int] = {}
-        for run in self.runs:
-            if run.state == "running":
-                counts[run.dag_id] = counts.get(run.dag_id, 0) + 1
-        return counts
+        return self.state_counts("running")
 
 
 @dataclass(frozen=True, slots=True)

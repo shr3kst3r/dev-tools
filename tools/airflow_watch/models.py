@@ -730,8 +730,9 @@ class Drill:
 # `/` opens an incremental filter over whatever list is on screen. It is applied
 # client-side to already-loaded rows, so it costs no API call and feels instant.
 
-# The lists a filter can be active on, each remembering its own query.
-FILTER_TARGETS = ("runs", "dags", "tasks", "log")
+# The lists a filter can be active on, each remembering its own query. The
+# Watched view keeps its own, so narrowing it never narrows the runs list.
+FILTER_TARGETS = ("runs", "dags", "watched", "tasks", "log")
 
 
 def matches(query: str, text: str) -> bool:

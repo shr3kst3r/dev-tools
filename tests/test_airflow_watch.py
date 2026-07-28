@@ -32,10 +32,10 @@ from tools.airflow_watch.app import (
     AirflowWatchApp,
     ConfirmScreen,
     DeploymentScreen,
+    DropdownScreen,
     HelpScreen,
     ImportErrorScreen,
     LogScreen,
-    MenuScreen,
 )
 from tools.airflow_watch.astro import AstroError, PollError
 from tools.airflow_watch import investigate
@@ -2744,14 +2744,6 @@ def test_render_loading_older_names_the_numbers() -> None:
     assert "150 of 5,000" in out
 
 
-def test_menu_offers_the_gw_hand_off_wherever_a_run_is_on_screen() -> None:
-    for view, level in (("runs", "runs"), ("runs", "tasks"), ("runs", "log")):
-        actions = [entry.action for entry in ui.menu_entries(view, level)]
-        assert "investigate" in actions, (view, level)
-    dags = [entry.action for entry in ui.menu_entries("dags", "runs")]
-    assert "investigate" not in dags
-
-
 def test_render_detail_shows_loading_and_error_states() -> None:
     snapshot = _snapshot()
     run = snapshot.runs[0]
@@ -3341,52 +3333,76 @@ def test_render_in_flight_chart_says_when_nothing_has_started() -> None:
     )
 
 
-# --- the actions menu --------------------------------------------------------
+# --- watched runs ------------------------------------------------------------
 
 
-def test_menu_entries_narrow_to_the_context() -> None:
-    """The menu offers what the footer hint used to, per level and view."""
-    top = [entry.action for entry in ui.menu_entries("runs", "runs")]
-    assert "drill_in" in top and "trigger_run" in top
-    assert "clear_tasks" not in top and "toggle_stale" not in top
-    assert top[-1] == "quit"
-
-    tasks = [entry.action for entry in ui.menu_entries("runs", "tasks")]
-    assert "clear_tasks" in tasks and "mark_tasks" in tasks
-    assert "switch_view" not in tasks
-
-    log = [entry.action for entry in ui.menu_entries("runs", "log")]
-    assert "prev_try" in log and "next_try" in log
-    assert "clear_tasks" not in log
-
-    dags = [entry.action for entry in ui.menu_entries("dags", "runs")]
-    assert "toggle_stale" in dags
+def test_watched_view_is_in_the_cycle_and_labelled() -> None:
+    assert ui.VIEWS == ("runs", "dags", "watched")
+    assert ui.VIEW_LABELS["watched"] == "Watched"
+    assert set(ui.RUN_VIEWS) == {"runs", "watched"}
 
 
-def test_menu_entries_label_their_toggles_by_state() -> None:
-    def label(entries: tuple[ui.MenuEntry, ...], action: str) -> str:
-        return next(entry.label for entry in entries if entry.action == action)
+def test_list_row_stars_a_watched_run() -> None:
+    """The star marks a watched run in any state — and coexists with the
+    attention dot rather than replacing it."""
+    settled = _run_(end=NOW)
+    assert "★" in ui.list_row(settled, NOW, watched=True)[0].plain
+    assert "★" not in ui.list_row(settled, NOW)[0].plain
+    failed = _run_(state="failed")
+    cell = ui.list_row(failed, NOW, watched=True)[0].plain
+    assert "●" in cell and "★" in cell
 
-    assert "Show stale" in label(
-        ui.menu_entries("dags", "runs", stale_shown=False), "toggle_stale"
+
+def test_summary_watched_view_counts_whats_outside_the_window() -> None:
+    """A watched run the poll no longer holds cannot be a silent absence: the
+    bar says how many watched runs sit outside the loaded window."""
+    runs = (
+        _run_("a", run_id="r1", state="failed"),
+        _run_("b", run_id="r2", state="running"),
     )
-    assert "Hide stale" in label(
-        ui.menu_entries("dags", "runs", stale_shown=True), "toggle_stale"
+    bar = ui.render_summary(
+        _snapshot(), None, view="watched", shown=2, watched_runs=runs, watched_total=3
+    ).plain
+    assert "2 of 3 watched" in bar
+    assert "1 failed" in bar
+    assert "1 running" in bar
+    assert "1 outside the loaded runs" in bar
+
+
+def test_summary_watched_view_is_quiet_when_everything_is_held() -> None:
+    runs = (_run_("a", run_id="r1"),)
+    bar = ui.render_summary(
+        _snapshot(), None, view="watched", shown=1, watched_runs=runs, watched_total=1
+    ).plain
+    assert "1 watched" in bar
+    assert "outside" not in bar
+
+
+def test_placeholder_explains_an_empty_watched_view() -> None:
+    """An empty Watched view says how to put something in it — unless a filter
+    emptied it, which is the message every other view gives."""
+    empty = _plain_renderable(
+        ui.render_detail_placeholder(_snapshot(), None, view="watched", shown=0)
     )
-    assert "Hide the charts" in label(
-        ui.menu_entries("runs", "runs", chart_shown=True), "toggle_chart"
+    assert "w on a run marks it" in empty
+    filtered = _plain_renderable(
+        ui.render_detail_placeholder(
+            _snapshot(), None, view="watched", shown=0, query="beta"
+        )
     )
-    assert "Show the charts" in label(
-        ui.menu_entries("runs", "runs", chart_shown=False), "toggle_chart"
-    )
+    assert "match the current filter" in filtered
+
+
+# --- the menu bar --------------------------------------------------------
 
 
 def test_menu_option_names_the_direct_key() -> None:
     """Every row teaches the shortcut it replaces."""
-    for entry in ui.menu_entries("runs", "runs"):
-        assert entry.key and entry.label and entry.action
-        row = ui.menu_option(entry).plain
-        assert entry.key in row and entry.label in row
+    for category in ui.menu_categories():
+        for entry in category.entries:
+            assert entry.key and entry.label and entry.action
+            row = ui.menu_option(entry).plain
+            assert entry.key in row and entry.label in row
 
 
 def test_render_summary_marks_hidden_stale_dags() -> None:
@@ -3397,23 +3413,50 @@ def test_render_summary_marks_hidden_stale_dags() -> None:
     assert "1 stale" in shown and "hidden" not in shown
 
 
-def test_menu_offers_the_running_filter_at_the_top_level_only() -> None:
-    """`R` narrows the runs and DAGs lists; inside a drill the list belongs to
-    a run's tasks, so the menu does not offer it there."""
-    assert "toggle_running" in [e.action for e in ui.menu_entries("runs", "runs")]
-    assert "toggle_running" in [e.action for e in ui.menu_entries("dags", "runs")]
-    assert "toggle_running" not in [e.action for e in ui.menu_entries("runs", "tasks")]
-    assert "toggle_running" not in [e.action for e in ui.menu_entries("runs", "log")]
+def test_menu_categories_are_the_complete_command_map() -> None:
+    """The bar is the only menu, so it must be total in both directions: every
+    entry runs a real app action, and every bound key's action is reachable
+    through some category — except the key that opens the bar itself."""
+    in_bar = {
+        entry.action
+        for category in ui.menu_categories()
+        for entry in category.entries
+    }
+    for action in in_bar:
+        assert hasattr(AirflowWatchApp, f"action_{action}"), action
+    bound = {binding[1] for binding in AirflowWatchApp.BINDINGS}
+    assert bound - in_bar == {"open_menu_bar"}
 
 
-def test_menu_labels_the_running_filter_by_state_and_view() -> None:
-    def label(entries: tuple[ui.MenuEntry, ...]) -> str:
-        return next(e.label for e in entries if e.action == "toggle_running")
+def test_menu_categories_label_their_toggles_by_state() -> None:
+    def label(categories: tuple[ui.MenuCategory, ...], action: str) -> str:
+        return next(
+            entry.label
+            for category in categories
+            for entry in category.entries
+            if entry.action == action
+        )
 
-    assert label(ui.menu_entries("runs", "runs")) == "Show only running runs"
-    assert label(ui.menu_entries("runs", "runs", running_only=True)) == "Show all runs"
-    assert label(ui.menu_entries("dags", "runs")) == "Show only running DAGs"
-    assert label(ui.menu_entries("dags", "runs", running_only=True)) == "Show all DAGs"
+    assert label(ui.menu_categories(stale_shown=True), "toggle_stale") == "Hide stale DAGs"
+    assert label(ui.menu_categories(stale_shown=False), "toggle_stale") == "Show stale DAGs"
+    assert label(ui.menu_categories(chart_shown=False), "toggle_chart") == "Show the charts"
+    assert (
+        label(ui.menu_categories(running_only=True), "toggle_running")
+        == "Show all runs and DAGs"
+    )
+
+
+def test_menu_bar_titles_are_stable_whatever_the_state() -> None:
+    """Drop-down entries relabel by state; the bar's titles must not, or the
+    bar would appear to rearrange itself."""
+    default = [category.title for category in ui.menu_categories()]
+    toggled = [
+        category.title
+        for category in ui.menu_categories(
+            chart_shown=False, stale_shown=True, running_only=True
+        )
+    ]
+    assert default == toggled
 
 
 def test_render_summary_marks_the_running_only_narrowing() -> None:
@@ -4631,7 +4674,11 @@ async def test_view_switch_shows_dags_with_stale_hidden_but_counted() -> None:
         await pilot.pause()
         assert table.row_count == 3
 
-        # Switching back restores the runs list, where `s` is a no-op.
+        # Switching onward passes the Watched view, then restores the runs
+        # list, where `s` is a no-op.
+        await pilot.press("v")
+        await pilot.pause()
+        assert app._view == "watched"
         await pilot.press("v")
         await pilot.pause()
         assert app._view == "runs"
@@ -4677,7 +4724,7 @@ async def test_running_filter_narrows_both_views_and_is_marked() -> None:
         await pilot.pause()
         assert len(app.visible_dags()) == 2
         assert "running only" not in _plain(app.query_one("#summary", Static))
-        await pilot.press("v")
+        await pilot.press("v", "v")  # dags → watched → runs
         await pilot.pause()
         assert table.row_count == 3
 
@@ -4688,6 +4735,209 @@ async def test_running_filter_narrows_both_views_and_is_marked() -> None:
         await pilot.press("R")
         await pilot.pause()
         assert not app._only_running
+
+
+async def test_app_w_watches_and_unwatches_the_selected_run() -> None:
+    """`w` toggles the watch mark on the selected run: the row gains a star,
+    the activity log records both directions, and nothing leaves the app."""
+    app = _app()
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app._selected_key is not None and "sync_beta" in app._selected_key
+
+        await pilot.press("w")
+        await pilot.pause()
+        assert len(app._watched) == 1
+        table = app.query_one(DataTable)
+        assert "★" in table.get_row_at(0)[0].plain
+        assert any("Watching sync_beta" in e.message for e in app.activity_log)
+
+        await pilot.press("w")
+        await pilot.pause()
+        assert not app._watched
+        assert "★" not in table.get_row_at(0)[0].plain
+        assert any("Unwatched sync_beta" in e.message for e in app.activity_log)
+
+
+async def test_app_watched_view_shows_only_watched_runs() -> None:
+    app = _app()
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        table = app.query_one(DataTable)
+        assert table.row_count == 2
+
+        await pilot.press("w")  # watch the selected (failed) run
+        await pilot.press("v", "v")  # runs → dags → watched
+        await pilot.pause()
+        assert app._view == "watched"
+        assert table.row_count == 1
+        assert [run.run_id for run in app.visible_runs()] == ["r-broken"]
+        assert "sync_beta" in _plain(app.query_one("#detail", Static))
+        summary = _plain(app.query_one("#summary", Static))
+        assert "1 watched" in summary
+
+
+async def test_app_clearing_the_watch_list_empties_the_watched_view() -> None:
+    """`W` drops the whole list at once: the Watched view empties, says how to
+    refill itself, and the activity log records what the keystroke cost."""
+    app = _app()
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("w", "down")
+        await pilot.pause()
+        await pilot.press("w")  # both runs watched
+        await pilot.pause()
+        assert len(app._watched) == 2
+
+        await pilot.press("v", "v")  # into the Watched view
+        await pilot.pause()
+        table = app.query_one(DataTable)
+        assert table.row_count == 2
+
+        await pilot.press("W")
+        await pilot.pause()
+        assert not app._watched
+        assert table.row_count == 0
+        assert "w on a run marks it" in _plain(app.query_one("#detail", Static))
+        assert any("Cleared 2 watched runs" in e.message for e in app.activity_log)
+
+        # A second `W` with nothing to clear stays silent.
+        entries = len(app.activity_log)
+        await pilot.press("W")
+        await pilot.pause()
+        assert len(app.activity_log) == entries
+
+
+async def test_app_watch_is_inert_in_the_dags_view() -> None:
+    """The DAGs list has no run on screen to mark, so `w` there does nothing."""
+    app = _app()
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("v")  # DAGs view
+        await pilot.pause()
+        await pilot.press("w")
+        await pilot.pause()
+        assert not app._watched
+
+
+async def test_app_watching_from_inside_a_drill_marks_the_drilled_run() -> None:
+    app = _app()
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("enter")  # drill into the failed run
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("w")
+        await pilot.pause()
+        assert len(app._watched) == 1
+        assert any("Watching sync_beta" in e.message for e in app.activity_log)
+
+
+async def test_app_deployment_switch_drops_the_watch_list() -> None:
+    """Watched keys name runs of one deployment; against another they could
+    only be stale, so a switch clears them."""
+    app = _app()
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("w")
+        await pilot.pause()
+        assert len(app._watched) == 1
+
+        app.action_switch_deployment()
+        await pilot.pause()
+        await pilot.press("2")  # Staging
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert not app._watched
+
+
+async def test_menu_bar_opens_a_dropdown_and_runs_the_chosen_action() -> None:
+    """Clicking a category title floats its drop-down; selecting an entry runs
+    the same action the direct key would, then closes."""
+    app = _app()
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app.query_one("#menubar").region.y == 0  # the bar sits on top
+
+        await pilot.click("#menu-title-3")  # View
+        await pilot.pause()
+        assert isinstance(app.screen, DropdownScreen)
+
+        entries = ui.menu_categories(chart_shown=True)[3].entries
+        for _ in range([entry.action for entry in entries].index("toggle_chart")):
+            await pilot.press("down")
+        await pilot.press("enter")
+        await pilot.pause()
+        assert not isinstance(app.screen, DropdownScreen)
+        assert not app.query_one("#charts").display  # the action ran
+
+        # Escape closes without running anything.
+        await pilot.click("#menu-title-3")
+        await pilot.pause()
+        assert isinstance(app.screen, DropdownScreen)
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, DropdownScreen)
+        assert not app.query_one("#charts").display  # still as it was
+
+
+async def test_menu_bar_opens_from_the_keyboard() -> None:
+    """`M` is the mouse-free path into the bar: it opens the first category,
+    from which `←`/`→` reach every other one; pressing it again closes."""
+    app = _app()
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("M")
+        await pilot.pause()
+        assert isinstance(app.screen, DropdownScreen)
+        assert app.screen._category.title == "App"
+
+        await pilot.press("right")
+        await pilot.pause()
+        assert isinstance(app.screen, DropdownScreen)
+        assert app.screen._category.title == "Runs"
+
+        await pilot.press("M")
+        await pilot.pause()
+        assert not isinstance(app.screen, DropdownScreen)
+
+
+async def test_menu_bar_arrows_slide_between_categories() -> None:
+    """`←`/`→` inside a drop-down move to the neighbouring category, wrapping
+    at the ends — the way menu bars behave everywhere else."""
+    app = _app()
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.click("#menu-title-0")
+        await pilot.pause()
+        assert isinstance(app.screen, DropdownScreen)
+        assert app.screen._category.title == "App"
+
+        await pilot.press("right")
+        await pilot.pause()
+        assert isinstance(app.screen, DropdownScreen)
+        assert app.screen._category.title == "Runs"
+
+        await pilot.press("left")
+        await pilot.pause()
+        assert app.screen._category.title == "App"
+
+        await pilot.press("left")  # wraps to the last category
+        await pilot.pause()
+        assert app.screen._category.title == "View"
+
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, DropdownScreen)
 
 
 async def test_dag_view_detail_labels_the_dags_state() -> None:
@@ -4720,7 +4970,9 @@ async def test_summary_states_the_true_total_when_a_list_is_partial() -> None:
     async with app.run_test(size=(160, 40)) as pilot:
         await app.workers.wait_for_complete()
         await pilot.pause()
-        summary = _plain(app.query_one("#summary", Static))
+        # Normalized: the three-tab bar wraps at the render width, and a line
+        # break must not read as a missing notice.
+        summary = " ".join(_plain(app.query_one("#summary", Static)).split())
         assert "2 of 533,618 runs" in summary
         assert "DAG list truncated" in summary
 
@@ -5040,7 +5292,7 @@ async def test_the_heartbeat_does_not_re_render_the_log_pane(monkeypatch) -> Non
 
 
 async def test_footer_points_to_the_menu_and_keeps_the_filter_state() -> None:
-    """The footer no longer enumerates keys — the `o` menu does. What it keeps
+    """The footer no longer enumerates keys — the menu bar does. What it keeps
     is the stateful part: an active filter, which would otherwise make a
     narrowed list indistinguishable from a short one."""
     app = _app()
@@ -5048,13 +5300,13 @@ async def test_footer_points_to_the_menu_and_keeps_the_filter_state() -> None:
         await app.workers.wait_for_complete()
         await pilot.pause()
         status = _plain(app.query_one("#status", Static))
-        assert "o menu" in status and "q quit" in status
+        assert "M menu" in status and "q quit" in status
 
         await pilot.press("enter")  # the per-level key lists are gone
         await app.workers.wait_for_complete()
         await pilot.pause()
         status = _plain(app.query_one("#status", Static))
-        assert "o menu" in status
+        assert "M menu" in status
         assert "c clear" not in status and "m mark" not in status
 
         await pilot.press("escape")
@@ -5063,53 +5315,4 @@ async def test_footer_points_to_the_menu_and_keeps_the_filter_state() -> None:
         await pilot.pause()
         status = _plain(app.query_one("#status", Static))
         assert "/beta" in status and "(1/2)" in status  # the filter survives
-        assert "o menu" in status
-
-
-async def test_menu_lists_actions_and_runs_the_chosen_one() -> None:
-    app = _app()
-    async with app.run_test(size=(150, 40)) as pilot:
-        await app.workers.wait_for_complete()
-        await pilot.pause()
-        await pilot.press("o")
-        await pilot.pause()
-        assert isinstance(app.screen, MenuScreen)
-
-        # Walk to the charts toggle and select it: the menu runs the same
-        # action the direct key would, then closes.
-        entries = ui.menu_entries("runs", "runs", chart_shown=True)
-        for _ in range([entry.action for entry in entries].index("toggle_chart")):
-            await pilot.press("down")
-        await pilot.press("enter")
-        await pilot.pause()
-        assert not isinstance(app.screen, MenuScreen)
-        assert not app.query_one("#charts").display  # the action ran
-
-        # Escape closes without running anything.
-        await pilot.press("o")
-        await pilot.pause()
-        assert isinstance(app.screen, MenuScreen)
-        await pilot.press("escape")
-        await pilot.pause()
-        assert not isinstance(app.screen, MenuScreen)
-        assert not app.query_one("#charts").display  # still as it was
-
-
-async def test_menu_follows_the_drill_level() -> None:
-    """Inside a run the menu offers the task actions, not the run ones —
-    the same narrowing the footer hint used to do."""
-    app = _app()
-    async with app.run_test(size=(150, 40)) as pilot:
-        await app.workers.wait_for_complete()
-        await pilot.pause()
-        await pilot.press("enter")  # drill into the failed run
-        await app.workers.wait_for_complete()
-        await pilot.pause()
-        await pilot.press("o")
-        await pilot.pause()
-        assert isinstance(app.screen, MenuScreen)
-        labels = [entry.label for entry in app.screen._entries]
-        assert any("Clear" in label for label in labels)
-        assert not any("Trigger" in label for label in labels)
-        await pilot.press("escape")
-        await pilot.pause()
+        assert "M menu" in status

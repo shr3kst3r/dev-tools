@@ -147,7 +147,9 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--view",
-        choices=ui.VIEWS,
+        # The Watched view is deliberately absent: the watch list is session
+        # state inside the live app, so a one-shot snapshot has nothing to show.
+        choices=[view for view in ui.VIEWS if view != "watched"],
         default=ui.VIEWS[0],
         help=(
             "Which list `--once` prints: recent DAG runs, or every DAG "

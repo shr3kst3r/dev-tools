@@ -17,14 +17,21 @@ chart strip — an in-flight chart counting how many runs (or, drilled in, task
 instances) were running at once, stacked on top of an activity chart of the
 same rows bucketed over time and coloured by state — which `g` shows or
 hides. All of those and the selected deployment persist in a state file (see
-layout.py) when the app is given a `layout_path`. `o` opens the actions menu —
-every key that applies right now, in one list, since the footer stopped trying
-to name them all. `?` floats a keybinding reference, `l` a live activity log of
-every poll and every action, `e` the DAG import errors, and `D` a deployment
-switcher. Stale DAGs are hidden from the DAGs view by default (`s` shows them);
-the summary bar always counts them. `R` narrows both top-level views to what is
-running right now — runs in state "running", DAGs with a run in flight — and
-the summary bar says so while it is on.
+layout.py) when the app is given a `layout_path`. A menu bar sits above the
+summary line: click a category title (App, Runs, Tasks, View) — or press `M` —
+and its drop-down lists every command in that group with its direct key,
+`←`/`→` sliding between categories. It is the one menu, and the complete map:
+the footer stopped trying to name every key long ago. `?` floats a keybinding
+reference, `l` a live activity log of every poll and every action, `e` the DAG
+import errors, and `D` a deployment switcher. Stale DAGs are hidden from the DAGs view by default
+(`s` shows them); the summary bar always counts them. `R` narrows both
+top-level views to what is running right now — runs in state "running", DAGs
+with a run in flight — and the summary bar says so while it is on. `w` marks
+the selected run as watched (a yellow ★ in the runs list); the third view in
+the `v` cycle shows only watched runs, and `W` clears the list. The watch list
+is session state, like `s` and `R` — deliberately not persisted, and dropped
+on a deployment switch because run keys only mean anything within one
+deployment.
 
 Polling is resilient in the same way my-prs is: errors show as concise
 one-liners (never a raw command dump), the last good run list stays on screen
@@ -46,8 +53,9 @@ from typing import Callable, cast
 
 from textual import events
 from textual.app import App, ComposeResult, SuspendNotSupported
-from textual.containers import Container, VerticalScroll
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
+from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, OptionList, Static
 from textual.widgets.option_list import Option
@@ -249,23 +257,58 @@ class DeploymentScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
-class MenuScreen(ModalScreen[str | None]):
-    """The `o` overlay: every action available right now, one per row.
+class MenuTitle(Static):
+    """One clickable category title in the menu bar.
 
-    The footer used to advertise every keybinding and ran out of room; it now
-    points here instead. Selecting a row dismisses with the action's name and
-    the app runs it — the menu itself changes nothing, so it can be closed and
-    reopened without consequence.
+    Posts `Clicked` rather than opening anything itself: which drop-down to
+    show, and where, is the app's decision — the title only knows its index.
     """
 
-    BINDINGS = [("escape,q,o", "dismiss_menu", "Close")]
+    class Clicked(Message):
+        def __init__(self, index: int) -> None:
+            self.index = index
+            super().__init__()
+
+    def __init__(self, title: str, *, index: int, id: str | None = None) -> None:
+        super().__init__(title, id=id)
+        self._index = index
+
+    def on_click(self) -> None:
+        self.post_message(self.Clicked(self._index))
+
+
+class DropdownScreen(ModalScreen[str | None]):
+    """One menu-bar drop-down: a category's commands, floated under its title.
+
+    Dismisses with the chosen action's name (None when cancelled) and the app
+    runs it — the drop-down itself changes nothing, so it can be closed and
+    reopened without consequence. `←`/`→` dismiss with a navigation sentinel
+    instead, so the app can slide to the neighbouring category the way menu
+    bars work everywhere else. Clicking anywhere outside the list closes it,
+    which is what makes the bar feel like a bar rather than a modal.
+    """
+
+    # Dismissal sentinels for `←`/`→`. Colons keep them from ever colliding
+    # with an action name — Textual action names cannot contain one.
+    PREV = "menu:prev"
+    NEXT = "menu:next"
+
+    # `M` is bound here as well as on the app: an open modal's focused list
+    # consumes the key before app-level bindings see it, and `M` closing what
+    # `M` opened is the behavior a toggle key owes.
+    BINDINGS = [
+        ("escape,q,M", "dismiss_dropdown", "Close"),
+        ("left", "neighbour(-1)", "Previous category"),
+        ("right", "neighbour(1)", "Next category"),
+    ]
 
     CSS = """
-    MenuScreen {
-        align: center middle;
+    DropdownScreen {
+        align: left top;
     }
-    MenuScreen #menu {
-        width: 56;
+    DropdownScreen #dropdown {
+        width: auto;
+        max-width: 60;
         height: auto;
         max-height: 80%;
         border: round $accent;
@@ -273,26 +316,29 @@ class MenuScreen(ModalScreen[str | None]):
     }
     """
 
-    def __init__(self, entries: tuple[ui.MenuEntry, ...]) -> None:
+    def __init__(self, category: ui.MenuCategory, anchor_x: int) -> None:
         super().__init__()
-        self._entries = entries
+        self._category = category
+        # The x column of the category's title in the bar, so the drop-down
+        # opens under the title that was clicked rather than in a corner.
+        self._anchor_x = anchor_x
 
     def compose(self) -> ComposeResult:
         menu = OptionList(
             *(
                 Option(ui.menu_option(entry), id=entry.action)
-                for entry in self._entries
+                for entry in self._category.entries
             ),
-            id="menu",
+            id="dropdown",
         )
-        menu.border_title = "Menu"
-        menu.border_subtitle = "enter selects · esc closes"
+        menu.border_title = self._category.title
+        menu.border_subtitle = "← → categories · esc closes"
         yield menu
 
     def on_mount(self) -> None:
-        # Arrow keys need the list focused, and a menu with nothing highlighted
-        # reads as broken — land on the first action.
         menu = self.query_one(OptionList)
+        # Sit one row down (below the bar itself), under the clicked title.
+        menu.styles.margin = (1, 0, 0, self._anchor_x)
         menu.focus()
         menu.highlighted = 0
 
@@ -301,8 +347,17 @@ class MenuScreen(ModalScreen[str | None]):
     ) -> None:
         self.dismiss(event.option.id)
 
-    def action_dismiss_menu(self) -> None:
+    def on_click(self, event: events.Click) -> None:
+        if not self.query_one(OptionList).region.contains(
+            event.screen_x, event.screen_y
+        ):
+            self.dismiss(None)
+
+    def action_dismiss_dropdown(self) -> None:
         self.dismiss(None)
+
+    def action_neighbour(self, delta: int) -> None:
+        self.dismiss(self.PREV if delta < 0 else self.NEXT)
 
 
 class ConfirmScreen(ModalScreen[bool]):
@@ -358,7 +413,9 @@ class AirflowWatchApp(App[None]):
         ("e", "show_import_errors", "Import errors"),
         ("s", "toggle_stale", "Show/hide stale DAGs"),
         ("R", "toggle_running", "Only running"),
-        ("o", "open_menu", "Actions menu"),
+        ("w", "toggle_watch", "Watch/unwatch run"),
+        ("W", "clear_watched", "Clear watched runs"),
+        ("M", "open_menu_bar", "Menu bar"),
         ("p", "toggle_pause", "Pause/unpause DAG"),
         ("t", "trigger_run", "Trigger run"),
         ("c", "clear_tasks", "Clear task"),
@@ -373,8 +430,26 @@ class AirflowWatchApp(App[None]):
     ]
 
     CSS = """
-    #summary {
+    /* The menu bar and the summary line share one docked header: two widgets
+       docked to the same edge overlap rather than stack, so the container is
+       what owns the dock and the rows sit inside it. */
+    #header {
         dock: top;
+        height: 2;
+    }
+    #menubar {
+        height: 1;
+        background: $boost;
+    }
+    #menubar MenuTitle {
+        width: auto;
+        padding: 0 2;
+    }
+    #menubar MenuTitle:hover {
+        background: $accent 50%;
+        text-style: bold;
+    }
+    #summary {
         height: 1;
         padding: 0 1;
     }
@@ -489,6 +564,10 @@ class AirflowWatchApp(App[None]):
         # flight" is a question about the deployment, not about one list.
         # Not persisted for the same reason `_show_stale` is not.
         self._only_running = False
+        # The run keys `w` has marked as watched; the Watched view shows only
+        # these. Session state like `_show_stale`, and dropped on a deployment
+        # switch — a run key only means anything within one deployment.
+        self._watched: set[str] = set()
         # How many runs the poll should fetch, once scrolling has grown it past
         # the caller's --limit. None until then, so the caller's default rules;
         # never shrunk within a deployment, so a refresh cannot cut a list the
@@ -583,13 +662,23 @@ class AirflowWatchApp(App[None]):
         return self._queries[target or self._filter_target]
 
     def visible_runs(self) -> tuple[DagRun, ...]:
-        query = self._queries["runs"]
+        """The run rows the current run-shaped view shows: the `/` filter, the
+        `R` narrowing, and — in the Watched view — only the runs `w` marked."""
+        watched_only = self._view == "watched"
+        query = self._queries["watched" if watched_only else "runs"]
         return tuple(
             run
             for run in self._runs
-            if (not self._only_running or run.state == "running")
+            if (not watched_only or run.key in self._watched)
+            and (not self._only_running or run.state == "running")
             and matches(query, run.search_text)
         )
+
+    def _watched_in_window(self) -> tuple[DagRun, ...]:
+        """The watched runs the loaded run window still holds. Anything watched
+        but absent here has aged out of the poll's window — the summary bar
+        counts those out loud, because the Watched view cannot show them."""
+        return tuple(run for run in self._runs if run.key in self._watched)
 
     def visible_dags(self) -> tuple[Dag, ...]:
         """The DAG rows the list shows: the `/` filter, and — unless `s` has
@@ -633,7 +722,16 @@ class AirflowWatchApp(App[None]):
         return self._queries["dags"]
 
     def compose(self) -> ComposeResult:
-        yield Static(id="summary")
+        # The menu bar: one clickable title per category, above the summary
+        # line. The titles are fixed; the drop-down's entries are built at open
+        # time so toggle labels reflect the state they would change.
+        with Vertical(id="header"):
+            with Horizontal(id="menubar"):
+                for index, category in enumerate(ui.menu_categories()):
+                    yield MenuTitle(
+                        category.title, index=index, id=f"menu-title-{index}"
+                    )
+            yield Static(id="summary")
         with Container(id="body"):
             yield DataTable(id="list")
             with Container(id="detail-pane"):
@@ -827,8 +925,11 @@ class AirflowWatchApp(App[None]):
     def _selected_run(self) -> DagRun | None:
         if self._showing_tasks and self._drill.run is not None:
             return self._drill.run
+        # Each run-shaped view keeps its own cursor; outside one (the DAGs
+        # view), the runs list's last selection is the run actions target.
+        view = self._view if self._view in ui.RUN_VIEWS else "runs"
         for run in self._runs:
-            if run.key == self._selected["runs"]:
+            if run.key == self._selected[view]:
                 return run
         return None
 
@@ -895,7 +996,10 @@ class AirflowWatchApp(App[None]):
         else:
             runs = self.visible_runs()
             for run in runs:
-                table.add_row(*ui.list_row(run, now), key=run.key)
+                table.add_row(
+                    *ui.list_row(run, now, watched=run.key in self._watched),
+                    key=run.key,
+                )
             self._selected_key = self._reseat(
                 table, [run.key for run in runs], self._selected_key
             )
@@ -1273,6 +1377,9 @@ class AirflowWatchApp(App[None]):
         self._selected_key = None
         self._task_key = None
         self._drill = Drill()
+        # Watched keys name runs of the old deployment; against the new one
+        # they could only ever be stale or, worse, collide.
+        self._watched.clear()
         # A run window grown by scrolling was earned against the old
         # deployment's history; the new one starts back at the default.
         self._wanted_runs = None
@@ -1535,28 +1642,83 @@ class AirflowWatchApp(App[None]):
         self._rebuild_table()
         self._refresh_view()
 
-    # --- the actions menu ----------------------------------------------------
+    def action_toggle_watch(self) -> None:
+        """`w`: mark or unmark the selected run as watched.
 
-    def action_open_menu(self) -> None:
-        if isinstance(self.screen, MenuScreen):
-            self.screen.dismiss(None)
+        Works wherever a run is on screen — the runs list, the Watched view,
+        or inside a drill-down — because "keep an eye on this one" is a thought
+        you have while looking at a run, not while standing in a particular
+        view. Local state only: nothing is sent to Airflow, so no confirmation.
+        """
+        if self._view == "dags" and not self._showing_tasks:
+            return  # the DAGs list has no run on screen to mark
+        run = self._selected_run()
+        if run is None:
             return
-        entries = ui.menu_entries(
-            self._view,
-            self._drill.level,
+        if run.key in self._watched:
+            self._watched.discard(run.key)
+            self._append_log("info", f"Unwatched {run.dag_id} · {run.run_id}.")
+        else:
+            self._watched.add(run.key)
+            self._append_log("info", f"Watching {run.dag_id} · {run.run_id}.")
+        self._rebuild_table()
+        self._refresh_view()
+
+    def action_clear_watched(self) -> None:
+        """`W`: drop every watched run at once.
+
+        No confirmation modal on purpose — the gate exists for Airflow
+        mutations, and this is a local list that one `w` per run rebuilds. The
+        activity log records the count, so an accidental `W` at least says
+        what it cost.
+        """
+        if not self._watched:
+            return
+        count = len(self._watched)
+        self._watched.clear()
+        self._append_log(
+            "info", f"Cleared {count} watched run{'s' if count != 1 else ''}."
+        )
+        self._rebuild_table()
+        self._refresh_view()
+
+    # --- the menu bar ---------------------------------------------------------
+
+    def on_menu_title_clicked(self, message: MenuTitle.Clicked) -> None:
+        self._open_dropdown(message.index)
+
+    def action_open_menu_bar(self) -> None:
+        """`M`: the keyboard path into the menu bar — opens the first category's
+        drop-down, from which `←`/`→` reach every other one. (While one is
+        open, the screen's own `M` binding closes it.)"""
+        if not isinstance(self.screen, DropdownScreen):
+            self._open_dropdown(0)
+
+    def _open_dropdown(self, index: int) -> None:
+        """Float the given category's drop-down under its title in the bar."""
+        categories = ui.menu_categories(
             chart_shown=self._chart_shown,
             stale_shown=self._show_stale,
             running_only=self._only_running,
         )
-        self.push_screen(MenuScreen(entries), self._on_menu_picked)
+        index %= len(categories)
+        anchor = self.query_one(f"#menu-title-{index}", MenuTitle).region.x
+        self.push_screen(
+            DropdownScreen(categories[index], anchor),
+            lambda result: self._on_dropdown_picked(index, result),
+        )
 
-    def _on_menu_picked(self, action: str | None) -> None:
-        if action is None:
+    def _on_dropdown_picked(self, index: int, result: str | None) -> None:
+        if result is None:
             return
-        # Deferred one message: run_action may push a screen (help, confirm),
-        # and pushing from inside the dismiss callback of the screen being
-        # popped is exactly the re-entrancy Textual dislikes.
-        self.call_later(self.run_action, action)
+        # `call_later` for the same re-entrancy reason as `_on_menu_picked`:
+        # both branches push a screen from inside a dismiss callback.
+        if result == DropdownScreen.PREV:
+            self.call_later(self._open_dropdown, index - 1)
+        elif result == DropdownScreen.NEXT:
+            self.call_later(self._open_dropdown, index + 1)
+        else:
+            self.call_later(self.run_action, result)
 
     def action_grow_list(self) -> None:
         self._resize_split(+SPLIT_STEP)
@@ -1645,6 +1807,8 @@ class AirflowWatchApp(App[None]):
                 shown=self._shown_count(),
                 stale_hidden=not self._show_stale,
                 running_only=self._only_running,
+                watched_runs=self._watched_in_window(),
+                watched_total=len(self._watched),
             )
         )
         now = datetime.now(timezone.utc)
@@ -1701,13 +1865,13 @@ class AirflowWatchApp(App[None]):
 
     def _hint(self) -> str:
         """The footer's key hint. It once tried to advertise every key for the
-        current level and ran out of room; the `o` menu now carries that list,
+        current level and ran out of room; the menu bar now carries that list,
         so the footer keeps only what is stateful — an active filter, which
         would otherwise make a narrowed list indistinguishable from a short
         one — plus the three constants."""
         active = self._queries[self._filter_target]
         prefix = f"/{active} ({self._filter_count()}) esc clears · " if active else ""
-        return prefix + "o menu · ? help · q quit"
+        return prefix + "M menu · ? help · q quit"
 
     def _filter_count(self) -> str:
         """"12/240" — matches over the rows the filter searched."""
@@ -1722,4 +1886,6 @@ class AirflowWatchApp(App[None]):
         if target == "dags":
             dags = self._snapshot.dags if self._snapshot is not None else ()
             return f"{len(self.visible_dags())}/{len(dags)}"
+        if target == "watched":
+            return f"{len(self.visible_runs())}/{len(self._watched_in_window())}"
         return f"{len(self.visible_runs())}/{len(self._runs)}"

@@ -79,9 +79,16 @@ _DAG_COLUMNS = ("", "DAG", "Running", "Schedule", "Owners", "Tags", "Next run")
 _DAG_ID_WIDTH = 34
 _RUN_ID_WIDTH = 26
 
-# The views the master list can show, in the order `v` cycles through.
-VIEWS = ("runs", "dags")
-VIEW_LABELS = {"runs": "DAG runs", "dags": "DAGs"}
+# The views the master list can show, in the order `v` cycles through. The
+# Watched view is the runs list narrowed to the runs `w` has marked — same
+# columns, same drill-down, its own cursor and filter.
+VIEWS = ("runs", "dags", "watched")
+VIEW_LABELS = {"runs": "DAG runs", "dags": "DAGs", "watched": "Watched"}
+
+# The views whose rows are DAG runs. Everything that renders or selects a run
+# asks this rather than testing for "runs", so the Watched view inherits the
+# whole run machinery instead of re-implementing it.
+RUN_VIEWS = ("runs", "watched")
 
 
 def state_style(value: str) -> tuple[str, str]:
@@ -124,19 +131,28 @@ def list_columns() -> tuple[str, ...]:
     return _LIST_COLUMNS
 
 
-def attention_cell(run: DagRun) -> Text:
-    """Red dot: failed. Cyan dot: in flight. Blank: settled and fine."""
+def attention_cell(run: DagRun, watched: bool = False) -> Text:
+    """Red dot: failed. Cyan dot: in flight. Blank: settled and fine.
+
+    A watched run additionally carries a star, whatever its state — the mark
+    has to survive the run settling, or a watched run that finished would look
+    like one that was never marked.
+    """
     if run.state == "failed":
-        return Text("●", style="bold red")
-    if run.state in ("running", "queued"):
-        return Text("●", style="bold cyan")
-    return Text(" ")
+        cell = Text("●", style="bold red")
+    elif run.state in ("running", "queued"):
+        cell = Text("●", style="bold cyan")
+    else:
+        cell = Text(" ")
+    if watched:
+        cell.append("★", style="bold yellow")
+    return cell
 
 
-def list_row(run: DagRun, now: datetime) -> tuple[Text, ...]:
+def list_row(run: DagRun, now: datetime, watched: bool = False) -> tuple[Text, ...]:
     """The cells for one run row, in `list_columns()` order."""
     return (
-        attention_cell(run),
+        attention_cell(run, watched),
         Text(_elide(run.dag_id, _DAG_ID_WIDTH), style="cyan"),
         Text(_elide(run.run_id, _RUN_ID_WIDTH), style="dim"),
         Text(run.run_type or "—"),
@@ -319,6 +335,8 @@ def render_summary(
     shown: int | None = None,
     stale_hidden: bool = False,
     running_only: bool = False,
+    watched_runs: tuple[DagRun, ...] = (),
+    watched_total: int = 0,
 ) -> Text:
     """The one-line status bar docked at the top: which view, which deployment,
     what state its rows are in, and whether any DAG file is failing to parse.
@@ -329,6 +347,11 @@ def render_summary(
     silently absent is exactly the failure mode this bar exists to prevent.
     `running_only` marks the `R` narrowing for the same reason: a list showing
     only what is in flight must never read as a deployment with nothing else.
+
+    `watched_runs` are the watched runs currently inside the loaded run window
+    and `watched_total` is the whole watch list — the gap between them is a
+    watched run the poll no longer holds, which the Watched view cannot show
+    and therefore must count out loud.
     """
     bar = view_tabs(view)
     if snapshot is not None:
@@ -363,6 +386,26 @@ def render_summary(
         if stale_hidden and snapshot.stale_count:
             stale += " hidden · s shows"
         bar.append(stale, style="yellow" if snapshot.stale_count else "dim")
+    elif view == "watched":
+        failed = sum(1 for run in watched_runs if run.state == "failed")
+        running = sum(1 for run in watched_runs if run.state == "running")
+        bar.append_text(
+            shown_of(
+                len(watched_runs) if shown is None else shown,
+                watched_total,
+                "watched",
+            )
+        )
+        bar.append("   ")
+        bar.append(f"✖ {failed} failed", style="bold red" if failed else "dim")
+        bar.append("   ")
+        bar.append(f"● {running} running", style="bold cyan" if running else "dim")
+        outside = watched_total - len(watched_runs)
+        if outside > 0:
+            # Watched but no longer inside the loaded run window — the one way
+            # a row can be absent from this view without being unwatched.
+            bar.append("   ")
+            bar.append(f"⋯ {outside} outside the loaded runs", style="bold yellow")
     else:
         runs = snapshot.runs
         failed = sum(1 for run in runs if run.state == "failed")
@@ -643,20 +686,29 @@ def render_detail_placeholder(
     loading: bool = False,
     view: str = "runs",
     shown: int | None = None,
+    query: str = "",
 ) -> RenderableType:
     """What the detail pane shows when there is no selected row to render.
 
     `shown` is how many rows survived the `/` filter. It matters: a list emptied
     by a filter and a deployment with nothing in it look identical from here
     otherwise, and telling the user "nothing matches" is the useful message.
+    `query` disambiguates the same two cases in the Watched view, where an
+    empty unfiltered list means "nothing marked yet" and deserves to say how
+    to mark something.
     """
-    noun = "DAGs" if view == "dags" else "DAG runs"
+    noun = "watched runs" if view == "watched" else ("DAGs" if view == "dags" else "DAG runs")
     loaded = () if snapshot is None else (snapshot.dags if view == "dags" else snapshot.runs)
     rows: tuple[object, ...] | range = loaded if shown is None else range(shown)
     if loading:
         message = Text("Contacting Astro…", style="dim italic")
     elif error is not None:
         message = Text(error, style="red")
+    elif not rows and view == "watched" and not query.strip():
+        message = Text(
+            "Nothing watched — w on a run marks it, W clears the list.",
+            style="dim",
+        )
     elif not rows:
         message = Text(f"No {noun} match the current filter.", style="dim")
     else:
@@ -762,6 +814,7 @@ def render_detail(
             loading=snapshot is None and error is None,
             view=view,
             shown=shown,
+            query=query,
         )
     known = snapshot.dag(run.dag_id) if snapshot is not None else None
     return render_run(run, known, now)
@@ -1181,100 +1234,17 @@ def render_confirm(action: Action) -> RenderableType:
     )
 
 
-# --- the actions menu --------------------------------------------------------
+# --- the menu bar ------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class MenuEntry:
-    """One row of the `o` menu: the direct key, what it does, and the app
-    action (`action_<name>`) that selecting it runs."""
+    """One command row in a menu drop-down: the direct key, what it does, and
+    the app action (`action_<name>`) that selecting it runs."""
 
     key: str
     label: str
     action: str
-
-
-def menu_entries(
-    view: str,
-    level: str,
-    *,
-    chart_shown: bool = True,
-    stale_shown: bool = False,
-    running_only: bool = False,
-) -> tuple[MenuEntry, ...]:
-    """The actions available right now, for the `o` menu.
-
-    The footer used to advertise every key and ran out of room; the menu
-    replaces it. Context-narrowed the way that footer hint was — keys that do
-    nothing at this level are not offered — and every entry still names its
-    direct key, so the menu keeps teaching the shortcuts it replaced.
-    """
-    entries: list[MenuEntry] = []
-    if level == "log":
-        entries += [
-            MenuEntry("/", "Search the log", "start_filter"),
-            MenuEntry("<", "Previous log attempt", "prev_try"),
-            MenuEntry(">", "Next log attempt", "next_try"),
-            MenuEntry("i", "Hand this run to gw for a summary", "investigate"),
-            MenuEntry("esc", "Back to the task instances", "escape"),
-        ]
-    elif level == "tasks":
-        entries += [
-            MenuEntry("enter", "Open the selected task's log", "drill_in"),
-            MenuEntry("/", "Filter the task instances", "start_filter"),
-            MenuEntry("c", "Clear (retry) the selected task", "clear_tasks"),
-            MenuEntry("m", "Mark the selected task success / failed", "mark_tasks"),
-            MenuEntry("i", "Hand this run to gw for a summary", "investigate"),
-            MenuEntry("esc", "Back to the runs list", "escape"),
-        ]
-    elif view == "dags":
-        entries += [
-            MenuEntry("enter", "Show the selected DAG's runs", "drill_in"),
-            MenuEntry("v", "Switch view: DAGs → DAG runs", "switch_view"),
-            MenuEntry("/", "Filter the DAG list", "start_filter"),
-            MenuEntry(
-                "s",
-                "Hide stale DAGs" if stale_shown else "Show stale DAGs",
-                "toggle_stale",
-            ),
-            MenuEntry(
-                "R",
-                "Show all DAGs" if running_only else "Show only running DAGs",
-                "toggle_running",
-            ),
-            MenuEntry("p", "Pause / unpause the selected DAG", "toggle_pause"),
-            MenuEntry("t", "Trigger a run of the selected DAG", "trigger_run"),
-            MenuEntry("e", "Show DAG import errors", "show_import_errors"),
-        ]
-    else:
-        entries += [
-            MenuEntry("enter", "Drill into the selected run's tasks", "drill_in"),
-            MenuEntry("v", "Switch view: DAG runs → DAGs", "switch_view"),
-            MenuEntry("/", "Filter the runs list", "start_filter"),
-            MenuEntry(
-                "R",
-                "Show all runs" if running_only else "Show only running runs",
-                "toggle_running",
-            ),
-            MenuEntry("p", "Pause / unpause the selected DAG", "toggle_pause"),
-            MenuEntry("t", "Trigger a run of the selected DAG", "trigger_run"),
-            MenuEntry("i", "Hand the selected run to gw for a summary", "investigate"),
-            MenuEntry("e", "Show DAG import errors", "show_import_errors"),
-        ]
-    entries += [
-        MenuEntry("r", "Refresh now", "poll_now"),
-        MenuEntry("D", "Switch deployment", "switch_deployment"),
-        MenuEntry("d", "Move / hide the detail pane", "cycle_detail"),
-        MenuEntry(
-            "g",
-            "Hide the charts" if chart_shown else "Show the charts",
-            "toggle_chart",
-        ),
-        MenuEntry("l", "Activity log", "toggle_log"),
-        MenuEntry("?", "Help", "help"),
-        MenuEntry("q", "Quit", "quit"),
-    ]
-    return tuple(entries)
 
 
 def menu_option(entry: MenuEntry) -> Text:
@@ -1284,6 +1254,94 @@ def menu_option(entry: MenuEntry) -> Text:
     text.append("  ")
     text.append(entry.label)
     return text
+
+
+@dataclass(frozen=True)
+class MenuCategory:
+    """One drop-down of the menu bar: a title and the commands under it."""
+
+    title: str
+    entries: tuple[MenuEntry, ...]
+
+
+def menu_categories(
+    *,
+    chart_shown: bool = True,
+    stale_shown: bool = False,
+    running_only: bool = False,
+) -> tuple[MenuCategory, ...]:
+    """Every command, organized for the menu bar's drop-downs.
+
+    The bar is the complete map: every command appears, grouped by what it
+    acts on, so it is also where a new user discovers what exists — the footer
+    once tried to advertise every key and ran out of room. Selecting a command
+    that does not apply right now is the same no-op its key would be; the
+    toggles still label themselves by state so the menu never points the wrong
+    direction, and every entry names its direct key so the menu keeps teaching
+    the shortcuts.
+    """
+    return (
+        MenuCategory(
+            "App",
+            (
+                MenuEntry("r", "Refresh now", "poll_now"),
+                MenuEntry("D", "Switch deployment", "switch_deployment"),
+                MenuEntry("l", "Activity log", "toggle_log"),
+                MenuEntry("e", "DAG import errors", "show_import_errors"),
+                MenuEntry("?", "Help", "help"),
+                MenuEntry("q", "Quit", "quit"),
+            ),
+        ),
+        MenuCategory(
+            "Runs",
+            (
+                MenuEntry("enter", "Drill into the selected run's tasks", "drill_in"),
+                MenuEntry("w", "Watch / unwatch the selected run", "toggle_watch"),
+                MenuEntry("W", "Clear the watched runs", "clear_watched"),
+                MenuEntry("t", "Trigger a run of the selected DAG", "trigger_run"),
+                MenuEntry("p", "Pause / unpause the selected DAG", "toggle_pause"),
+                MenuEntry("i", "Hand the selected run to gw for a summary", "investigate"),
+            ),
+        ),
+        MenuCategory(
+            "Tasks",
+            (
+                MenuEntry("enter", "Open the selected task's log", "drill_in"),
+                MenuEntry("c", "Clear (retry) the selected task", "clear_tasks"),
+                MenuEntry("m", "Mark the selected task success / failed", "mark_tasks"),
+                MenuEntry("<", "Previous log attempt", "prev_try"),
+                MenuEntry(">", "Next log attempt", "next_try"),
+                MenuEntry("esc", "Back out one level", "escape"),
+            ),
+        ),
+        MenuCategory(
+            "View",
+            (
+                MenuEntry("v", "Switch view: DAG runs → DAGs → Watched", "switch_view"),
+                MenuEntry("/", "Filter the list on screen", "start_filter"),
+                MenuEntry(
+                    "R",
+                    "Show all runs and DAGs"
+                    if running_only
+                    else "Show only what is running",
+                    "toggle_running",
+                ),
+                MenuEntry(
+                    "s",
+                    "Hide stale DAGs" if stale_shown else "Show stale DAGs",
+                    "toggle_stale",
+                ),
+                MenuEntry("d", "Move / hide the detail pane", "cycle_detail"),
+                MenuEntry(
+                    "g",
+                    "Hide the charts" if chart_shown else "Show the charts",
+                    "toggle_chart",
+                ),
+                MenuEntry("[", "Shrink the list window", "shrink_list"),
+                MenuEntry("]", "Grow the list window", "grow_list"),
+            ),
+        ),
+    )
 
 
 # The activity log's per-level glyph and style, keyed by LogEntry.level.
@@ -1331,8 +1389,8 @@ def render_activity_log(entries: list[LogEntry]) -> RenderableType:
 
 HELP_KEYS: tuple[tuple[str, str], ...] = (
     ("↑ / ↓", "Move through the list — the bottom of the runs list loads older runs"),
-    ("o", "Open the actions menu — everything below, narrowed to what applies"),
-    ("v", "Switch view: DAG runs ↔ DAGs"),
+    ("M", "Open the menu bar — every command by category, ← → between them"),
+    ("v", "Switch view: DAG runs → DAGs → Watched"),
     ("/", "Filter the list (or the log) — type to narrow, esc clears"),
     ("enter", "Drill in: run → task instances → log"),
     ("escape", "Back out one level, or clear the filter"),
@@ -1341,6 +1399,8 @@ HELP_KEYS: tuple[tuple[str, str], ...] = (
     ("e", "Show / hide DAG import errors"),
     ("s", "Show / hide stale DAGs (hidden by default)"),
     ("R", "Show only running runs / DAGs (press again for all)"),
+    ("w", "Watch / unwatch the selected run — the Watched view shows them"),
+    ("W", "Clear the watched runs"),
     ("p", "Pause or unpause the selected DAG"),
     ("t", "Trigger a new run of the selected DAG"),
     ("c", "Clear (retry) the selected task instance"),
@@ -1361,7 +1421,9 @@ HELP_NOTE = (
     "hidden by default but always counted in the summary bar, and `s` shows "
     "them. A list that could not be fetched in full says 'N of M'. Every "
     "action that changes Airflow asks first, offers a dry run, and is recorded "
-    "in the activity log. Layout and the selected deployment are restored on "
+    "in the activity log. The menu bar at the top opens with a click or `M` "
+    "and lists every command by category; `w` marks runs to follow in the Watched view "
+    "for this session. Layout and the selected deployment are restored on "
     "the next launch."
 )
 

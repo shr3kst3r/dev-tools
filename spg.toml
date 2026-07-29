@@ -82,6 +82,26 @@ source = "skills/adr-format"
 target = "~/.claude/skills/"
 description = "adr-format skill: ADR format spec + significance bar, preloaded into the adr-rpi subagents"
 
+[links.pr-land]
+source = "skills/pr-land"
+target = "~/.claude/skills/"
+description = "pr-land skill: drive a PR to green — fix checks, adjudicate bot/human review feedback, reply, push"
+
+[links.azdo-pr]
+source = "skills/azdo-pr"
+target = "~/.claude/skills/"
+description = "azdo-pr skill: diagnose and locally fix the PR's Azure DevOps build (delegated to by pr-land)"
+
+[links.pr-notebook]
+source = "skills/pr-notebook"
+target = "~/.claude/skills/"
+description = "pr-notebook skill: run a Databricks notebook against the PR's image, pinned by digest"
+
+[links.azdo-then-notebook]
+source = "skills/azdo-then-notebook"
+target = "~/.claude/skills/"
+description = "azdo-then-notebook skill: gate pr-notebook on a green azdo pipeline; chains azdo-pr → pr-notebook"
+
 [links.adr-implementer]
 source = "agents/adr-implementer.md"
 target = "~/.claude/agents/adr-implementer.md"
@@ -91,3 +111,8 @@ description = "adr-rpi implement phase subagent (Opus) — adr-rpi cannot run it
 source = "agents/adr-reviewer.md"
 target = "~/.claude/agents/adr-reviewer.md"
 description = "adr-rpi review phase subagent (Opus, xhigh effort) — adr-rpi cannot run its review phase without it"
+
+[links.pr-feedback-judge]
+source = "agents/pr-feedback-judge.md"
+target = "~/.claude/agents/pr-feedback-judge.md"
+description = "pr-land's review-feedback adjudicator (Opus, high effort) — verifies each bot/human finding before pr-land changes code"

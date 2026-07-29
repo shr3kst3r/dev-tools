@@ -62,7 +62,10 @@ from tools.airflow_watch.models import (
     TaskInstance,
     TaskLog,
     TaskRow,
+    databricks_run_url,
     filter_log,
+    find_urls,
+    is_databricks_url,
     live_import_error_files,
     matches,
     order_task_instances,
@@ -1682,6 +1685,109 @@ def test_render_filter_prompt_shows_what_is_being_typed() -> None:
     out = _plain_renderable(ui.render_filter_prompt("runs", "syn"))
     assert "/syn" in out
     assert "filtering runs" in out
+
+
+# --- links in a log --------------------------------------------------------
+
+DATABRICKS_RUN = (
+    "https://dbc-1234abcd-5e6f.cloud.databricks.com/?o=42#job/915/run/271828"
+)
+
+
+def test_find_urls_spans_the_url_and_not_the_prose_around_it() -> None:
+    line = f"INFO - View run status at {DATABRICKS_RUN}."
+    (start, end, url) = find_urls(line)[0]
+    assert url == DATABRICKS_RUN  # the sentence's full stop is not part of it
+    assert line[start:end] == url
+
+
+def test_find_urls_keeps_brackets_the_url_owns() -> None:
+    """A closing bracket ends the URL only when its opener is outside it."""
+    (_, _, wrapped) = find_urls("see (https://example.com/a) for more")[0]
+    assert wrapped == "https://example.com/a"
+    (_, _, owned) = find_urls("https://example.com/a_(b) done")[0]
+    assert owned == "https://example.com/a_(b)"
+
+
+def test_find_urls_finds_every_url_on_a_line() -> None:
+    found = find_urls("http://a.test/one and https://b.test/two")
+    assert [url for _, _, url in found] == ["http://a.test/one", "https://b.test/two"]
+    assert find_urls("nothing to click here") == ()
+
+
+def test_is_databricks_url_covers_every_workspace_domain() -> None:
+    assert is_databricks_url(DATABRICKS_RUN)
+    assert is_databricks_url("https://adb-9876.5.azuredatabricks.net/#job/1/run/2")
+    assert is_databricks_url("https://acme.gcp.databricks.com/jobs/1/runs/2")
+    assert not is_databricks_url("https://airflow.example.com/dags/sync_alpha")
+    # The host decides, not the path — a link *about* databricks is not one to it.
+    assert not is_databricks_url("https://example.com/docs/databricks")
+
+
+def test_databricks_run_url_prefers_the_run_page() -> None:
+    """Operators log the workspace several times and the run page once; the run
+    page is the one worth opening."""
+    content = "\n".join(
+        (
+            "INFO - Using workspace https://dbc-1234abcd-5e6f.cloud.databricks.com/",
+            f"INFO - View run status, Spark UI, and logs at {DATABRICKS_RUN}",
+            "INFO - Task exited with return code 0",
+        )
+    )
+    assert databricks_run_url(content) == DATABRICKS_RUN
+
+
+def test_databricks_run_url_falls_back_to_the_workspace_and_gives_up_cleanly() -> None:
+    workspace = "https://dbc-1234abcd-5e6f.cloud.databricks.com/"
+    assert databricks_run_url(f"INFO - hitting {workspace}") == workspace
+    assert databricks_run_url("INFO - no links at all here") is None
+    assert databricks_run_url("INFO - see https://airflow.example.com/home") is None
+
+
+def test_log_line_makes_every_url_clickable() -> None:
+    line = f"INFO - logs at {DATABRICKS_RUN}"
+    rendered = ui.log_line(line, "")
+    assert rendered.plain == line  # the log's own text is left exactly as written
+    styles = [span.style for span in rendered.spans]
+    assert any(getattr(style, "link", None) == DATABRICKS_RUN for style in styles)
+    assert any(
+        f"{ui.LINK_ACTION}({DATABRICKS_RUN!r})"
+        == getattr(style, "meta", {}).get("@click")
+        for style in styles
+    )
+
+
+def test_the_link_action_is_one_the_app_really_has() -> None:
+    """`link_style` names an app action in a string, which nothing type-checks;
+    a rename that missed it would turn every link into a dead click."""
+    namespace, _, action = ui.LINK_ACTION.rpartition(".")
+    assert namespace == "app"
+    assert hasattr(AirflowWatchApp, f"action_{action}")
+
+
+def test_log_line_stacks_a_link_on_top_of_a_search_highlight() -> None:
+    """A `/` filter and a link both style the same line; neither wins."""
+    rendered = ui.log_line(f"INFO - logs at {DATABRICKS_RUN}", "logs")
+    styles = [span.style for span in rendered.spans]
+    assert any(getattr(style, "link", None) == DATABRICKS_RUN for style in styles)
+    assert any(style == "bold black on yellow" for style in styles)
+
+
+def test_render_log_hoists_the_databricks_run() -> None:
+    task = _task("databricks_sync", state="failed", try_number=1, max_tries=1)
+    log = TaskLog(
+        content=f"INFO - start\nINFO - View run status at {DATABRICKS_RUN}\n",
+        try_number=1,
+    )
+    out = _plain_renderable(ui.render_log(task, log))
+    assert "Databricks run" in out
+    assert "o to open" in out
+
+    # Nothing to hoist means no banner — the pane never claims a link it lacks.
+    plain = _plain_renderable(
+        ui.render_log(task, TaskLog(content="INFO - start\n", try_number=1))
+    )
+    assert "Databricks" not in plain
 
 
 # --- ADR constraint: credential redaction ---------------------------------
@@ -3940,6 +4046,102 @@ async def test_app_moving_between_tasks_follows_with_the_log() -> None:
         await pilot.pause()
         assert app._drill.level == "log"
         assert "log of loader" in _plain(app.query_one("#detail", Static))
+
+
+async def test_o_opens_the_databricks_run_the_log_points_at(monkeypatch) -> None:
+    """The link is clickable in the log, but only once you have scrolled to the
+    line carrying it; `o` is the same link without the hunt."""
+    log = TaskLog(
+        content=f"INFO - start\nINFO - View run status at {DATABRICKS_RUN}\n",
+        try_number=1,
+    )
+    app = _app(log=log)
+    opened: list[str] = []
+    monkeypatch.setattr(
+        AirflowWatchApp, "open_url", lambda _self, url, **_kw: opened.append(url)
+    )
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        # Away from a log there is nothing to open, and nothing is fetched to find one.
+        await pilot.press("o")
+        await pilot.pause()
+        assert opened == []
+
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert "Databricks run" in _plain(app.query_one("#detail", Static))
+
+        await pilot.press("o")
+        await pilot.pause()
+        assert opened == [DATABRICKS_RUN]
+        assert DATABRICKS_RUN in app.activity_log[-1].message
+
+
+async def test_clicking_a_link_in_the_log_opens_it(monkeypatch) -> None:
+    """The point of the feature: the link on screen is a link you can click.
+
+    Textual owns the mouse while the app runs, so a URL is clickable only if
+    its span carries the `@click` meta the app dispatches from — this drives a
+    real click through the compositor to prove the whole path is wired.
+    """
+    log = TaskLog(content=f"INFO - View run status at {DATABRICKS_RUN}\n", try_number=1)
+    app = _app(log=log)
+    opened: list[str] = []
+    monkeypatch.setattr(
+        AirflowWatchApp, "open_url", lambda _self, url, **_kw: opened.append(url)
+    )
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        spot = _first_link_cell(app)
+        assert spot is not None, "no clickable cell on screen"
+        await pilot.click(offset=spot)
+        await pilot.pause()
+        assert opened == [DATABRICKS_RUN]
+
+
+def _first_link_cell(app: AirflowWatchApp) -> tuple[int, int] | None:
+    """The first screen cell whose style would open a link when clicked."""
+    for y in range(app.size.height):
+        for x in range(app.size.width):
+            meta = app.screen.get_style_at(x, y).meta
+            if "@click" in meta:
+                return (x, y)
+    return None
+
+
+async def test_o_says_so_when_the_log_names_no_databricks_run(monkeypatch) -> None:
+    app = _app(log=TaskLog(content="INFO - nothing to click\n", try_number=1))
+    opened: list[str] = []
+    monkeypatch.setattr(
+        AirflowWatchApp, "open_url", lambda _self, url, **_kw: opened.append(url)
+    )
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("o")
+        await pilot.pause()
+        assert opened == []
+        assert "Databricks" not in _plain(app.query_one("#detail", Static))
 
 
 async def test_app_drill_error_keeps_the_run_list() -> None:

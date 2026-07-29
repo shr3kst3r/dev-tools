@@ -81,6 +81,7 @@ from .models import (
     TaskInstance,
     TaskLog,
     TaskRow,
+    databricks_run_url,
     live_import_error_files,
     matches,
 )
@@ -422,6 +423,7 @@ class AirflowWatchApp(App[None]):
         ("c", "clear_tasks", "Clear task"),
         ("m", "mark_tasks", "Mark task state"),
         ("i", "investigate", "Summarize run in gw"),
+        ("o", "open_databricks", "Open the Databricks run"),
         ("d", "cycle_detail", "Move/hide detail"),
         ("g", "toggle_chart", "Show/hide chart"),
         ("left_square_bracket", "shrink_list", "Shrink list window"),
@@ -1329,6 +1331,45 @@ class AirflowWatchApp(App[None]):
                 log=log,
             )
         self._refresh_view()
+
+    def action_open_link(self, url: str) -> None:
+        """Open a link that was clicked on screen.
+
+        Every URL the log pane renders carries this action in its style meta
+        (`ui.link_style`), because Textual holds the mouse while the app runs:
+        the terminal's own hyperlink handling is there as well, but only this
+        path fires on an ordinary click.
+        """
+        self.open_url(url)
+        self._append_log("info", f"Opened {url}")
+
+    def action_open_databricks(self) -> None:
+        """`o`: open the Databricks run this task's log points at.
+
+        The link is in the log and clickable there, but only once you have
+        scrolled to the one line that carries it — this is the same link
+        without the hunt. It needs the log, which is what the log pane holds,
+        so from anywhere else it says so rather than fetching one silently.
+        """
+        drill = self._drill
+        if drill.level != "log" or drill.log is None:
+            self.notify(
+                "Open a task's log first (enter) — the Databricks link is in it.",
+                title="databricks",
+                severity="warning",
+            )
+            return
+        url = databricks_run_url(drill.log.content)
+        if url is None:
+            self.notify(
+                "No Databricks link in this log.",
+                title="databricks",
+                severity="warning",
+            )
+            return
+        self.open_url(url)
+        task_id = drill.task.display_id if drill.task is not None else "task"
+        self._append_log("info", f"{task_id}: opened {url}")
 
     def action_prev_try(self) -> None:
         self._step_try(-1)

@@ -14,6 +14,7 @@ airflow-3-joins-the-version-seam ADR that widened it).
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -769,3 +770,89 @@ def filter_log(content: str, query: str) -> tuple[list[tuple[int, str]], int]:
         if matches(query, line)
     ]
     return hits, len(lines)
+
+
+# --- links in a log --------------------------------------------------------
+#
+# An Airflow log is where a task tells you where the real work happened. The
+# Databricks operators are the case that matters here: the run they submit does
+# its work in Databricks, and the only pointer to it is a run-page URL logged
+# once, somewhere in thousands of lines. So URLs are found as spans (the UI
+# turns them into clickable links) and the Databricks run page is singled out.
+
+# A URL runs to the first character that cannot be in one. Quotes, angle
+# brackets and backticks stop it because logs wrap URLs in them.
+_URL_RE = re.compile(r"https?://[^\s<>\"'`]+")
+
+# Punctuation a log tends to put *after* a URL rather than in it. Trimmed from
+# the end so "…logs at https://host/#job/1/run/2." does not link the full stop.
+_URL_TRAILING = ".,;:!?"
+
+# A closing bracket only ends the URL when its opener is not inside it, so
+# "https://host/a_(b)" keeps its parenthesis and "(https://host/a)" does not.
+_URL_BRACKETS = {")": "(", "]": "[", "}": "{"}
+
+
+def _trim_url(url: str) -> str:
+    """`url` without the trailing punctuation the surrounding prose owns."""
+    while url:
+        last = url[-1]
+        if last in _URL_TRAILING:
+            url = url[:-1]
+        elif last in _URL_BRACKETS and url.count(_URL_BRACKETS[last]) < url.count(last):
+            url = url[:-1]
+        else:
+            break
+    return url
+
+
+def find_urls(line: str) -> tuple[tuple[int, int, str], ...]:
+    """Every http(s) URL in `line`, as `(start, end, url)` spans into it.
+
+    Spans rather than strings so the log pane can style the URL in place,
+    leaving the line's text exactly as the log wrote it.
+    """
+    found: list[tuple[int, int, str]] = []
+    for match in _URL_RE.finditer(line):
+        url = _trim_url(match.group())
+        if url:
+            found.append((match.start(), match.start() + len(url), url))
+    return tuple(found)
+
+
+def is_databricks_url(url: str) -> bool:
+    """Whether `url` points at a Databricks workspace.
+
+    Matched on the host containing "databricks", which covers every workspace
+    domain Databricks hands out — `dbc-….cloud.databricks.com`,
+    `adb-….azuredatabricks.net`, `….gcp.databricks.com`. A vanity domain that
+    hides the word is not recognized, and cannot be without guessing.
+    """
+    host = url.split("//", 1)[-1].split("/", 1)[0].split("?", 1)[0]
+    return "databricks" in host.casefold()
+
+
+# What a Databricks *run page* looks like in either of the two shapes the
+# operators log: the legacy fragment (`#job/123/run/456`) and the current path
+# (`/jobs/123/runs/456`).
+_DATABRICKS_RUN_RE = re.compile(r"#job/\d+/run/\d+|/jobs/\d+/runs/\d+")
+
+
+def databricks_run_url(content: str) -> str | None:
+    """The Databricks run page a log points at, or None if it names none.
+
+    A run page is preferred over any other Databricks URL in the log — the
+    operators log the run page once and workspace links (docs, cluster pages)
+    several times — but a workspace URL is still returned when that is all
+    there is, since it at least lands you in the right place.
+    """
+    fallback: str | None = None
+    for line in content.splitlines():
+        for _, _, url in find_urls(line):
+            if not is_databricks_url(url):
+                continue
+            if _DATABRICKS_RUN_RE.search(url):
+                return url
+            if fallback is None:
+                fallback = url
+    return fallback

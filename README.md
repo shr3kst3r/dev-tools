@@ -91,6 +91,9 @@ loop: **see what's failing → drill into the failed task → read its log.**
 - `/` **searches** whatever is on screen — the DAG list, the runs list, the task
   list, or the text of a log — client-side and instantly, with the match count in
   the footer;
+- every **URL a log prints is clickable**, and a **Databricks run page** is
+  hoisted to a line above the log — the operators name it exactly once in
+  thousands of lines — so `o` opens the run in a browser without hunting for it;
 - a **DAG import errors** pane (`e`) and a header indicator, because an
   unparseable DAG file looks exactly like "nothing scheduled";
 - an in-TUI **deployment switcher** (`D`), and an **activity log** (`l`) of every

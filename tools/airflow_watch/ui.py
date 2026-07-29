@@ -21,6 +21,7 @@ from datetime import datetime
 from rich.align import Align
 from rich.console import Console, ConsoleOptions, Group, RenderableType, RenderResult
 from rich.panel import Panel
+from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 
@@ -39,7 +40,9 @@ from .models import (
     TaskInstance,
     TaskLog,
     TaskRow,
+    databricks_run_url,
     filter_log,
+    find_urls,
     live_import_error_files,
 )
 
@@ -560,6 +563,63 @@ def highlight(text: str, query: str) -> Text:
     return marked
 
 
+# --- clickable links ---------------------------------------------------------
+#
+# A URL in a log is styled two ways at once, because two different things can
+# handle the click. `link` is the OSC 8 terminal hyperlink, which a terminal
+# that speaks it opens itself (⌘-click in iTerm2, Ghostty, WezTerm). The
+# `@click` meta is Textual's own: clicking a span carrying one runs the action
+# named in it, which is the only path that works while the app holds the mouse.
+#
+# LINK_ACTION is the one place this module names the app it renders into —
+# `AirflowWatchApp.action_open_link`, which a test asserts still exists. `repr`
+# quotes the URL so a query string full of `&`, `=` and `#` survives Textual's
+# action parse.
+LINK_ACTION = "app.open_link"
+
+
+def link_style(url: str) -> Style:
+    """The style that makes a span of text a clickable link to `url`."""
+    return Style(link=url, underline=True) + Style.from_meta(
+        {"@click": f"{LINK_ACTION}({url!r})"}
+    )
+
+
+def linkify(text: Text, line: str) -> Text:
+    """`text` with every URL in `line` made clickable, in place.
+
+    Takes the source line as well as the `Text` because the spans are offsets
+    into the original — the caller may already have styled it (a search
+    highlight, say), and the two stack rather than replace each other.
+    """
+    for start, end, url in find_urls(line):
+        text.stylize(link_style(url), start, end)
+    return text
+
+
+def log_line(line: str, query: str) -> Text:
+    """One rendered log line: search hits marked, URLs clickable."""
+    return linkify(highlight(line, query) if query.strip() else Text(line), line)
+
+
+def databricks_banner(log: TaskLog | None) -> Text | None:
+    """The "this task ran in Databricks" line, or None if it did not say so.
+
+    The run page is logged once, in the middle of a log thousands of lines
+    long; hoisting it to the top of the pane is the difference between a link
+    you can use and one you have to go looking for.
+    """
+    url = databricks_run_url(log.content) if log is not None else None
+    if url is None:
+        return None
+    line = Text("↗ ", style="bold magenta")
+    line.append(
+        "Databricks run", style=link_style(url) + Style(color="magenta", bold=True)
+    )
+    line.append("   click, or o to open", style="dim italic")
+    return line
+
+
 def render_log(
     task: TaskInstance,
     log: TaskLog | None,
@@ -572,6 +632,10 @@ def render_log(
     A filter here shows only matching lines, keeping each line's *original* number
     so a filtered view still tells you where in the log you are, and highlighting
     what matched.
+
+    Any URL in the log is a link you can click; a Databricks run page is also
+    hoisted to a line above the log, since that is where the task's real work
+    happened and the log names it exactly once.
     """
     tries = task.tries
     selector = Text()
@@ -607,6 +671,10 @@ def render_log(
             selector.append(f"{query!r}", style="yellow")
             selector.append("   esc clears", style="dim italic")
 
+    banner = databricks_banner(log)
+    if banner is not None:
+        body = Group(banner, Text(), body)
+
     return Panel(
         body,
         title=Text(f"Log · {task.display_id} · attempt {log.try_number if log else '?'}", style="bold"),
@@ -625,7 +693,7 @@ def _log_body(
     table.add_column(justify="right", style="dim", no_wrap=True)  # line number
     table.add_column(ratio=1, overflow="fold")
     for number, line in shown:
-        table.add_row(str(number), highlight(line, query) if query.strip() else Text(line))
+        table.add_row(str(number), log_line(line, query))
     parts: list[RenderableType] = [table]
     if len(hits) > len(shown):
         parts.append(
@@ -1328,6 +1396,9 @@ def menu_categories(
                 MenuEntry("enter", "Open the selected task's log", "drill_in"),
                 MenuEntry("c", "Clear (retry) the selected task", "clear_tasks"),
                 MenuEntry("m", "Mark the selected task success / failed", "mark_tasks"),
+                MenuEntry(
+                    "o", "Open the log's Databricks run in a browser", "open_databricks"
+                ),
                 MenuEntry("<", "Previous log attempt", "prev_try"),
                 MenuEntry(">", "Next log attempt", "next_try"),
                 MenuEntry("esc", "Back out one level", "escape"),
@@ -1412,6 +1483,7 @@ HELP_KEYS: tuple[tuple[str, str], ...] = (
     ("enter", "Drill in: run → task instances → log"),
     ("escape", "Back out one level, or clear the filter"),
     ("< / >", "Previous / next log attempt"),
+    ("o", "Open the Databricks run the log points at — links are clickable too"),
     ("D", "Switch deployment"),
     ("e", "Show / hide DAG import errors"),
     ("s", "Show / hide stale DAGs (hidden by default)"),
@@ -1438,7 +1510,9 @@ HELP_NOTE = (
     "hidden by default but always counted in the summary bar, and `s` shows "
     "them. A list that could not be fetched in full says 'N of M'. Every "
     "action that changes Airflow asks first, offers a dry run, and is recorded "
-    "in the activity log. The menu bar at the top opens with a click or `M` "
+    "in the activity log. Any URL a log prints is clickable, and a Databricks "
+    "run page is hoisted to a line above the log so `o` can open it without "
+    "hunting. The menu bar at the top opens with a click or `M` "
     "and lists every command by category; `w` marks runs to follow in the Watched view "
     "for this session. Layout and the selected deployment are restored on "
     "the next launch."

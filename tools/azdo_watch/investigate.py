@@ -1,0 +1,342 @@
+"""Handing a pipeline run to goblin-watcher (gw) for an AI summary.
+
+`i` on a run gathers everything azdo-watch can see about it — the run's metadata,
+its whole timeline in tree order, every issue Azure DevOps recorded, and the logs
+worth reading (`azdo.fetch_run_bundle`) — renders it into one report file, and
+launches `gw scratch --prompt …` so a fresh agent session reads the report,
+summarizes it, and then *stops*: the prompt explicitly forbids changes and says to
+wait for instructions.
+
+This is the same hand-off `airflow_watch/investigate.py` performs, and it is worth
+more here: the answer to "why did this build fail?" is almost always a specific
+line in one step's log, and the tool already knows which step and which line
+(azdo's timeline issues carry both). The report leads with that, so the agent
+starts where a human would.
+
+The prompt itself stays small — the run's identity plus the instructions — and the
+bulk travels in the report file, because argv has a hard ceiling (~1 MB on macOS)
+and a single pipeline log can be twice that. Each log's contribution to the report
+is bounded to its tail (`LOG_TAIL_CHARS`): failures announce themselves at the end
+of a log, and an agent asked to read a 50 MB file summarizes nothing.
+
+Like `tools/my_prs/gw.py` — whose stderr parsing this module reuses — the dashboard
+shells out to the gw binary rather than importing goblin-watcher: gw owns its
+config, state and tmux windowing, and its CLI is the stable seam between the tools.
+The subprocess inherits stdin/stdout, so the app must be suspended around
+`run_scratch` (outside tmux, gw execs `tmux attach`, which needs the real terminal).
+"""
+
+from __future__ import annotations
+
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+from tools.my_prs.gw import error_line
+
+from .azdo import RunBundle
+from .models import Pipeline, Project, Run, collect_issues
+
+__all__ = [
+    "LOG_TAIL_CHARS",
+    "Investigation",
+    "build_prompt",
+    "log_tail",
+    "prepare",
+    "render_report",
+    "run_scratch",
+    "scratch_command",
+    "scratch_name",
+    "write_report",
+]
+
+# How much of each log the report keeps, from the end — the tail is where a
+# pipeline step explains itself, because the runner prints its summary last. The
+# cut is announced in place, so the reader (an agent) knows there was more and how
+# much.
+LOG_TAIL_CHARS = 16_000
+
+# Where report files land: a stable, named directory under the system temp dir, so
+# a session's reports are findable and the OS eventually reclaims them.
+REPORT_DIR = "azdo-watch"
+
+
+@dataclass(frozen=True, slots=True)
+class Investigation:
+    """One prepared hand-off: the report on disk and the `gw scratch` to run.
+
+    Built entirely before anything is launched, so the app can log what is about to
+    happen — and what it cost to gather — as one honest line.
+    """
+
+    name: str
+    prompt: str
+    path: Path
+    steps: int
+    logs: int
+    calls: int
+    elapsed: float
+
+
+def scratch_name(run: Run, now: datetime) -> str:
+    """The scratch-space name: `azdo-<pipeline>-<timestamp>`.
+
+    Named so `gw status` reads sensibly a week later; timestamped so two
+    investigations of the same pipeline never collide. The build number is not
+    enough on its own — `20260730.5` repeats across pipelines every day.
+    """
+    return f"azdo-{_slug(run.pipeline_name)[:32]}-{now.strftime('%Y%m%d-%H%M%S')}"
+
+
+def _slug(text: str) -> str:
+    """Lowercase, dash-separated, nothing a filesystem or tmux will fight."""
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "run"
+
+
+def log_tail(content: str, limit: int = LOG_TAIL_CHARS) -> tuple[str, bool]:
+    """The last `limit` characters of a log, cut on a line boundary, plus whether
+    anything was dropped."""
+    if len(content) <= limit:
+        return content, False
+    tail = content[-limit:]
+    cut = tail.find("\n")
+    return (tail[cut + 1 :] if 0 <= cut < len(tail) - 1 else tail), True
+
+
+def _stamp(value: datetime | None) -> str:
+    return value.isoformat() if value is not None else "—"
+
+
+def _seconds(value: float | None) -> str:
+    return f"{value:.0f}s" if value is not None else "—"
+
+
+def render_report(
+    project: Project,
+    run: Run,
+    pipeline: Pipeline | None,
+    bundle: RunBundle,
+    now: datetime,
+) -> str:
+    """The whole story of one run, as markdown an agent will read.
+
+    Ordered the way a human investigates: identity, then **the issues Azure DevOps
+    already recorded** — which is the answer often enough that burying it would be
+    perverse — then the timeline in tree order, then each log's tail. Every omission
+    (a skipped log, a fetch that failed, a truncated log) is stated where it
+    happened, because the reader cannot see what was left out of a file.
+    """
+    lines: list[str] = [
+        f"# Azure DevOps run report: {run.pipeline_name} {run.number}",
+        "",
+        f"Generated by azdo-watch at {now.isoformat()}.",
+        "",
+        "## Run",
+        "",
+        f"- project: {project.label}",
+        f"- pipeline: {run.pipeline_name} (definition {run.pipeline_id})",
+        f"- run: {run.number} (build {run.id})",
+        f"- description: {run.description or '—'}",
+        f"- state: {run.state}  (azdo status={run.status or '—'}, "
+        f"result={run.result or '—'})",
+        f"- trigger: {run.trigger} ({run.reason or '—'})",
+        f"- branch: {run.branch_label}  ({run.branch or '—'})",
+        f"- commit: {run.commit or '—'}",
+        f"- requested for: {run.requested_for or '—'}",
+        f"- queued: {_stamp(run.queue_time)}",
+        f"- started: {_stamp(run.start_time)}",
+        f"- finished: {_stamp(run.finish_time)}",
+        f"- duration: {_seconds(run.duration)}",
+        f"- waited for an agent: {_seconds(run.queued_for)}",
+        f"- agent pool: {run.queue_name or '—'}",
+        f"- url: {run.web_url or '—'}",
+    ]
+    if run.pr_number:
+        lines.append(f"- pull request: #{run.pr_number} {run.pr_title}".rstrip())
+    if run.tags:
+        lines.append(f"- tags: {', '.join(run.tags)}")
+    if pipeline is not None:
+        lines += [
+            "",
+            "## Pipeline",
+            "",
+            f"- folder: {pipeline.folder or '(root)'}",
+            f"- queue status: {pipeline.queue_status}",
+            f"- author: {pipeline.authored_by or '—'}",
+        ]
+
+    issues = collect_issues(list(bundle.records))
+    lines += ["", f"## Issues Azure DevOps recorded ({len(issues)})", ""]
+    if not issues:
+        lines.append(
+            "None. The timeline records no error or warning, so whatever went "
+            "wrong (if anything) is only visible in the logs below."
+        )
+    for record, issue in issues:
+        where = f" (log line {issue.log_line})" if issue.log_line is not None else ""
+        lines.append(
+            f"- **{issue.type}** in {record.type} `{record.name}`{where}: "
+            f"{issue.message}"
+        )
+
+    lines += ["", f"## Timeline ({len(bundle.rows)} steps, in tree order)", ""]
+    for row in bundle.rows:
+        record = row.record
+        marker = " · UNPLACED (parent missing or cyclic)" if row.unplaced else ""
+        attempt = f" · attempt {record.attempt}" if record.attempt > 1 else ""
+        lines.append(
+            f"- {row.label}: {record.display_state} · {record.type}{attempt} · "
+            f"agent {record.worker_name or '—'} · started {_stamp(record.start_time)} "
+            f"· duration {_seconds(record.duration)}{marker}"
+        )
+
+    lines += ["", "## Logs", ""]
+    if not bundle.logs:
+        lines.append("No logs were fetched.")
+    for entry in bundle.logs:
+        record = entry.record
+        lines.append(
+            f"### {record.type} — {record.name} ({record.display_state})"
+        )
+        lines.append("")
+        if entry.error is not None:
+            lines.append(f"Log could not be fetched: {entry.error}")
+        elif entry.log is None or not entry.log.content.strip():
+            lines.append("(empty log)")
+        else:
+            tail, cut = log_tail(entry.log.content)
+            if entry.log.truncated:
+                lines.append(
+                    "[the fetch itself was truncated — this is not the whole log]"
+                )
+            if cut:
+                lines.append(
+                    f"[showing the last {LOG_TAIL_CHARS:,} of "
+                    f"{len(entry.log.content):,} characters]"
+                )
+            lines.append("```")
+            lines.append(tail.rstrip("\n"))
+            lines.append("```")
+            lines.append(f"[end of log for {record.name}]")
+        lines.append("")
+    if bundle.skipped:
+        lines += [
+            f"{len(bundle.skipped)} logs were not fetched (the per-investigation "
+            "ceiling):",
+            "",
+        ]
+        lines += [f"- {skipped}" for skipped in bundle.skipped]
+        lines.append("")
+    lines += [
+        "Note on what was gathered: failed steps and every job contribute their "
+        "logs; individually successful tasks do not, since a job's log already "
+        "contains its tasks' output.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def build_prompt(project: Project, run: Run, path: Path) -> str:
+    """What the fresh gw session is seeded with: read the report, summarize, change
+    nothing, wait.
+
+    The "change nothing" is load-bearing — the agent is being handed a report
+    *about* CI, in a scratch space with no project attached, and its job ends at
+    understanding. It is pointed at the recorded issues first because that is where
+    the answer usually is, and told to quote the decisive lines because a summary
+    of a build failure without the failing line is not actionable.
+    """
+    return (
+        f"An Azure DevOps pipeline run needs investigating: {run.pipeline_name} "
+        f"{run.number} (state: {run.state}) in project {project.label}.\n"
+        "\n"
+        "The full context azdo-watch gathered — the run's metadata, the errors and "
+        "warnings Azure DevOps itself recorded, the whole timeline in tree order, "
+        "and the logs of the failed steps and of every job — is in this file:\n"
+        "\n"
+        f"{path}\n"
+        "\n"
+        "Read it, then give a summary of the run: which step failed and why (quote "
+        "the decisive log lines), whether anything else looks anomalous, and where "
+        "you would look next. Start from the recorded issues — each names the step "
+        "and the log line — then confirm against that step's log rather than "
+        "trusting the message alone. Do not make any changes of any kind: no "
+        "files, no commands that mutate anything, no re-running the pipeline. "
+        "After the summary, stop and wait for instructions."
+    )
+
+
+def scratch_command(name: str, prompt: str) -> list[str]:
+    """The `gw scratch` invocation: a named scratch space, seeded with the prompt so
+    the agent starts summarizing without being asked twice."""
+    return ["gw", "scratch", name, "--prompt", prompt]
+
+
+def write_report(text: str, name: str, directory: Path | None = None) -> Path:
+    """Write the report where the agent can read it and return the path.
+
+    A stable per-run filename in a named temp directory, not `mkstemp` noise: the
+    path appears in the prompt and the activity log, and a human retracing the
+    hand-off should recognize it.
+    """
+    parent = (directory or Path(tempfile.gettempdir())) / REPORT_DIR
+    parent.mkdir(parents=True, exist_ok=True)
+    path = parent / f"{name}.md"
+    path.write_text(text)
+    return path
+
+
+def prepare(
+    project: Project,
+    run: Run,
+    pipeline: Pipeline | None,
+    bundle: RunBundle,
+    now: datetime,
+    directory: Path | None = None,
+) -> Investigation:
+    """Bundle → Investigation: render the report, write it, build the prompt.
+
+    The one impure step is the file write; everything else is deterministic from its
+    inputs, which is what the tests lean on.
+    """
+    name = scratch_name(run, now)
+    path = write_report(
+        render_report(project, run, pipeline, bundle, now), name, directory
+    )
+    return Investigation(
+        name=name,
+        prompt=build_prompt(project, run, path),
+        path=path,
+        steps=len(bundle.records),
+        logs=len(bundle.logs),
+        calls=bundle.calls,
+        elapsed=bundle.elapsed,
+    )
+
+
+def run_scratch(investigation: Investigation) -> tuple[str | None, str | None]:
+    """Run `gw scratch` with the terminal's stdin/stdout (call this with the app
+    suspended) and return `(message, error)` one-liners for the activity log. Blocks
+    until gw exits — which, outside tmux, is when the user detaches from the agent's
+    session."""
+    if shutil.which("gw") is None:
+        return None, "gw not found on PATH — is goblin-watcher installed?"
+    proc = subprocess.run(
+        scratch_command(investigation.name, investigation.prompt),
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if proc.stderr:
+        sys.stderr.write(proc.stderr)  # keep gw's own errors on the terminal too
+    if proc.returncode != 0:
+        return None, error_line(proc.stderr or "")
+    return (
+        f"gw: opened scratch {investigation.name} on {investigation.path.name} "
+        f"({investigation.logs} logs).",
+        None,
+    )

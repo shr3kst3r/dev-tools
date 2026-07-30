@@ -127,6 +127,71 @@ one set-state endpoint against another — and all of it lives behind one seam
 `docs/adrs/2026-07-24-airflow-2-only-behind-a-version-seam.md` and
 `docs/adrs/2026-07-27-airflow-3-joins-the-version-seam.md`.
 
+### `azdo-watch`
+
+`airflow-watch`'s shape pointed at Azure DevOps Pipelines, because the loop is the
+same one: **see what's running → drill into the step that broke → read its log.**
+
+- **recent runs across every pipeline**, newest first, filterable by state; `v`
+  switches to a **pipeline list** in the shape of the azdo *Recent* tab — each
+  pipeline with its last run, its result, and a live dot per run in flight;
+- `enter` drills a run into **Azure DevOps' own timeline tree** — a stage above its
+  phases, a phase above its jobs, a job above its tasks, indented and numbered —
+  and a step into its **log**;
+- **the errors azdo already recorded are hoisted out of the logs.** Every timeline
+  record carries its own issues *with the log line each was printed on*, so the
+  Step pane and the `e` overlay answer "which step failed and what did it say"
+  with no log fetch at all. `E` then filters the open log to the `##[error]`
+  markers, and `<` / `>` jump between the run's failed steps;
+- drilling in lands on the **failed task**, not the failed stage: azdo marks the
+  whole chain failed and only the leaf says what actually went wrong, so `enter`
+  twice reaches the log that explains it;
+- `/` **searches** whatever is on screen — the pipeline list, the runs list, the
+  step tree (including the issue messages, so `/tfplan` finds the step that could
+  not find the plan file), or the text of a log — client-side and instantly;
+- logs arrive **cleaned**: the agent's per-line ISO timestamp and the test runner's
+  ANSI colour codes come off at parse time, line numbers preserved, and the azdo
+  markers (`##[error]`, `##[section]`, …) are coloured so a log skims the way it
+  does in the browser. Any **URL a log prints is clickable**, and `o` opens the
+  selected run or pipeline in the web UI;
+- an in-TUI **project switcher** (`P`), and an **activity log** (`l`) of every poll
+  — its call count and wall clock — and every action;
+- actions — queue a run, cancel a run, re-run a failed stage — each behind a
+  confirmation modal that names its target. There is **no dry-run offer**, because
+  Azure DevOps has no preview for any of them, and the modal says so;
+- `i` hands the run to **goblin-watcher**: a worker gathers the timeline, the
+  recorded issues and the logs worth reading (failed steps, plus every job — a
+  job's log already contains its tasks') into a report, then `gw scratch` opens an
+  agent session pointed at it.
+
+```bash
+just azdo-watch                              # watch the project you last had open
+uv run azdo-watch --project Main             # pick one by name or id
+uv run azdo-watch --org example-org                # or by org, name or URL
+uv run azdo-watch --state inProgress         # only fetch runs in this azdo status
+uv run azdo-watch --once                     # one snapshot, no live loop
+uv run azdo-watch --once --view pipelines    # every pipeline and its last run
+```
+
+**Anything in flight is always on screen.** The main run window is bounded and
+ordered by queue time, so a build that has been running since last week is not in
+it — this org had three when the tool was written. So every poll spends one extra
+call on `statusFilter=inProgress,notStarted,cancelling` and merges the two lists by
+run id. That is the dashboard's central claim, and it is worth a call.
+
+**"More available", not "N of M".** Azure DevOps pages its build list by an opaque
+continuation token and reports **no total**, so the honest phrasing is `218 runs ·
+more available`; an M would be invented. It also means deeper paging is *serial* —
+page two's token is inside page one — which is why the default window is one large
+`$top` (1000 rows in 2.9s) rather than several polite pages.
+
+Uses the `az` CLI with the `azure-devops` extension for auth and transport, so
+`az extension add --name azure-devops` and `az devops login` must be done once —
+there is no HTTP client and no credential handling in this repo, the same call
+`/azdo-pr` already makes. The org and project default to whatever
+`az devops configure --defaults` is set to. Every call pins `--api-version`, so an
+unrelated `az extension update` cannot change what the tool does.
+
 ## Skills
 
 Agent skills — the instructions that teach an AI coding agent how to work here —

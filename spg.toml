@@ -27,6 +27,19 @@ args = [
     { name = "--once", description = "render a single snapshot and exit" },
 ]
 
+[commands.azdo-watch]
+run = "uv run azdo-watch"
+description = "Live Textual dashboard of an Azure DevOps project's pipelines: what is running, what failed, each run's stages/jobs/tasks, and their logs — all searchable with `/`. Uses the az CLI (azure-devops extension) for auth."
+args = [
+    { name = "--org", description = "Azure DevOps org, a name or its URL (default: `az devops configure`'s)" },
+    { name = "--project", description = "project name or id to watch (default: last used)" },
+    { name = "--interval", description = "seconds between refreshes (default: 60, minimum 20)" },
+    { name = "--limit", description = "runs to fetch per refresh (default: 1000)" },
+    { name = "--state", description = "only fetch runs with this azdo status; repeatable" },
+    { name = "--view", description = "which list --once prints: runs or pipelines" },
+    { name = "--once", description = "render a single snapshot and exit" },
+]
+
 [commands.my-prs]
 run = "uv run my-prs"
 description = "Live Textual dashboard of your open GitHub PRs from the last 2 weeks, across all repos: failing checks, unresolved comments, missing reviews. Uses the gh CLI for auth."

@@ -48,6 +48,7 @@ args = [
     { name = "--interval", description = "seconds between refreshes (default: 60)" },
     { name = "--limit", description = "maximum PRs to show (default: 50)" },
     { name = "--author", description = "GitHub login to search PRs for (default: you)" },
+    { name = "--view", description = "view to open with: mine, review, or hidden" },
     { name = "--once", description = "render a single snapshot and exit" },
 ]
 

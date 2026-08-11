@@ -1,9 +1,16 @@
 """The my-prs TUI, built on Textual.
 
-Two views share the dashboard — the PRs you authored ("mine") and the PRs
-waiting on a review from you ("review") — and `v` switches between them.
-Every poll fetches both, so switching is instant, and each view remembers its
-own selection.
+Three views share the dashboard — the PRs you authored ("mine"), the PRs
+waiting on a review from you ("review"), and the ones you've hidden
+("hidden") — and `v` cycles between them. Every poll fetches the first two, so
+switching is instant, and each view remembers its own selection.
+
+`h` hides the selected PR: it leaves whichever list it was in and turns up in
+the hidden view, where `h` puts it back. The hide list is persisted (see
+hidden.py) when the app is given a `hidden_path`, so a PR you're not
+interested in stays out of the way across restarts. Hiding is a local mute and
+nothing else — nothing is changed on GitHub — and because the hidden view is
+derived from the same poll, both directions take effect without a refresh.
 
 Windowing: a master/detail split. The left window is a DataTable of every
 recent PR (cursor keys / mouse to select); the detail pane shows the selected
@@ -49,15 +56,16 @@ from textual.widgets import DataTable, Static
 from tools.pr_watch import ui as pr_ui
 
 from . import gw
+from . import hidden as hidden_state
 from . import layout as layout_state
 from . import ui
 from .github import PollError
 from .layout import DETAIL_MODES, SPLIT_STEP, Layout
-from .models import VIEWS, LogEntry, PrItem
+from .models import SOURCE_VIEWS, VIEWS, LogEntry, PrItem, partition_hidden
 
 # What one poll of GitHub yields: ({view: items}, None) on success — every
-# view's list in one poll, so switching views never waits on the network —
-# or (None, PollError) on failure.
+# searched view's list in one poll, so switching views never waits on the
+# network — or (None, PollError) on failure.
 ViewData = dict[str, list[PrItem]]
 PollResult = tuple[ViewData | None, PollError | None]
 
@@ -169,6 +177,7 @@ class MyPrsApp(App[None]):
     BINDINGS = [
         ("q", "quit", "Quit"),
         ("v", "switch_view", "Switch view"),
+        ("h", "toggle_hidden", "Hide / unhide"),
         ("r", "poll_now", "Refresh now"),
         ("o", "open_pr", "Open in browser"),
         ("g", "open_in_gw", "Open in gw"),
@@ -230,6 +239,7 @@ class MyPrsApp(App[None]):
         interval: int,
         layout_path: Path | None = None,
         initial_view: str | None = None,
+        hidden_path: Path | None = None,
     ) -> None:
         super().__init__()
         self._poll = poll
@@ -240,6 +250,9 @@ class MyPrsApp(App[None]):
         self._current_delay = interval
         self._rate_limit_streak = 0
         self._data: ViewData | None = None  # None until the first poll lands
+        # The lists the UI actually shows: `_data` with the hidden PRs moved
+        # out into their own view. Re-derived on every poll and on every `h`.
+        self._views: ViewData | None = None
         self._error: PollError | None = None
         # A rolling log of what each background poll did, for the `l` overlay.
         self._activity_log: list[LogEntry] = []
@@ -258,6 +271,10 @@ class MyPrsApp(App[None]):
         self._detail_mode = saved.detail_mode
         self._split = saved.split
         self._view = initial_view if initial_view in VIEWS else saved.view
+        # The hide list, on the same terms as the layout: persisted only when
+        # the caller supplies a path, in memory otherwise.
+        self._hidden_path = hidden_path
+        self._hidden = hidden_state.load(hidden_path) if hidden_path else {}
 
     @property
     def activity_log(self) -> list[LogEntry]:
@@ -269,7 +286,7 @@ class MyPrsApp(App[None]):
 
     @property
     def _items(self) -> list[PrItem] | None:
-        return None if self._data is None else self._data.get(self._view)
+        return None if self._views is None else self._views.get(self._view)
 
     @property
     def _selected_key(self) -> str | None:
@@ -320,15 +337,22 @@ class MyPrsApp(App[None]):
         self._error = error
         if data is not None:  # keep showing the last good lists through errors
             self._data = data
+            self._derive_views()
         self._updated = datetime.now()
         self._current_delay = self._delay_after(error)
         self._seconds_left = self._current_delay
         self._polling = False
         if self._poll_history and self._poll_history[-1] == "running":
             self._poll_history[-1] = "ok" if error is None else "error"
-        self._record_poll(data, error)
+        self._record_poll(error)
         self._rebuild_table()
         self._refresh_view()
+
+    def _derive_views(self) -> None:
+        """Re-split the last poll into the lists the UI shows. Cheap and pure,
+        so pressing `h` gets the same result a fresh poll would."""
+        if self._data is not None:
+            self._views = partition_hidden(self._data, self._hidden)
 
     def _delay_after(self, error: PollError | None) -> int:
         """Seconds until the next poll. Normal polls use the configured
@@ -343,11 +367,15 @@ class MyPrsApp(App[None]):
         self._rate_limit_streak = 0
         return self._interval
 
-    def _record_poll(self, data: ViewData | None, error: PollError | None) -> None:
-        """Append one activity-log line summarizing this poll's outcome."""
+    def _record_poll(self, error: PollError | None) -> None:
+        """Append one activity-log line summarizing this poll's outcome.
+
+        The counts are the *shown* lists, so a poll that returned nothing new
+        to look at because you hid it reads that way.
+        """
         if error is None:
             counts = " · ".join(
-                f"{len((data or {}).get(view, []))} {view}" for view in VIEWS
+                f"{len((self._views or {}).get(view, []))} {view}" for view in VIEWS
             )
             self._append_log("info", f"Refreshed — {counts}")
         elif error.rate_limited:
@@ -407,7 +435,8 @@ class MyPrsApp(App[None]):
         items = self._items or []
         now = datetime.now(timezone.utc)
         for item in items:
-            table.add_row(*ui.list_row(item, now, self._view), key=item.key)
+            row = ui.list_row(item, now, self._view, self._hidden.get(item.key))
+            table.add_row(*row, key=item.key)
         if items:
             keys = [item.key for item in items]
             row = keys.index(self._selected_key) if self._selected_key in keys else 0
@@ -428,6 +457,57 @@ class MyPrsApp(App[None]):
         item = self._selected_item()
         if item is not None and item.pr.url:
             webbrowser.open(item.pr.url)
+
+    # --- hiding --------------------------------------------------------------
+
+    def action_toggle_hidden(self) -> None:
+        """`h`: hide the selected PR, or unhide it if it's already hidden.
+
+        The PR leaves the current list either way, so the cursor is handed to
+        its neighbour, and the view it lands in is pre-selected on it — flip
+        over with `v` and it's the row under the cursor.
+        """
+        item = self._selected_item()
+        if item is None:
+            return
+        unhiding = item.key in self._hidden
+        if unhiding:
+            del self._hidden[item.key]
+        else:
+            self._hidden[item.key] = datetime.now(timezone.utc)
+        if self._hidden_path is not None:
+            hidden_state.save(self._hidden, self._hidden_path)
+
+        self._selected_key = self._neighbour_key(item.key)
+        self._derive_views()
+        for view in self._destination_views(item.key, unhiding=unhiding):
+            self._selected[view] = item.key
+        self._rebuild_table()
+        self._refresh_view()
+
+        verb = "Unhid" if unhiding else "Hid"
+        where = "" if unhiding else " — it's in the Hidden view (v)"
+        self._append_log("info", f"{verb} {item.key}: {item.pr.title}{where}")
+
+    def _neighbour_key(self, key: str) -> str | None:
+        """The row to select once `key` leaves the current list: the one after
+        it, or the one before it when it was last."""
+        keys = [item.key for item in self._items or []]
+        if key not in keys:
+            return self._selected_key
+        index = keys.index(key)
+        rest = keys[index + 1 :] or keys[:index][-1:]
+        return rest[0] if rest else None
+
+    def _destination_views(self, key: str, *, unhiding: bool) -> list[str]:
+        """Where a just-(un)hidden PR went, so those views can point at it."""
+        if not unhiding:
+            return ["hidden"]
+        return [
+            view
+            for view in SOURCE_VIEWS
+            if any(item.key == key for item in (self._views or {}).get(view, []))
+        ]
 
     # --- goblin-watcher hand-off ---------------------------------------------
 
@@ -534,7 +614,9 @@ class MyPrsApp(App[None]):
         loading = self._items is None and self._error is None
         error_message = self._error.message if self._error is not None else None
         self.query_one("#summary", Static).update(
-            ui.render_summary(self._items, error_message, self._view)
+            ui.render_summary(
+                self._items, error_message, self._view, len(self._hidden)
+            )
         )
         item = self._selected_item()
         if item is not None:

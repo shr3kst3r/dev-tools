@@ -8,15 +8,25 @@ the "does this need me?" flags the dashboard sorts and colors by.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from tools.pr_watch.models import CheckState, PullRequest, RepoContext
 
+# The views GitHub is actually searched for (see github.fetch_all_views).
+SOURCE_VIEWS = ("mine", "review")
+
 # The dashboard's views, in the order `v` cycles through: PRs you authored,
-# and PRs waiting on a review from you.
-VIEWS = ("mine", "review")
-VIEW_LABELS = {"mine": "My PRs", "review": "Needs my review"}
+# PRs waiting on a review from you, and the ones you've hidden. "hidden" is
+# not a search — it's whatever the source views turned up that's on the hide
+# list (see hidden.py), which is also why hiding takes effect without a poll.
+VIEWS = ("mine", "review", "hidden")
+VIEW_LABELS = {
+    "mine": "My PRs",
+    "review": "Needs my review",
+    "hidden": "Hidden",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,3 +126,39 @@ def sort_items(items: list[PrItem]) -> list[PrItem]:
         return (not item.needs_attention, -updated.timestamp())
 
     return sorted(items, key=key)
+
+
+def partition_hidden(
+    data: Mapping[str, list[PrItem]], hidden: Mapping[str, datetime]
+) -> dict[str, list[PrItem]]:
+    """Split a poll's source views into what to show and what's hidden.
+
+    Returns every view in `VIEWS`: each source view with its hidden PRs taken
+    out, plus a "hidden" view holding the ones that were taken out (deduped —
+    a PR can legitimately appear in more than one source view). Pure, so the
+    dashboard can re-derive its lists the instant you press `h`, with no poll.
+
+    Hidden PRs are ordered by when you hid them, newest first, so the one you
+    just dismissed is at the top if you want it back. Hide-list entries for
+    PRs this poll didn't return (merged, closed, or simply outside the day
+    window) have nothing to show and are silently absent — they stay on the
+    list, and reappear here if the PR does.
+    """
+    shown = {
+        view: [item for item in items if item.key not in hidden]
+        for view, items in data.items()
+    }
+    seen: set[str] = set()
+    hidden_items: list[PrItem] = []
+    for items in data.values():
+        for item in items:
+            if item.key in hidden and item.key not in seen:
+                seen.add(item.key)
+                hidden_items.append(item)
+    hidden_items.sort(
+        key=lambda item: (
+            -hidden[item.key].timestamp(),
+            -(item.pr.metrics.updated_at or _EPOCH).timestamp(),
+        )
+    )
+    return {**shown, "hidden": hidden_items}

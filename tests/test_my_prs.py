@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from rich.console import Console
 from textual.widgets import DataTable, Static
 
-from tools.my_prs import gw, layout, ui
+from tools.my_prs import gw, hidden, layout, ui
 from tools.my_prs.app import (
     POLL_HISTORY_LIMIT,
     GwRmScreen,
@@ -24,7 +24,7 @@ from tools.my_prs.github import (
     classify_github_error,
     parse_search,
 )
-from tools.my_prs.models import PrItem, sort_items
+from tools.my_prs.models import PrItem, partition_hidden, sort_items
 from tools.pr_watch.models import Check, CheckState, PRMetrics, PullRequest
 
 NOW = datetime(2026, 7, 15, 12, 0, 0, tzinfo=timezone.utc)
@@ -300,6 +300,93 @@ def test_sort_attention_first_then_recency() -> None:
     assert [i.pr.number for i in ordered] == [3, 1, 2]
 
 
+# --- the hide list ------------------------------------------------------------
+
+
+def test_hidden_from_dict_reads_keys_and_times() -> None:
+    parsed = hidden.from_dict({"hidden": {"o/r#1": "2026-07-15T12:00:00+00:00"}})
+    assert parsed == {"o/r#1": NOW}
+
+
+def test_hidden_from_dict_normalizes_naive_timestamps_to_utc() -> None:
+    parsed = hidden.from_dict({"hidden": {"o/r#1": "2026-07-15T12:00:00"}})
+    assert parsed["o/r#1"] == NOW
+
+
+def test_hidden_from_dict_accepts_a_bare_list_of_keys() -> None:
+    # A hand-edited file is a supported way to hide something.
+    parsed = hidden.from_dict({"hidden": ["o/r#1", "o/r#2"]})
+    assert sorted(parsed) == ["o/r#1", "o/r#2"]
+
+
+def test_hidden_from_dict_shrugs_off_junk() -> None:
+    assert hidden.from_dict("nope") == {}
+    assert hidden.from_dict({"hidden": 7}) == {}
+    # An unusable timestamp keeps the entry — the key is the part that matters.
+    assert hidden.from_dict({"hidden": {"o/r#1": "not-a-date"}}).keys() == {"o/r#1"}
+
+
+def test_hidden_load_returns_empty_for_missing_or_broken_file(tmp_path) -> None:
+    assert hidden.load(tmp_path / "nope.json") == {}
+    broken = tmp_path / "hidden.json"
+    broken.write_text("{not json")
+    assert hidden.load(broken) == {}
+
+
+def test_hidden_roundtrips_through_a_file(tmp_path) -> None:
+    path = tmp_path / "hidden.json"
+    hidden.save({"o/r#1": NOW}, path)
+    assert hidden.load(path) == {"o/r#1": NOW}
+
+
+# --- partitioning the hidden PRs out ------------------------------------------
+
+
+def _poll_data() -> dict[str, list[PrItem]]:
+    return {
+        "mine": [_item(_make_pr(1)), _item(_make_pr(2), repo="example-org/other")],
+        "review": [_item(_make_pr(9), repo="example-org/backend")],
+    }
+
+
+def test_partition_hidden_moves_a_pr_into_the_hidden_view() -> None:
+    views = partition_hidden(_poll_data(), {"example-org/other#2": NOW})
+    assert [i.key for i in views["mine"]] == ["example-org/dev-tools#1"]
+    assert [i.key for i in views["review"]] == ["example-org/backend#9"]
+    assert [i.key for i in views["hidden"]] == ["example-org/other#2"]
+
+
+def test_partition_hidden_leaves_everything_alone_when_nothing_is_hidden() -> None:
+    views = partition_hidden(_poll_data(), {})
+    assert len(views["mine"]) == 2
+    assert views["hidden"] == []
+
+
+def test_partition_hidden_orders_newest_hidden_first() -> None:
+    views = partition_hidden(
+        _poll_data(),
+        {"example-org/dev-tools#1": NOW - timedelta(days=1), "example-org/other#2": NOW},
+    )
+    # The one you just dismissed sits at the top, ready to be put back.
+    assert [i.key for i in views["hidden"]] == ["example-org/other#2", "example-org/dev-tools#1"]
+
+
+def test_partition_hidden_lists_a_pr_once_even_in_two_source_views() -> None:
+    item = _item(_make_pr(9), repo="example-org/backend")
+    views = partition_hidden(
+        {"mine": [item], "review": [item]}, {"example-org/backend#9": NOW}
+    )
+    assert [i.key for i in views["hidden"]] == ["example-org/backend#9"]
+
+
+def test_partition_hidden_ignores_keys_this_poll_did_not_return() -> None:
+    # A PR that merged (or aged out of the window) has nothing to show, but
+    # its entry stays on the list — this must not invent a row or blow up.
+    views = partition_hidden(_poll_data(), {"example-org/gone#404": NOW})
+    assert views["hidden"] == []
+    assert len(views["mine"]) == 2
+
+
 # --- list rendering ---------------------------------------------------------
 
 
@@ -353,6 +440,15 @@ def test_list_row_review_view_adds_author_column() -> None:
     assert len(review) == len(ui.list_columns("review"))
     author_index = ui.list_columns("review").index("Author")
     assert review[author_index].plain == "me"
+
+
+def test_list_row_hidden_view_trades_the_dot_for_when_you_hid_it() -> None:
+    columns = ui.list_columns("hidden")
+    row = ui.list_row(_item(_make_pr()), NOW, "hidden", NOW - timedelta(hours=3))
+    assert len(row) == len(columns)
+    assert "!" not in columns  # a hidden PR isn't asking for anything
+    assert row[columns.index("Author")].plain == "me"
+    assert row[columns.index("Hidden")].plain == "3h ago"
 
 
 def test_review_cell_states() -> None:
@@ -421,6 +517,21 @@ def test_render_summary_shows_view_tabs() -> None:
 
 def test_render_summary_error() -> None:
     assert "boom" in ui.render_summary(None, "boom").plain
+
+
+def test_render_summary_notes_the_hide_list_on_the_visible_views() -> None:
+    text = ui.render_summary([_item(_make_pr())], None, "mine", hidden_total=3).plain
+    assert "Hidden" in text  # the third tab
+    assert "⊘ 3 hidden" in text
+    # Nothing hidden, nothing said.
+    assert "⊘" not in ui.render_summary([_item(_make_pr())], None).plain
+
+
+def test_render_summary_hidden_view_counts_what_it_cannot_show() -> None:
+    # Two on the list, one of them merged out of the poll window.
+    text = ui.render_summary([_item(_make_pr())], None, "hidden", hidden_total=2).plain
+    assert "1 hidden" in text
+    assert "⊘ 1 not in this window" in text
 
 
 def test_render_log_empty_and_with_entries() -> None:
@@ -747,7 +858,14 @@ async def test_switch_view_swaps_list_and_selection() -> None:
         # The review view grows an Author column.
         assert len(table.columns) == len(ui.list_columns("review"))
 
-        # Switching back restores the other view's selection.
+        # Third stop on the cycle: the (empty) hidden view.
+        await pilot.press("v")
+        await pilot.pause()
+        assert app._view == "hidden"
+        assert table.row_count == 0
+        assert len(table.columns) == len(ui.list_columns("hidden"))
+
+        # Coming back around restores the first view's selection.
         await pilot.press("v")
         await pilot.pause()
         assert app._view == "mine"
@@ -798,6 +916,121 @@ async def test_initial_view_overrides_saved(tmp_path) -> None:
         await app.workers.wait_for_complete()
         await pilot.pause()
         assert app._view == "mine"
+
+
+# --- hiding PRs ----------------------------------------------------------------
+
+
+async def test_h_hides_the_selected_pr_and_the_hidden_view_holds_it() -> None:
+    app = MyPrsApp(poll=lambda: (_data(), None), interval=60)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        table = app.query_one(DataTable)
+        assert app._selected_key == "example-org/other#2"
+
+        await pilot.press("h")
+        await pilot.pause()
+        # It's gone from "mine", and the cursor moved to what was below it.
+        assert table.row_count == 1
+        assert app._selected_key == "example-org/dev-tools#1"
+        assert "⊘ 1 hidden" in _plain(app.query_one("#summary", Static))
+
+        # …and it's waiting in the hidden view, already under the cursor.
+        await pilot.press("v", "v")  # mine → review → hidden
+        await pilot.pause()
+        assert app._view == "hidden"
+        assert table.row_count == 1
+        assert app._selected_key == "example-org/other#2"
+        assert "Broken PR" in _plain(app.query_one("#detail", Static))
+
+
+async def test_h_in_the_hidden_view_puts_the_pr_back() -> None:
+    app = MyPrsApp(poll=lambda: (_data(), None), interval=60)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("h")  # hide "example-org/other#2" from the mine view
+        await pilot.pause()
+
+        await pilot.press("v", "v")  # mine → review → hidden
+        await pilot.pause()
+        assert app._view == "hidden"
+        assert app._selected_key == "example-org/other#2"
+
+        await pilot.press("h")
+        await pilot.pause()
+        assert app._hidden == {}
+        assert app.query_one(DataTable).row_count == 0
+        # Back in the view it came from, selected there too.
+        assert app._selected["mine"] == "example-org/other#2"
+
+
+async def test_hiding_survives_a_refresh() -> None:
+    app = MyPrsApp(poll=lambda: (_data(), None), interval=60)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("h")
+        await pilot.pause()
+
+        app.action_poll_now()  # the same PR comes back from GitHub…
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app.query_one(DataTable).row_count == 1  # …and stays hidden
+        assert "1 mine" in app.activity_log[-1].message  # counts are what's shown
+        assert "1 hidden" in app.activity_log[-1].message
+
+
+async def test_hide_list_is_persisted_and_restored(tmp_path) -> None:
+    path = tmp_path / "hidden.json"
+    app = MyPrsApp(poll=lambda: (_data(), None), interval=60, hidden_path=path)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("h")
+        await pilot.pause()
+    assert list(hidden.load(path)) == ["example-org/other#2"]
+
+    reopened = MyPrsApp(poll=lambda: (_data(), None), interval=60, hidden_path=path)
+    async with reopened.run_test(size=(140, 40)) as pilot:
+        await reopened.workers.wait_for_complete()
+        await pilot.pause()
+        assert reopened.query_one(DataTable).row_count == 1
+        assert reopened._selected_key == "example-org/dev-tools#1"
+
+
+async def test_hiding_the_last_row_falls_back_to_the_one_above() -> None:
+    app = MyPrsApp(poll=lambda: (_data(), None), interval=60)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("down")  # the bottom row
+        await pilot.pause()
+        assert app._selected_key == "example-org/dev-tools#1"
+
+        await pilot.press("h")
+        await pilot.pause()
+        assert app._selected_key == "example-org/other#2"
+
+
+async def test_h_on_an_empty_list_does_nothing() -> None:
+    app = MyPrsApp(poll=lambda: (_data(mine=[], review=[]), None), interval=60)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("h")
+        await pilot.pause()
+        assert app._hidden == {}
+        assert app.is_running
+
+
+async def test_hidden_view_empty_state_points_at_the_key() -> None:
+    app = MyPrsApp(poll=lambda: (_data(), None), interval=60, initial_view="hidden")
+    async with app.run_test(size=(140, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert "press h" in _plain(app.query_one("#detail", Static))
 
 
 async def test_cycle_detail_moves_then_hides_pane() -> None:

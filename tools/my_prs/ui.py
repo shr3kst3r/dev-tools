@@ -7,7 +7,7 @@ cells and the summary/footer live here; the *detail* pane reuses pr-watch's
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 
 from rich.align import Align
@@ -22,11 +22,18 @@ from tools.pr_watch.ui import format_relative
 from .models import VIEW_LABELS, VIEWS, LogEntry, PrItem
 
 # The review view adds an Author column — whose PR you're being asked to
-# review — right where "mine" needs none (they're all yours).
+# review — right where "mine" needs none (they're all yours). The hidden view
+# keeps the author (a hidden PR may have come from either source view) and
+# trades the attention dot for a Hidden column: a PR you dismissed isn't
+# asking you for anything, but when you dismissed it decides whether it's
+# still worth ignoring.
 _COLUMNS = {
     "mine": ("!", "Repo", "PR", "Title", "CI", "💬", "Review", "⚠", "Updated"),
     "review": (
         "!", "Repo", "PR", "Author", "Title", "CI", "💬", "Review", "⚠", "Updated",
+    ),
+    "hidden": (
+        "Repo", "PR", "Author", "Title", "CI", "💬", "Review", "⚠", "Updated", "Hidden",
     ),
 }
 
@@ -99,8 +106,16 @@ def _title_cell(item: PrItem) -> Text:
     return Text(title, style=style)
 
 
-def list_row(item: PrItem, now: datetime, view: str = "mine") -> tuple[Text, ...]:
-    """The cells for one PR row, in `list_columns(view)` order."""
+def list_row(
+    item: PrItem,
+    now: datetime,
+    view: str = "mine",
+    hidden_at: datetime | None = None,
+) -> tuple[Text, ...]:
+    """The cells for one PR row, in `list_columns(view)` order.
+
+    `hidden_at` is when the PR was hidden, and only the hidden view shows it.
+    """
     cells = [
         attention_cell(item),
         Text(item.repo_name, style="cyan"),
@@ -112,8 +127,11 @@ def list_row(item: PrItem, now: datetime, view: str = "mine") -> tuple[Text, ...
         merge_cell(item),
         Text(format_relative(item.pr.metrics.updated_at, now), style="dim"),
     ]
-    if view == "review":
+    if view in ("review", "hidden"):
         cells.insert(3, Text(item.pr.author, style="magenta"))
+    if view == "hidden":
+        del cells[0]  # no attention dot: a hidden PR isn't asking for anything
+        cells.append(Text(format_relative(hidden_at, now), style="dim"))
     return tuple(cells)
 
 
@@ -128,8 +146,22 @@ def view_tabs(view: str) -> Text:
     return tabs
 
 
-def render_summary(items: list[PrItem] | None, error: str | None, view: str = "mine") -> Text:
-    """The one-line counts bar docked at the top of the app."""
+_SUMMARY_NOUNS = {"mine": "open", "review": "to review", "hidden": "hidden"}
+
+
+def render_summary(
+    items: list[PrItem] | None,
+    error: str | None,
+    view: str = "mine",
+    hidden_total: int = 0,
+) -> Text:
+    """The one-line counts bar docked at the top of the app.
+
+    `hidden_total` is the size of the whole hide list. On the visible views
+    it's a dim reminder that some PRs are being kept out of the list; on the
+    hidden view it's what the shown rows are measured against, since a hidden
+    PR the poll no longer returns has no row to appear as.
+    """
     summary = view_tabs(view)
     if error is not None:
         summary.append(f"   ✖ {error}", style="bold red")
@@ -138,8 +170,12 @@ def render_summary(items: list[PrItem] | None, error: str | None, view: str = "m
         summary.append("   Contacting GitHub…", style="dim italic")
         return summary
 
-    noun = "to review" if view == "review" else "open"
-    summary.append(f"  ·  {len(items)} {noun}", style="bold")
+    summary.append(f"  ·  {len(items)} {_SUMMARY_NOUNS[view]}", style="bold")
+    if view == "hidden":
+        offscreen = max(0, hidden_total - len(items))
+        if offscreen:
+            summary.append(f"   ⊘ {offscreen} not in this window", style="dim")
+        return summary
     failing = sum(1 for i in items if i.failing)
     commented = sum(1 for i in items if i.open_threads)
     unreviewed = sum(1 for i in items if i.review_gap)
@@ -157,6 +193,8 @@ def render_summary(items: list[PrItem] | None, error: str | None, view: str = "m
     ready = sum(1 for i in items if i.ready)
     summary.append("   ")
     summary.append(f"● {ready} ready", style="bold green" if ready else "dim")
+    if hidden_total:
+        summary.append(f"   ⊘ {hidden_total} hidden", style="dim")
     return summary
 
 
@@ -220,6 +258,11 @@ def render_detail_placeholder(
     elif not items:
         if view == "review":
             message = Text("No PRs waiting on your review. 🎉", style="green")
+        elif view == "hidden":
+            message = Text(
+                "Nothing hidden — press h on a PR to keep it out of the lists.",
+                style="dim",
+            )
         else:
             message = Text(
                 "No open PRs of yours updated in this window. 🎉", style="green"
@@ -302,7 +345,8 @@ def render_gw_exists(task_id: str, project: str) -> RenderableType:
 
 HELP_KEYS: tuple[tuple[str, str], ...] = (
     ("↑ / ↓", "Select a PR"),
-    ("v", "Switch view: your PRs ↔ PRs needing your review"),
+    ("v", "Cycle view: your PRs → PRs needing your review → hidden"),
+    ("h", "Hide the selected PR (in the Hidden view, unhide it)"),
     ("enter / o", "Open the selected PR in your browser"),
     ("g", "Open the PR's branch as a gw task (asks before --rm if it exists)"),
     ("tab", "Move focus between the list and the detail pane"),
@@ -316,6 +360,8 @@ HELP_KEYS: tuple[tuple[str, str], ...] = (
 
 HELP_NOTES = (
     "The ⚠ column marks a PR that no longer merges cleanly into its base branch.",
+    "Hiding is local and permanent until you unhide: hidden PRs stay out of the "
+    "other views across restarts, and the Hidden view is where they wait.",
     "Layout, sizing, and the active view are saved and restored on the next launch.",
     "The status-bar dots are the last 10 GitHub requests: "
     "green ok, red failed, blue in flight.",
@@ -339,8 +385,14 @@ def render_help() -> RenderableType:
     )
 
 
-def render_once(items: list[PrItem], now: datetime, view: str = "mine") -> RenderableType:
+def render_once(
+    items: list[PrItem],
+    now: datetime,
+    view: str = "mine",
+    hidden: Mapping[str, datetime] | None = None,
+) -> RenderableType:
     """A single-shot snapshot of the whole list for `--once` / scripting."""
+    hidden = hidden or {}
     table = Table(
         expand=True,
         header_style="bold",
@@ -350,5 +402,5 @@ def render_once(items: list[PrItem], now: datetime, view: str = "mine") -> Rende
     for column in list_columns(view):
         table.add_column(column, no_wrap=column != "Title")
     for item in items:
-        table.add_row(*list_row(item, now, view))
-    return Group(render_summary(items, None, view), table)
+        table.add_row(*list_row(item, now, view, hidden.get(item.key)))
+    return Group(render_summary(items, None, view, len(hidden)), table)

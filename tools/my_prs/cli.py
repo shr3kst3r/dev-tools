@@ -2,10 +2,11 @@
 
 Shows a live dashboard of your open GitHub PRs updated in the last two weeks
 (configurable), across all repos: check status, unresolved review threads,
-and review state — so you know the moment any PR needs you. Two views, with
-`v` switching between them: the PRs you authored, and the PRs waiting on a
-review from you. The live view is a Textual master/detail app: a PR list
-window on the left, a scrollable detail window on the right.
+and review state — so you know the moment any PR needs you. Three views, with
+`v` cycling between them: the PRs you authored, the PRs waiting on a review
+from you, and the PRs you've hidden with `h` because they're not yours to care
+about. The live view is a Textual master/detail app: a PR list window on the
+left, a scrollable detail window on the right.
 """
 
 from __future__ import annotations
@@ -16,17 +17,17 @@ from datetime import datetime, timezone
 
 from rich.console import Console
 
+from . import hidden as hidden_state
+from . import layout as layout_state
 from . import ui
 from .app import MyPrsApp, PollResult
-from .layout import state_path
 from .github import (
     GitHubError,
     classify_github_error,
     fetch_all_views,
-    fetch_prs,
     require_gh,
 )
-from .models import VIEWS, sort_items
+from .models import VIEWS, partition_hidden, sort_items
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -63,8 +64,9 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--view",
         choices=VIEWS,
         default=None,
-        help="Which view to open with: your PRs (mine) or PRs awaiting your "
-        "review (review). Default: the view you last had open.",
+        help="Which view to open with: your PRs (mine), PRs awaiting your "
+        "review (review), or the PRs you've hidden (hidden). Default: the "
+        "view you last had open.",
     )
     parser.add_argument(
         "--once",
@@ -98,22 +100,26 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.once:
         view = args.view or VIEWS[0]
-        try:
-            items = sort_items(
-                fetch_prs(view, days=days, limit=limit, author=args.author)
-            )
-        except GitHubError as exc:
-            console.print(f"[red]{exc}[/red]")
+        data, error = poll()
+        if data is None:
+            console.print(f"[red]{error.message if error else 'poll failed'}[/red]")
             return 1
-        console.print(ui.render_once(items, datetime.now(timezone.utc), view))
+        # The snapshot honors the hide list too — the same PRs are kept out,
+        # and `--view hidden` is how you print what's on it.
+        hidden = hidden_state.load(hidden_state.state_path())
+        items = partition_hidden(data, hidden)[view]
+        console.print(
+            ui.render_once(items, datetime.now(timezone.utc), view, hidden)
+        )
         return 0
 
     try:
         MyPrsApp(
             poll=poll,
             interval=interval,
-            layout_path=state_path(),
+            layout_path=layout_state.state_path(),
             initial_view=args.view,
+            hidden_path=hidden_state.state_path(),
         ).run()
     except KeyboardInterrupt:
         pass

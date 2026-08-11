@@ -3,7 +3,9 @@
 A single GraphQL request fetches *both* views at once — the PRs authored by the
 user ("mine") and those awaiting the user's review ("review") — as two aliased
 `search` fields sharing one PR-fields fragment. One request per poll (instead
-of one per view) keeps the tool well under GitHub's rate limits. The hard
+of one per view) keeps the tool well under GitHub's rate limits. Those two are
+the only *searched* views; the dashboard's "hidden" view is derived from them
+locally, so it costs no request. The hard
 parsing is delegated to pr-watch's pure `parse_pull_request`; this module only
 wraps each node with its repo/branch and turns `gh` failures into concise,
 actionable errors the dashboard can act on.
@@ -20,7 +22,7 @@ from pathlib import Path
 # tools report git/gh failures identically.
 from tools.pr_watch.github import GitHubError, _run, parse_pull_request, require_gh
 
-from .models import VIEWS, PrItem
+from .models import SOURCE_VIEWS, PrItem
 
 __all__ = [
     "GitHubError",
@@ -29,7 +31,6 @@ __all__ = [
     "build_search_query",
     "classify_github_error",
     "fetch_all_views",
-    "fetch_prs",
     "parse_search",
 ]
 
@@ -115,19 +116,7 @@ fragment PrFields on PullRequest {
 }
 """
 
-# One view, one search — used by the `--once` snapshot.
-_SEARCH_QUERY = (
-    _PR_FIELDS
-    + """
-query($q: String!, $limit: Int!) {
-  search(query: $q, type: ISSUE, first: $limit) {
-    nodes { ...PrFields }
-  }
-}
-"""
-)
-
-# Both views in one request: two aliased searches sharing the fragment. Halving
+# Both source views in one request: two aliased searches sharing the fragment. Halving
 # the per-poll request count is the main defense against GitHub's rate limits.
 _MULTI_SEARCH_QUERY = (
     _PR_FIELDS
@@ -223,31 +212,6 @@ def _graphql(args: list[str], cwd: Path | None) -> dict:
     return payload.get("data") or {}
 
 
-def fetch_prs(
-    view: str,
-    days: int,
-    limit: int,
-    author: str = "@me",
-    cwd: Path | None = None,
-) -> list[PrItem]:
-    """Return the view's open PRs updated within the last `days` days."""
-    query = build_search_query(
-        days, now=datetime.now(timezone.utc), author=author, view=view
-    )
-    data = _graphql(
-        [
-            "-f",
-            f"query={_SEARCH_QUERY}",
-            "-f",
-            f"q={query}",
-            "-F",
-            f"limit={limit}",
-        ],
-        cwd,
-    )
-    return parse_search((data.get("search") or {}).get("nodes") or [])
-
-
 def fetch_all_views(
     days: int,
     limit: int,
@@ -276,7 +240,7 @@ def fetch_all_views(
     )
     return {
         view: parse_search((data.get(view) or {}).get("nodes") or [])
-        for view in VIEWS
+        for view in SOURCE_VIEWS
     }
 
 

@@ -44,6 +44,7 @@ justfile                 # task runner
 tools/<name>/            # one package per tool, each with cli.py:main() -> int
 skills/<name>/SKILL.md   # agent skills — the real files (see below)
 agents/<name>.md         # subagent definitions — the real files
+statusline/statusline.sh # Claude Code status line (bash, see below)
 .claude/                 # symlinks only, nothing else lives here
 docs/adrs/               # architecture decision records (see skills/adr-rpi)
 tests/                   # test suite for all tools
@@ -84,9 +85,10 @@ links). If agent discovery ever breaks, that's the thing to suspect — move the
   `spg install` it writes a `~/bin/<name>` wrapper (plus zsh completion) for each
   `[commands.<name>]` entry, so this repo's tools land on your `$PATH`, and it
   creates a symlink for each `[links.<name>]` entry, so this repo's skills and
-  agents land where Claude Code looks for them. Commands have a `run` (shell to
-  execute from the repo root), a `description`, and optional `args` that drive
-  tab completion; links have a `source` (repo-relative) and a `target`
+  agents (and the status line) land where Claude Code looks for them. Commands
+  have a `run` (shell to execute from the repo root), a `description`, and
+  optional `args` that drive tab completion; links have a `source`
+  (repo-relative) and a `target`
   (absolute). This is *not* a packaging file — it only answers "what should this
   repo publish onto my machine, and how does it complete?".
 
@@ -99,9 +101,30 @@ links). If agent discovery ever breaks, that's the thing to suspect — move the
   in `spg.toml` whose `source` points at the **top-level** path
   (`skills/<name>`, `agents/<name>.md`) — never at the `.claude/` bridge
   symlink, so nothing resolves through two hops.
+- `spg` only creates links. Anything that also needs a key in
+  `~/.claude/settings.json` — the status line's `statusLine.command` is the one
+  case — documents that step in the README instead of editing a user's settings.
 
 Run `spg install` (or `spg sync`) to materialize wrappers and links after
 editing `spg.toml`.
+
+## The status line is bash on purpose
+
+`statusline/statusline.sh` is the one non-Python program here. Claude Code shells
+out to it on **every render**, so an interpreter start per turn would be felt —
+that is why it isn't a tool under `tools/`. Two rules follow from that:
+
+- **It must never fail.** A non-zero exit is a broken status bar, so every lookup
+  falls back to a default and an unparseable payload degrades to `{}` rather than
+  tripping `set -e`. `jq` is the only dependency.
+- **It must never block.** Network calls (the OAuth usage endpoint, when the
+  session JSON carries no `.rate_limits`) are `curl --max-time`-bounded, cached
+  for five minutes, and skipped when the keychain token is already expired.
+
+It is tested by running it: `tests/test_statusline.py` pipes fixture payloads in
+and asserts on the rendered lines. Every fixture supplies `.rate_limits` and an
+overridden `$HOME`, so no test touches the network or the real `~/.claude`.
+`just statusline` previews the render from `statusline/sample.json`.
 
 ## No account or employer identifiers in this repo
 

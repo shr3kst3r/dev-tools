@@ -81,7 +81,9 @@ args = [
     { name = "--quiet", description = "send silently, no confirmation output" },
 ]
 
-# --- links: publish this repo's skills and agents to Claude Code --------------
+# --- links: publish this repo's Claude Code config ----------------------------
+#
+# Skills, subagents, and the status line script.
 #
 # `spg install` / `sync` creates these symlinks (and `uninstall` removes them),
 # so the skills work in every session rather than only when the shell is inside
@@ -128,6 +130,16 @@ source = "skills/azdo-then-notebook"
 target = "~/.claude/skills/"
 description = "azdo-then-notebook skill: gate pr-notebook on a green azdo pipeline; chains azdo-pr → pr-notebook"
 
+[links.knowledge-base-article]
+source = "skills/knowledge-base-article"
+target = "~/.claude/skills/"
+description = "knowledge-base-article skill: write a structured KBA into docs/, from one of four templates"
+
+[links.topic-intro]
+source = "skills/topic-intro"
+target = "~/.claude/skills/"
+description = "topic-intro skill: research and write a primer for learning a new topic"
+
 [links.adr-implementer]
 source = "agents/adr-implementer.md"
 target = "~/.claude/agents/adr-implementer.md"
@@ -142,3 +154,12 @@ description = "adr-rpi review phase subagent (Opus, xhigh effort) — adr-rpi ca
 source = "agents/pr-feedback-judge.md"
 target = "~/.claude/agents/pr-feedback-judge.md"
 description = "pr-land's review-feedback adjudicator (Opus, high effort) — verifies each bot/human finding before pr-land changes code"
+
+# Not a skill or an agent: the status line is a script Claude Code shells out to
+# on every render. The link only puts the file where settings.json expects it —
+# `statusLine.command` still has to point at it once per machine (see README).
+
+[links.statusline]
+source = "statusline/statusline.sh"
+target = "~/.claude/statusline.sh"
+description = "Claude Code status line: cwd + git, model/tokens/cost, context grid, 5h & 7d rate limits"

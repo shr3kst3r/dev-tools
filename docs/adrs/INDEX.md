@@ -4,7 +4,7 @@
 
 # ADR index
 
-6 active · 0 superseded
+7 active · 0 superseded
 
 ## Active
 
@@ -12,6 +12,7 @@
 | --- | --- | --- | --- | --- | --- |
 | [2026-08-11-my-issues-copies-the-my-prs-shell](2026-08-11-my-issues-copies-the-my-prs-shell.md) | Give `my-issues` its own copy of the dashboard shell, and share only pr-watch's generic layer | Accepted | my-issues, my-prs, tool-boundaries | #5 | 2026-08-11 |
 | [2026-08-11-issues-get-no-attention-dot](2026-08-11-issues-get-no-attention-dot.md) | Sort `my-issues` by recency alone and ship no attention dot | Accepted | my-issues | #5 | 2026-08-11 |
+| [2026-08-11-claude-config-collapses-into-dev-tools](2026-08-11-claude-config-collapses-into-dev-tools.md) | Collapse the global Claude Code config into this repo, keeping the status line as bash | Proposed | statusline, spg-links, skills, repo-boundary | — | 2026-08-11 |
 | [2026-07-27-airflow-3-joins-the-version-seam](2026-07-27-airflow-3-joins-the-version-seam.md) | Airflow 3 joins Airflow 2 behind the widened version seam | Accepted | airflow-watch, api-versions | — | 2026-07-27 |
 | [2026-07-24-airflow-access-via-astro-cli](2026-07-24-airflow-access-via-astro-cli.md) | Reach Airflow and Astro exclusively by shelling out to the `astro` CLI | Accepted | airflow-watch, transport | — | 2026-07-24 |
 | [2026-07-24-airflow-2-only-behind-a-version-seam](2026-07-24-airflow-2-only-behind-a-version-seam.md) | Support only Airflow 2 at first, with all version-specific knowledge behind one seam | Accepted | airflow-watch, api-versions | — | 2026-07-24 |

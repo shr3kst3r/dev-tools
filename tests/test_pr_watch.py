@@ -8,7 +8,7 @@ from rich.console import Console
 from textual.containers import VerticalScroll
 
 from tools.pr_watch.app import PrWatchApp
-from tools.pr_watch.cli import _parse_args
+from tools.pr_watch.cli import DEFAULT_INTERVAL, MIN_INTERVAL, _parse_args
 from tools.pr_watch.github import parse_pull_request
 from tools.pr_watch.models import (
     Check,
@@ -313,6 +313,15 @@ def test_default_directory_falls_back_to_cwd(monkeypatch) -> None:
 def test_explicit_directory_overrides_spg_invocation_dir(monkeypatch) -> None:
     monkeypatch.setenv("SPG_INVOCATION_DIR", "/some/where")
     assert _parse_args(["/other/place"]).directory == "/other/place"
+
+
+def test_cli_interval_default_and_floor() -> None:
+    """One poll is cheap (~5 points of 5000/hour), but this is the tool most
+    likely to be running in several worktrees at once, so its usage multiplies
+    by however many are open — hence a floor well above a couple of seconds."""
+    assert _parse_args([]).interval == DEFAULT_INTERVAL
+    assert MIN_INTERVAL >= 15
+    assert max(MIN_INTERVAL, _parse_args(["--interval", "1"]).interval) == MIN_INTERVAL
 
 
 # --- rendering + scrolling ----------------------------------------------------

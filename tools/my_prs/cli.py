@@ -29,6 +29,14 @@ from .github import (
 )
 from .models import VIEWS, partition_hidden, sort_items
 
+# Refresh cadence, in seconds. One poll costs ~54 points of GitHub's 5000/hour
+# GraphQL budget (see github._PR_FIELDS), so the default spends ~1080/hour and
+# leaves room for my-issues and a few pr-watch instances alongside it. The floor
+# is what stops `-i 1` from turning a dashboard into a rate limit: even at 30s
+# this tool alone is already ~6500 points/hour.
+DEFAULT_INTERVAL = 180
+MIN_INTERVAL = 30
+
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -46,8 +54,9 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "-i",
         "--interval",
         type=int,
-        default=60,
-        help="Seconds between refreshes (default: 60).",
+        default=DEFAULT_INTERVAL,
+        help=f"Seconds between refreshes (default: {DEFAULT_INTERVAL}, "
+        f"minimum: {MIN_INTERVAL}).",
     )
     parser.add_argument(
         "--limit",
@@ -81,7 +90,7 @@ def main(argv: list[str] | None = None) -> int:
     console = Console()
 
     days = max(1, args.days)
-    interval = max(10, args.interval)
+    interval = max(MIN_INTERVAL, args.interval)
     limit = min(100, max(1, args.limit))
 
     try:

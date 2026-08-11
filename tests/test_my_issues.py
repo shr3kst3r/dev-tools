@@ -28,7 +28,7 @@ from tools.my_issues.app import (
     LogScreen,
     MyIssuesApp,
 )
-from tools.my_issues.cli import _parse_args
+from tools.my_issues.cli import DEFAULT_INTERVAL, MIN_INTERVAL, _parse_args
 from tools.my_issues.github import (
     GitHubError,
     PollError,
@@ -888,7 +888,7 @@ def test_render_body_marks_a_reopened_issue() -> None:
 def test_cli_defaults() -> None:
     args = _parse_args([])
     assert args.days == 14
-    assert args.interval == 60
+    assert args.interval == DEFAULT_INTERVAL
     assert args.limit == 50
     assert args.user == "@me"
     assert args.once is False
@@ -898,6 +898,14 @@ def test_cli_defaults() -> None:
 def test_cli_view_and_user_args() -> None:
     assert _parse_args(["--view", "mentioned"]).view == "mentioned"
     assert _parse_args(["--user", "alice"]).user == "alice"
+
+
+def test_min_interval_is_a_floor() -> None:
+    """Polls here are cheap (~5 points), but the 5000/hour GraphQL budget is
+    shared with my-prs and every running pr-watch, so `-i 1` still has to become
+    something that leaves room for them."""
+    assert MIN_INTERVAL >= 30
+    assert max(MIN_INTERVAL, _parse_args(["--interval", "1"]).interval) == MIN_INTERVAL
     assert _parse_args(["--once", "-d", "30", "--limit", "100"]).days == 30
 
 

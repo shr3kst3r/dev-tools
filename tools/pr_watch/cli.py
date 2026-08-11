@@ -1,7 +1,7 @@
 """Entry point for `pr-watch`.
 
 Runs in a specific directory, finds the open PR for that repo's current branch,
-and shows a live view refreshing every N seconds (default 30). The live view is
+and shows a live view refreshing every N seconds (default 60). The live view is
 a Textual app with a scrollable body, so long check lists and comment threads
 can be scrolled instead of being cropped by the terminal height.
 """
@@ -20,6 +20,16 @@ from . import ui
 from .app import PrWatchApp
 from .github import GitHubError, fetch_pull_request, get_repo_context
 from .models import PullRequest
+
+# Refresh cadence, in seconds. A poll costs ~5 points of GitHub's 5000/hour
+# GraphQL budget — cheap, because this query is scoped to one branch's PRs
+# rather than a search across every repo. The cadence is still worth being
+# careful with: pr-watch is the tool most likely to be running in several
+# worktrees at once, so its usage multiplies by however many are open. At 60s,
+# each instance spends ~300 points/hour and you can keep a handful running
+# alongside my-prs without approaching the limit.
+DEFAULT_INTERVAL = 60
+MIN_INTERVAL = 15
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -42,8 +52,9 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "-i",
         "--interval",
         type=int,
-        default=30,
-        help="Seconds between refreshes (default: 30).",
+        default=DEFAULT_INTERVAL,
+        help=f"Seconds between refreshes (default: {DEFAULT_INTERVAL}, "
+        f"minimum: {MIN_INTERVAL}).",
     )
     parser.add_argument(
         "--once",
@@ -62,7 +73,7 @@ def main(argv: list[str] | None = None) -> int:
         console.print(f"[red]Not a directory:[/red] {directory}")
         return 2
 
-    interval = max(5, args.interval)
+    interval = max(MIN_INTERVAL, args.interval)
 
     try:
         ctx = get_repo_context(directory)

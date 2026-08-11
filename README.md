@@ -83,6 +83,43 @@ Uses the `gh` CLI for auth, so `gh auth login` must be done once. The PR is
 found by the directory's current git branch; if there's no open PR yet, the view
 waits and picks it up automatically.
 
+### `my-prs`
+
+`pr-watch` widened from one PR to all of them: every open PR you touched in the
+last two weeks, across every repo, in one Textual master/detail dashboard — the
+list on the left, the selected PR's detail on the right.
+
+- **three views**, cycled with `v`: the PRs you authored, the PRs waiting on a
+  review from you, and the ones you've hidden;
+- sorted **needs-you first**, then most recently updated. A PR needs you if a
+  check is failing, a review thread is unresolved, the review is still missing or
+  changes-requested, or **the branch no longer merges cleanly** — GitHub computes
+  mergeability lazily, so only a definite `CONFLICTING` counts as a conflict,
+  never the `UNKNOWN` it returns while it is still working it out;
+- `h` **hides** a PR that isn't yours to care about — a bot's dependency bump, a
+  spike someone parked, a review request you'll never get to. It drops out of its
+  view and turns up in the hidden view, where `h` puts it back. Nothing is
+  unsubscribed on GitHub's side; the local list is the only record, and hiding
+  takes effect without waiting for a poll;
+- `g` hands the PR to **goblin-watcher**: `gw new --pr <url>` checks its head
+  branch out in a fresh worktree and spawns an agent on it, and if a task for
+  that branch already exists, a modal offers to recreate it;
+- `o` opens the PR in a browser, `d` moves or hides the detail pane, `[` / `]`
+  move the divider, `l` is the **activity log** of every poll, `?` the keybinding
+  overlay. Where you left the windows — and which view was showing — persists to
+  a small JSON state file, and a corrupt one degrades to defaults rather than
+  taking the dashboard down.
+
+```bash
+just my-prs                        # your PRs, last 14 days
+uv run my-prs --view review        # open on "needs my review"
+uv run my-prs -d 30 --limit 100    # a wider window (GitHub caps the search at 100)
+uv run my-prs --once               # one snapshot, no live loop
+```
+
+Uses the `gh` CLI for auth, like `pr-watch` — and reuses its `PullRequest` model
+and pure parser, so the two tools cannot disagree about what a check state means.
+
 ### `airflow-watch`
 
 A Textual monitor for Airflow deployments on Astronomer Astro, built around one
@@ -197,6 +234,25 @@ there is no HTTP client and no credential handling in this repo, the same call
 `/azdo-pr` already makes. The org and project default to whatever
 `az devops configure --defaults` is set to. Every call pins `--api-version`, so an
 unrelated `az extension update` cannot change what the tool does.
+
+### `slack-me`
+
+The small one: post a message to your own Slack through an incoming webhook, so a
+long job — or an agent — can tell you it's finished.
+
+```bash
+just slack-me "deploy finished"
+long-job 2>&1 | uv run slack-me    # no args: the message comes from stdin
+uv run slack-me -q "done"          # no confirmation panel (errors still print)
+```
+
+The webhook lives in `~/.slack-me.toml` (`webhook = "https://hooks.slack.com/…"`,
+plus an optional `username` to override the message's display name), or in
+`$SLACK_ME_WEBHOOK`, which wins over the file — handy for one-off use without
+writing a config. `slack-me --help` also carries a **Slack mrkdwn cheatsheet**
+(`*bold*` with single asterisks, `<url|text>` links), because Slack's syntax is
+not Markdown and the difference bites every time. The `slack-me` skill below is
+just this CLI with instructions attached.
 
 ## Skills
 

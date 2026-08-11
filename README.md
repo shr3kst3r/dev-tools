@@ -120,6 +120,56 @@ uv run my-prs --once               # one snapshot, no live loop
 Uses the `gh` CLI for auth, like `pr-watch` — and reuses its `PullRequest` model
 and pure parser, so the two tools cannot disagree about what a check state means.
 
+### `my-issues`
+
+`my-prs`' shape pointed at GitHub **issues**: every open issue you're involved in
+that moved in the last two weeks, across every repo, in the same Textual
+master/detail dashboard.
+
+- **four views**, cycled with `v`: issues assigned to you, issues you filed,
+  issues that mention you, and the ones you've hidden. All three searched views
+  come back in **one** GraphQL request per poll, so switching is instant;
+- sorted by **most recently updated, and nothing else** — there is deliberately
+  **no attention dot**. A PR exposes four crisp facts that mean "this needs you"
+  (a failing check, an unresolved thread, a missing review, a conflict); an issue
+  exposes none, and every substitute (assigned-but-untouched, an unanswered
+  comment, a label convention) needs a judgment GitHub does not make. A dot that
+  is only sometimes right costs a column and buys nothing, so every column here
+  reports a **fact**: the labels the repo defined, in the repo's own colors, who
+  is assigned (`—` when nobody is), the comment count, and how long ago. See
+  `docs/adrs/2026-08-11-issues-get-no-attention-dot.md`;
+- the **people columns follow one rule**: `Author` appears wherever the filer
+  might not be you, `Assignees` wherever the assignee might not be you. A column
+  that would read as you on every row is left out rather than padded;
+- the detail pane shows the issue's header, its labels/assignees/milestone/
+  reactions, its body rendered as **markdown**, and the tail of its comment
+  thread — with a `+N earlier` note so it never implies it has the whole
+  conversation;
+- `h` **hides** an issue that isn't yours to care about, `g` hands it to
+  **goblin-watcher** (`gw new --issue <url>`), `o` opens it in a browser, `d`
+  moves or hides the detail pane, `[` / `]` move the divider, `l` is the activity
+  log, `?` the keybinding overlay — the same keys as `my-prs`, so muscle memory
+  transfers.
+
+```bash
+just my-issues                       # issues assigned to you, last 14 days
+uv run my-issues --view created      # open on "I filed"
+uv run my-issues --user alice        # someone else's assigned/filed/mentioned
+uv run my-issues -d 30 --limit 100   # a wider window (GitHub caps the search at 100)
+uv run my-issues --once              # one snapshot, no live loop
+```
+
+Uses the `gh` CLI for auth. `my-issues` **owns its own copy** of the dashboard
+shell rather than sharing `my-prs`': an issue has no branch, checks, review
+decision or mergeability, so there is no subset of `pr-watch`'s `PullRequest` that
+describes one, and the two tools' sorts and columns already diverge. Sharing is
+limited to the genuinely domain-free helpers (`_run`, `require_gh`,
+`format_relative`), the two tools never import each other, and each keeps its
+state under its own `$XDG_CONFIG_HOME/<tool>/` — the hide-list keys are the same
+`owner/repo#number` shape, so a shared file would silently clobber the other's.
+The cost is that a fix to one shell is not a fix to the other; see
+`docs/adrs/2026-08-11-my-issues-copies-the-my-prs-shell.md`.
+
 ### `airflow-watch`
 
 A Textual monitor for Airflow deployments on Astronomer Astro, built around one

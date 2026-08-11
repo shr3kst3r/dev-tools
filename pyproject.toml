@@ -13,6 +13,7 @@ dependencies = [
 [project.scripts]
 airflow-watch = "tools.airflow_watch.cli:main"
 azdo-watch = "tools.azdo_watch.cli:main"
+my-issues = "tools.my_issues.cli:main"
 my-prs = "tools.my_prs.cli:main"
 pr-watch = "tools.pr_watch.cli:main"
 slack-me = "tools.slack_me.cli:main"

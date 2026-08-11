@@ -44,6 +44,10 @@ airflow-watch *args:
 azdo-watch *args:
     uv run azdo-watch {{args}}
 
+# Dashboard of your open GitHub issues from the last 2 weeks, across all repos.
+my-issues *args:
+    uv run my-issues {{args}}
+
 # Dashboard of your open GitHub PRs from the last 2 weeks, across all repos.
 my-prs *args:
     uv run my-prs {{args}}

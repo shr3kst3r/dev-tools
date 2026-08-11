@@ -4,7 +4,7 @@ Guidance for AI agents working in this repo.
 
 ## What this is
 
-`spg` — a personal developer toolbox. **One uv project, one tool per directory**
+`dev-tools` — a personal developer toolbox. **One uv project, one tool per directory**
 under `tools/`, all configured from a single `pyproject.toml`. This is *not* a
 uv workspace; there are no per-tool manifests.
 

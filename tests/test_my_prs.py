@@ -41,6 +41,7 @@ def _make_pr(
     review_decision: str | None = None,
     approvals: int = 0,
     updated_at: datetime | None = None,
+    mergeable: str = "MERGEABLE",
 ) -> PullRequest:
     from tools.pr_watch.models import ReviewThread
 
@@ -67,7 +68,7 @@ def _make_pr(
         created_at=NOW - timedelta(days=2),
         updated_at=updated_at or NOW,
         review_decision=review_decision,
-        mergeable="MERGEABLE",
+        mergeable=mergeable,
         approvals=approvals,
         changes_requested=0,
     )
@@ -317,6 +318,33 @@ def test_ci_cell_states() -> None:
     assert ui.ci_cell(_item(_make_pr(rollup=CheckState.UNKNOWN))).plain == "—"
 
 
+def test_merge_cell_flags_conflicts_only() -> None:
+    conflicting = _item(_make_pr(mergeable="CONFLICTING"))
+    assert ui.merge_cell(conflicting).plain == "⚠"
+    assert ui.merge_cell(conflicting).style == "bold red"
+    # A clean merge — and the UNKNOWN GitHub returns while it computes one —
+    # leave the column blank rather than claiming a conflict.
+    assert ui.merge_cell(_item(_make_pr())).plain.strip() == ""
+    assert ui.merge_cell(_item(_make_pr(mergeable="UNKNOWN"))).plain.strip() == ""
+
+
+def test_conflicting_pr_needs_attention_and_is_not_ready() -> None:
+    item = _item(
+        _make_pr(review_decision="APPROVED", approvals=1, mergeable="CONFLICTING")
+    )
+    assert item.conflicting
+    assert item.needs_attention
+    assert not item.ready
+    assert ui.attention_cell(item).style == "bold red"
+
+
+def test_list_row_shows_conflict_under_its_column() -> None:
+    for view in ("mine", "review"):
+        columns = ui.list_columns(view)
+        row = ui.list_row(_item(_make_pr(mergeable="CONFLICTING")), NOW, view)
+        assert row[columns.index("⚠")].plain == "⚠"
+
+
 def test_list_row_review_view_adds_author_column() -> None:
     item = _item(_make_pr())
     mine = ui.list_row(item, NOW)
@@ -364,12 +392,21 @@ def test_render_summary_counts() -> None:
         _item(_make_pr(2, n_threads=3, approvals=1)),
         _item(_make_pr(3, review_decision="REVIEW_REQUIRED")),
         _item(_make_pr(4, review_decision="APPROVED", approvals=1)),
+        _item(
+            _make_pr(
+                5,
+                review_decision="APPROVED",
+                approvals=1,
+                mergeable="CONFLICTING",
+            )
+        ),
     ]
     text = ui.render_summary(items, None).plain
-    assert "4 open" in text
+    assert "5 open" in text
     assert "1 failing" in text
     assert "1 with comments" in text
     assert "1 awaiting review" in text
+    assert "1 conflicting" in text
     assert "1 ready" in text
 
 

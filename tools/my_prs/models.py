@@ -78,18 +78,30 @@ class PrItem:
         return self.pr.metrics.approvals == 0
 
     @property
+    def conflicting(self) -> bool:
+        """The branch no longer merges cleanly into its base. GitHub computes
+        mergeability lazily, so anything other than a definite CONFLICTING —
+        including the UNKNOWN it returns while computing — is not a conflict."""
+        return self.pr.metrics.mergeable == "CONFLICTING"
+
+    @property
     def needs_attention(self) -> bool:
-        return self.failing or self.open_threads > 0 or self.review_gap
+        return (
+            self.failing
+            or self.open_threads > 0
+            or self.review_gap
+            or self.conflicting
+        )
 
     @property
     def ready(self) -> bool:
         """All clear: review satisfied, no open comments, checks done and not
-        failing, no merge conflicts, and not a draft. The green-dot state."""
+        failing, no merge conflicts (all four via `needs_attention`), and not a
+        draft. The green-dot state."""
         return (
             not self.needs_attention
             and not self.pr.is_draft
             and self.pr.rollup is not CheckState.PENDING
-            and self.pr.metrics.mergeable != "CONFLICTING"
         )
 
 

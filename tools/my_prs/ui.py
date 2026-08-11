@@ -24,8 +24,10 @@ from .models import VIEW_LABELS, VIEWS, LogEntry, PrItem
 # The review view adds an Author column — whose PR you're being asked to
 # review — right where "mine" needs none (they're all yours).
 _COLUMNS = {
-    "mine": ("!", "Repo", "PR", "Title", "CI", "💬", "Review", "Updated"),
-    "review": ("!", "Repo", "PR", "Author", "Title", "CI", "💬", "Review", "Updated"),
+    "mine": ("!", "Repo", "PR", "Title", "CI", "💬", "Review", "⚠", "Updated"),
+    "review": (
+        "!", "Repo", "PR", "Author", "Title", "CI", "💬", "Review", "⚠", "Updated",
+    ),
 }
 
 _TITLE_WIDTH = 44
@@ -80,6 +82,15 @@ def review_cell(item: PrItem) -> Text:
     return Text("○ none", style="yellow")
 
 
+def merge_cell(item: PrItem) -> Text:
+    """The conflict flag: a red mark when the branch no longer merges cleanly,
+    blank otherwise. One character wide on purpose — a clean merge is the norm,
+    so only the exception is worth ink. The detail pane spells the state out."""
+    if item.conflicting:
+        return Text("⚠", style="bold red")
+    return Text(" ")
+
+
 def _title_cell(item: PrItem) -> Text:
     title = item.pr.title
     if len(title) > _TITLE_WIDTH:
@@ -98,6 +109,7 @@ def list_row(item: PrItem, now: datetime, view: str = "mine") -> tuple[Text, ...
         ci_cell(item),
         comments_cell(item),
         review_cell(item),
+        merge_cell(item),
         Text(format_relative(item.pr.metrics.updated_at, now), style="dim"),
     ]
     if view == "review":
@@ -137,6 +149,11 @@ def render_summary(items: list[PrItem] | None, error: str | None, view: str = "m
     summary.append(f"💬 {commented} with comments", style="bold yellow" if commented else "dim")
     summary.append("   ")
     summary.append(f"○ {unreviewed} awaiting review", style="yellow" if unreviewed else "dim")
+    conflicting = sum(1 for i in items if i.conflicting)
+    summary.append("   ")
+    summary.append(
+        f"⚠ {conflicting} conflicting", style="bold red" if conflicting else "dim"
+    )
     ready = sum(1 for i in items if i.ready)
     summary.append("   ")
     summary.append(f"● {ready} ready", style="bold green" if ready else "dim")
@@ -298,6 +315,7 @@ HELP_KEYS: tuple[tuple[str, str], ...] = (
 )
 
 HELP_NOTES = (
+    "The ⚠ column marks a PR that no longer merges cleanly into its base branch.",
     "Layout, sizing, and the active view are saved and restored on the next launch.",
     "The status-bar dots are the last 10 GitHub requests: "
     "green ok, red failed, blue in flight.",

@@ -12,7 +12,7 @@ EOF
 )"
 ```
 
-Posts to Dennis's own webhook from `~/.slack-me.toml` — no channel lookup, no MCP
+Posts to your own webhook from `~/.slack-me.toml` — no channel lookup, no MCP
 tools. Exit codes: `0` sent · `1` config missing/malformed or Slack rejected it ·
 `2` empty message. On `1`, print the summary to the terminal and tell the user to
 check `~/.slack-me.toml`; do not retry and do not invent a webhook URL.
@@ -46,7 +46,7 @@ Number the phases the invoking skill actually ran; drop the rest.
 *3. Notebook*: <SUCCESS|FAILED|INTERNAL_ERROR|n/a — chain aborted>
 • Notebook: `<path>`
 • Run: <run-page-url|run page>
-• Cluster: `ci:multi:prod:<repo>:<slug>` (inline new_cluster | existing `<id>`)
+• Cluster: `<cluster-prefix>:<repo>:<slug>` (inline new_cluster | existing `<id>`)
 • Duration: <hh:mm:ss>
 
 *4. Triage findings*: <N>

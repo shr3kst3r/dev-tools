@@ -36,6 +36,7 @@ just <tool>     # run a tool (e.g. `just pr-watch`)
 ```
 pyproject.toml           # packaging: deps, dev group, [project.scripts], tool config
 spg.toml                 # spg command-publisher config (see below)
+dev-tools.env.example    # template for ~/.dev-tools.env (see below)
 justfile                 # task runner
 .pre-commit-config.yaml  # hooks
 .tool-versions           # asdf: pinned uv + just
@@ -101,6 +102,45 @@ links). If agent discovery ever breaks, that's the thing to suspect — move the
 
 Run `spg install` (or `spg sync`) to materialize wrappers and links after
 editing `spg.toml`.
+
+## No account or employer identifiers in this repo
+
+**This repo is generic on purpose. Nothing in it names an employer, a colleague, a
+cloud account, or an internal system.** That is a hard rule, not a preference —
+it is what lets the skills be shared, published, or read by anyone without
+leaking where they were written.
+
+Never commit, in code, docs, skills, or test fixtures:
+
+- a company or organization name, or a GitHub / Azure DevOps org that identifies
+  one;
+- an AWS account id, ARN, ECR registry host, or Databricks workspace host or
+  org id;
+- a real work email, colleague name, or GitHub login other than the repo owner's;
+- an internal repository, service, pipeline, cluster, dataset, or vendor-contract
+  name.
+
+Use placeholders instead — `example-org`, `you@example.com`, `alice`,
+`000000000000`, `etl-service` — and keep test fixtures anonymised even when they
+started as captures of real API responses. Say so in the fixture's docstring, as
+`tests/test_azdo_watch.py` does.
+
+When a skill genuinely **needs** a real value at runtime, it reads it from
+**`~/.dev-tools.env`** rather than carrying it:
+
+- `dev-tools.env.example` is the tracked template and documents every key.
+- `skills/pr-notebook/references/config.md` is the contract: how to source the
+  file, which keys each phase asserts, and the rule that a missing key is a hard
+  stop — never a value guessed from the ambient environment.
+- The real file is gitignored under both `dev-tools.env` and `.dev-tools.env`.
+- Skills must not echo a resolved ARN, account id, or registry host into a Slack
+  summary, a PR comment, or a commit message. Report the repo, tag, and short
+  digest instead.
+
+If a worked example in a skill needs to cite a real past incident to make its
+point, keep the *lesson* and anonymise the *coordinates* — "a build reported
+`FAILURE` while the only failing entries were superseded attempts" carries the
+same weight without naming the pipeline.
 
 ## Adding a tool
 

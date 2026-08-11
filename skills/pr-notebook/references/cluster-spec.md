@@ -8,32 +8,40 @@ cluster when the run starts and **tears it down when the run ends** — the clos
 thing Databricks offers to "run this notebook as a job". Nothing is left idle
 afterwards.
 
-The spec below was read off the live `ci:multi:prod:etl-service:vendor2` cluster,
-which is the freshest hand-tuned template in the account.
+The shape below was read off a live, hand-tuned multi-node cluster; the
+account-specific fields come from `~/.dev-tools.env` (see `config.md`).
 
 ## Submit
 
 ```bash
+CONFIG="${DEV_TOOLS_ENV:-$HOME/.dev-tools.env}"
+set -a; . "$CONFIG"; set +a
+: "${DATABRICKS_SINGLE_USER:?set DATABRICKS_SINGLE_USER in $CONFIG}"
+: "${DATABRICKS_INSTANCE_PROFILE_ARN:?set DATABRICKS_INSTANCE_PROFILE_ARN in $CONFIG}"
+: "${DATABRICKS_SECRETS_ARN:?set DATABRICKS_SECRETS_ARN in $CONFIG}"
+: "${DATABRICKS_CLUSTER_PREFIX:?set DATABRICKS_CLUSTER_PREFIX in $CONFIG}"
+: "${AWS_REGION:?set AWS_REGION in $CONFIG}"
+
 databricks jobs submit --profile "$PROFILE" --json "$(cat <<EOF
 {
   "run_name": "${SKILL_NAME} pr-${PR_NUMBER}: ${NOTEBOOK_BASENAME}",
   "notebook_task": {"notebook_path": "${NOTEBOOK_PATH}"},
   "new_cluster": {
-    "cluster_name": "ci:multi:prod:${REPO_NAME}:${RUN_SLUG}",
+    "cluster_name": "${DATABRICKS_CLUSTER_PREFIX}:${REPO_NAME}:${RUN_SLUG}",
     "spark_version": "14.3.x-scala2.12",
     "node_type_id": "${NODE_TYPE:-i3.8xlarge}",
     "driver_node_type_id": "i3.xlarge",
     "num_workers": ${WORKERS:-3},
     "autotermination_minutes": 30,
     "data_security_mode": "SINGLE_USER",
-    "single_user_name": "you@example.com",
+    "single_user_name": "${DATABRICKS_SINGLE_USER}",
     "runtime_engine": "STANDARD",
     "enable_elastic_disk": false,
     "enable_local_disk_encryption": false,
     "aws_attributes": {
       "availability": "SPOT_WITH_FALLBACK",
       "first_on_demand": 3,
-      "instance_profile_arn": "arn:aws:iam::000000000000:instance-profile/my-instance-profile",
+      "instance_profile_arn": "${DATABRICKS_INSTANCE_PROFILE_ARN}",
       "spot_bid_price_percent": 100,
       "zone_id": "auto"
     },
@@ -49,9 +57,9 @@ databricks jobs submit --profile "$PROFILE" --json "$(cat <<EOF
       "spark.rpc.message.maxSize": "1024"
     },
     "spark_env_vars": {
-      "AWS_DEFAULT_REGION": "us-east-1",
+      "AWS_DEFAULT_REGION": "${AWS_REGION}",
       "RUNTIME": "databricks",
-      "SECRETS_ARN": "arn:aws:secretsmanager:us-east-1:000000000000:secret:MY_SECRET-abc123"
+      "SECRETS_ARN": "${DATABRICKS_SECRETS_ARN}"
     },
     "docker_image": {"url": "${IMAGE_URL}"}
   }
@@ -66,15 +74,17 @@ Capture `run_id` from the response.
 
 ## Notes that look like bugs but are not
 
-- **`SECRETS_ARN` points at `MY_SECRET` for both `etl-service` and
-  `report-service`.** Verified against the live clusters. Do not "correct" it to
-  `MY_OTHER_SECRET` without checking with Dennis first.
-- **`instance_profile_arn` is `my-instance-profile`** — the standard for
-  `:prod` clusters in this account.
+- **One `SECRETS_ARN` may serve several repos.** Which secret a given repo's
+  pipeline actually reads is not inferable from the repo name — it was verified
+  against the live clusters and recorded in `~/.dev-tools.env`. Do not "correct"
+  `DATABRICKS_SECRETS_ARN` to the name that matches the repo without checking
+  against a live cluster first.
 - **`docker_image.url` must be the `@sha256:…` form.** See `ecr-digest.md`. A
   `:tag` here silently reintroduces the caching bug both skills exist to avoid.
-- **Single-node/SQL-only work needs no image at all** (`ci:single:sql` has none),
-  but that is not what these skills do.
+- **Single-node/SQL-only work needs no image at all**, but that is not what these
+  skills do.
+- **Do not print the rendered JSON into a summary.** It contains both ARNs. Report
+  the cluster name, node type, worker count, and short digest instead.
 
 ## Existing-cluster override (`--cluster <id>`)
 

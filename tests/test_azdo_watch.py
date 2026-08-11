@@ -2,11 +2,11 @@
 classification, redaction), the single subprocess seam, and the Textual app
 including its drill-down and its confirmation gate.
 
-Fixtures below are trimmed captures of real responses from the `example-org` Azure DevOps
+Fixtures below are trimmed captures of real responses from a live Azure DevOps
 organization — build definitions, builds, a build timeline and a task log, all taken
-through `az devops invoke` against API version 7.1. Names are kept because they are
-already public in the repo's own skills; nothing here carries a credential, an
-identity descriptor or a token.
+through `az devops invoke` against API version 7.1. Org, project and pipeline names
+are anonymised; nothing here carries a credential, an identity descriptor or a
+token.
 
 The mutating actions are exercised **only** against fakes. Nothing here talks to a
 real Azure DevOps, and nothing here may: the transport is faked at one seam

@@ -88,6 +88,6 @@ Then the `PushNotification` call and the terminal recap, both per that reference
 ## Examples
 
 ```text
-/azdo-then-notebook "/Users/you@example.com/magic/20260520: vendor bronze"
+/azdo-then-notebook "/Users/you@example.com/scratch/20260520: vendor bronze"
 /azdo-then-notebook "/Users/you@example.com/prod/refresh_gold" --workers 8
 ```

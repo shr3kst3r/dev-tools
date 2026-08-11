@@ -26,20 +26,22 @@ rather than on the code.
 |---|---|---|---|
 | `<notebook-path>` | yes | — | Full Databricks workspace path. **Always quote it** — these paths routinely contain spaces and colons. |
 | `--cluster <id>` | no | — | Run on an existing cluster instead. Skips the digest lookup entirely. |
-| `--profile <p>` | no | `production-data` | Databricks CLI profile. Pass it on **every** `databricks` call. |
+| `--profile <p>` | no | `$DATABRICKS_PROFILE` | Databricks CLI profile, defaulting to the one in `~/.dev-tools.env`. Pass it on **every** `databricks` call. |
 | `--workers <n>` | no | `3` | Worker count for the inline cluster. |
 | `--node-type <t>` | no | `i3.8xlarge` | Node type for the inline cluster. |
 | `--summary-only` | no | off | Return the summary block instead of sending it to Slack. `/azdo-then-notebook` passes this so the chain Slacks once, not twice. |
 
 ## Phase 0 — Sanity check
 
-In parallel:
+Load `~/.dev-tools.env` first, per `references/config.md` — every later phase
+needs it, and a missing config file should fail here rather than halfway through
+a cluster boot. Then, in parallel:
 
 ```bash
 gh --version
 databricks --version
 databricks auth describe --profile "$PROFILE"
-aws sts get-caller-identity --profile Administrator-000000000000
+aws sts get-caller-identity --profile "$AWS_ECR_PROFILE"
 command -v slack-me dbtools
 gh pr view --json number,headRefName,headRepository,url,title
 ```
@@ -47,7 +49,8 @@ gh pr view --json number,headRefName,headRepository,url,title
 Stop on any failure and say what to fix. A missing `slack-me` is a warning, not a
 stop — the run proceeds and the summary prints to the terminal. A missing PR
 means this skill does not apply: point the user at the `databricks-tools` skill
-(`dbtools submit` / `dbtools follow-run`) instead.
+(`dbtools submit` / `dbtools follow-run`) instead. A missing `~/.dev-tools.env`
+is a stop: say to copy `dev-tools.env.example` from the `dev-tools` repo.
 
 ## Phase 1 — Resolve the image digest
 
@@ -100,16 +103,19 @@ the composed block to your caller.
 ## Examples
 
 ```text
-/pr-notebook "/Users/you@example.com/magic/20260520: vendor bronze"
-/pr-notebook "/Users/you@example.com/magic/20260520: vendor bronze" --cluster 0520-174641-un2qujgw
+/pr-notebook "/Users/you@example.com/scratch/20260520: vendor bronze"
+/pr-notebook "/Users/you@example.com/scratch/20260520: vendor bronze" --cluster 0520-174641-un2qujgw
 /pr-notebook "/Users/you@example.com/prod/refresh_gold" --workers 8 --node-type i3.4xlarge
 ```
 
 ## Bundled references
 
+- `references/config.md` — `~/.dev-tools.env`: the account-specific values, how to
+  load them, and the rule against printing them. Shared with
+  `/azdo-then-notebook`. **Read this first.**
 - `references/ecr-digest.md` — the tag-slug transform, the ECR digest lookup, and
-  the two hard stops. Shared with `/azdo-then-notebook`.
-- `references/cluster-spec.md` — the `dr:*` inline `new_cluster` spec, the
+  the two hard stops. Shared.
+- `references/cluster-spec.md` — the inline `new_cluster` spec, the
   existing-cluster override, and the watch/triage commands. Shared.
 - `references/summary.md` — Slack mrkdwn summary shape, push notification,
   terminal recap. Shared.

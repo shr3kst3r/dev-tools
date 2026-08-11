@@ -231,8 +231,8 @@ Always, even on an abort:
 ## /pr-land — PR #945, 3 cycles
 
 Checks:  FAILURE → SUCCESS  (11 passing)
-  fixed  etl-service (Lint)   ruff format, 2 files                  a1b2c3d
-  fixed  etl-service (Test)   FF silver suffix crash                e4f5g6h
+  fixed  etl-service (Lint)   ruff format, 2 files                   a1b2c3d
+  fixed  etl-service (Test)   FF silver suffix crash                 e4f5g6h
 
 Feedback: 8 threads
   fixed     3  (2 cursor, 1 human)
@@ -241,7 +241,7 @@ Feedback: 8 threads
   asked     1  ← needs you: should the null-served case fail or warn?
 
 Pushed:   3 commits to alice/feat-79-…
-Left open: 1 human thread (alice disagrees with the decline)
+Left open: 1 human thread (bob disagrees with the decline)
 ```
 
 With `--slack`, send the same thing through `slack-me` — Slack mrkdwn, not

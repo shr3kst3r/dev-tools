@@ -12,6 +12,10 @@ __pycache__/
 .DS_Store
 *.swp
 
+# local skill config — belongs in ~/.dev-tools.env, never in the repo
+dev-tools.env
+.dev-tools.env
+
 # ephemeral rpi / adr-rpi artifacts (research.md, plan.md, implementation.md)
 .rpi/
 .adr-rpi/

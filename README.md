@@ -28,6 +28,9 @@ just sync     # create .venv and install everything (incl. dev group)
 just hooks    # install the pre-commit git hook
 just check    # ty + pytest — run before pushing
 just          # list every recipe
+
+# only needed for the pr-notebook / azdo-then-notebook skills:
+cp dev-tools.env.example ~/.dev-tools.env && chmod 600 ~/.dev-tools.env
 ```
 
 ## Layout
@@ -35,6 +38,7 @@ just          # list every recipe
 ```
 pyproject.toml           # the single manifest: deps, dev group, entry points, tool config
 spg.toml                 # which tools get published to ~/bin as commands
+dev-tools.env.example    # template for ~/.dev-tools.env (per-account skill config)
 justfile                 # task runner
 .pre-commit-config.yaml  # hooks (whitespace/eof/yaml/toml + ty + uv-lock check)
 .tool-versions           # asdf: pinned uv + just
@@ -167,7 +171,7 @@ same one: **see what's running → drill into the step that broke → read its l
 ```bash
 just azdo-watch                              # watch the project you last had open
 uv run azdo-watch --project Main             # pick one by name or id
-uv run azdo-watch --org example-org                # or by org, name or URL
+uv run azdo-watch --org my-org               # or by org, name or URL
 uv run azdo-watch --state inProgress         # only fetch runs in this azdo status
 uv run azdo-watch --once                     # one snapshot, no live loop
 uv run azdo-watch --once --view pipelines    # every pipeline and its last run
@@ -240,6 +244,34 @@ extension.
 
 Requires a `spg` new enough to support `[links]`. An older `spg` ignores the
 tables silently rather than erroring — wrappers appear, links don't.
+
+### Local configuration — `~/.dev-tools.env`
+
+The `pr-notebook` and `azdo-then-notebook` skills need values that are specific
+to *your* cloud account: the AWS account behind the ECR registry, the region and
+CLI profile, the Databricks login a single-user cluster runs as, and the instance
+profile and Secrets Manager ARNs that cluster assumes.
+
+None of that is committed. It lives in **`~/.dev-tools.env`**, outside the repo,
+and the skills `source` it at the start of any phase that needs it:
+
+```bash
+cp dev-tools.env.example ~/.dev-tools.env
+chmod 600 ~/.dev-tools.env
+$EDITOR ~/.dev-tools.env
+```
+
+`dev-tools.env.example` is the tracked template and documents every key;
+`skills/pr-notebook/references/config.md` is the contract the skills follow —
+which keys each phase requires, and the rule that a missing key is a hard stop
+rather than a silently defaulted one. Set `$DEV_TOOLS_ENV` to keep the file
+somewhere else.
+
+Nothing in it is a credential — auth still comes from the `aws` and `databricks`
+CLI profiles — but the values do identify an account, so the skills never echo a
+resolved ARN, account id, or registry host into a Slack summary, a PR comment, or
+a commit message. `.gitignore` also refuses `dev-tools.env` inside the repo, in
+case a copy lands there by accident.
 
 ### `adr-rpi`
 

@@ -40,6 +40,18 @@ args = [
     { name = "--once", description = "render a single snapshot and exit" },
 ]
 
+[commands.my-issues]
+run = "uv run my-issues"
+description = "Live Textual dashboard of your open GitHub issues from the last 2 weeks, across all repos: labels, assignees, comment counts, newest first. Uses the gh CLI for auth."
+args = [
+    { name = "--days", description = "how far back to look for issue activity (default: 14)" },
+    { name = "--interval", description = "seconds between refreshes (default: 60)" },
+    { name = "--limit", description = "maximum issues to show per view (default: 50)" },
+    { name = "--user", description = "GitHub login to search issues for (default: you)" },
+    { name = "--view", description = "view to open with: assigned, created, mentioned, or hidden" },
+    { name = "--once", description = "render a single snapshot and exit" },
+]
+
 [commands.my-prs]
 run = "uv run my-prs"
 description = "Live Textual dashboard of your open GitHub PRs from the last 2 weeks, across all repos: failing checks, unresolved comments, missing reviews. Uses the gh CLI for auth."

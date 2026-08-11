@@ -1,0 +1,83 @@
+"""Persisted window layout for my-issues.
+
+The dashboard remembers how you left its windows — where the detail pane lives
+(`d`), where the divider sits (`[` / `]`), and which view is showing (`v`) — in a
+small JSON state file under `$XDG_CONFIG_HOME/my-issues/`, loaded on the next
+launch. That directory is my-issues' own, never my-prs' (see hidden.py's
+docstring for why that matters). Parsing/serializing is pure so it can be
+unit-tested; only `load`/`save` touch the filesystem, and both shrug off a
+missing, malformed, or unwritable file (a broken state file must never take the
+dashboard down — it just means default layout).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+from .models import VIEWS
+
+# Where the detail pane lives, in the order `d` cycles through.
+DETAIL_MODES = ("right", "below", "hidden")
+
+# The list window's share of the split, as a percentage. `[` / `]` step it
+# between the bounds; the app's CSS min-width/min-height keep either window
+# usable even when the percentage would squeeze it further.
+SPLIT_DEFAULT = 50
+SPLIT_MIN = 20
+SPLIT_MAX = 80
+SPLIT_STEP = 5
+
+
+@dataclass(frozen=True)
+class Layout:
+    detail_mode: str = DETAIL_MODES[0]
+    split: int = SPLIT_DEFAULT
+    view: str = VIEWS[0]
+
+
+def clamp_split(value: int) -> int:
+    return max(SPLIT_MIN, min(SPLIT_MAX, value))
+
+
+def from_dict(data: object) -> Layout:
+    """Build a Layout from persisted JSON, defaulting anything unrecognized."""
+    if not isinstance(data, dict):
+        return Layout()
+    mode = data.get("detail_mode")
+    if not isinstance(mode, str) or mode not in DETAIL_MODES:
+        mode = DETAIL_MODES[0]
+    split = data.get("split")
+    if not isinstance(split, int) or isinstance(split, bool):
+        split = SPLIT_DEFAULT
+    view = data.get("view")
+    if not isinstance(view, str) or view not in VIEWS:
+        view = VIEWS[0]
+    return Layout(detail_mode=mode, split=clamp_split(split), view=view)
+
+
+def to_dict(layout: Layout) -> dict[str, object]:
+    return {"detail_mode": layout.detail_mode, "split": layout.split, "view": layout.view}
+
+
+def state_path() -> Path:
+    """`$XDG_CONFIG_HOME/my-issues/layout.json` — my-issues' own directory."""
+    config_home = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
+    return Path(config_home) / "my-issues" / "layout.json"
+
+
+def load(path: Path) -> Layout:
+    try:
+        return from_dict(json.loads(path.read_text()))
+    except (OSError, ValueError):
+        return Layout()
+
+
+def save(layout: Layout, path: Path) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(to_dict(layout), indent=2) + "\n")
+    except OSError:
+        pass

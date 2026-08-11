@@ -1,6 +1,8 @@
-# dev-tools (`spg`)
+# dev-tools
 
-A collection of personal developer tools. **One uv project, one tool per
+Personal developer tools: live terminal dashboards for the systems I spend the
+day waiting on — GitHub PRs, Airflow, Azure DevOps Pipelines — alongside the
+agent skills and subagents I work with. **One uv project, one tool per
 directory** under `tools/`, all configured from a single `pyproject.toml`.
 
 ## Toolchain
@@ -37,7 +39,7 @@ cp dev-tools.env.example ~/.dev-tools.env && chmod 600 ~/.dev-tools.env
 
 ```
 pyproject.toml           # the single manifest: deps, dev group, entry points, tool config
-spg.toml                 # which tools get published to ~/bin as commands
+spg.toml                 # which tools/skills this repo publishes (read by `spg`, a separate tool)
 dev-tools.env.example    # template for ~/.dev-tools.env (per-account skill config)
 justfile                 # task runner
 .pre-commit-config.yaml  # hooks (whitespace/eof/yaml/toml + ty + uv-lock check)

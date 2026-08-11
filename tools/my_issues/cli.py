@@ -30,6 +30,14 @@ from .github import (
 )
 from .models import VIEWS, partition_hidden, sort_items
 
+# Refresh cadence, in seconds. A poll here is cheap — all three views cost ~5
+# points of GitHub's 5000/hour GraphQL budget, because an issue carries no
+# connection-inside-a-connection the way a PR's review threads do — but the
+# budget is shared with my-prs and every running pr-watch, and issues simply do
+# not move fast enough to justify spending it. Matches my-prs on purpose.
+DEFAULT_INTERVAL = 180
+MIN_INTERVAL = 30
+
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -47,8 +55,9 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "-i",
         "--interval",
         type=int,
-        default=60,
-        help="Seconds between refreshes (default: 60).",
+        default=DEFAULT_INTERVAL,
+        help=f"Seconds between refreshes (default: {DEFAULT_INTERVAL}, "
+        f"minimum: {MIN_INTERVAL}).",
     )
     parser.add_argument(
         "--limit",
@@ -84,7 +93,7 @@ def main(argv: list[str] | None = None) -> int:
     console = Console()
 
     days = max(1, args.days)
-    interval = max(10, args.interval)
+    interval = max(MIN_INTERVAL, args.interval)
     limit = min(100, max(1, args.limit))
 
     try:

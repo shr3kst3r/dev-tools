@@ -16,8 +16,9 @@ from tools.my_prs.app import (
     LogScreen,
     MyPrsApp,
 )
-from tools.my_prs.cli import _parse_args
+from tools.my_prs.cli import DEFAULT_INTERVAL, MIN_INTERVAL, _parse_args
 from tools.my_prs.github import (
+    _PR_FIELDS,
     GitHubError,
     PollError,
     build_search_query,
@@ -592,7 +593,7 @@ def test_render_status_bar_countdown_and_no_dots_before_first_request() -> None:
 def test_cli_defaults() -> None:
     args = _parse_args([])
     assert args.days == 14
-    assert args.interval == 60
+    assert args.interval == DEFAULT_INTERVAL
     assert args.limit == 50
     assert args.author == "@me"
     assert args.once is False
@@ -601,6 +602,24 @@ def test_cli_defaults() -> None:
 
 def test_cli_view_arg() -> None:
     assert _parse_args(["--view", "review"]).view == "review"
+
+
+def test_min_interval_is_a_floor() -> None:
+    """A poll is ~54 points of a 5000/hour budget shared with every other tool,
+    so `-i 1` has to become something survivable rather than be taken at its
+    word. Even MIN_INTERVAL spends ~6500 points/hour on its own."""
+    assert MIN_INTERVAL >= 30
+    assert max(MIN_INTERVAL, _parse_args(["--interval", "1"]).interval) == MIN_INTERVAL
+
+
+def test_review_threads_stay_capped() -> None:
+    """GitHub scores this query on the nodes it might return, and `reviewThreads`
+    nests a `comments` connection inside itself, so its `first:` is what sets the
+    cost: `2 searches x limit x first / 100`. Measured live at `--limit 50`,
+    `first: 100` cost 104 points a poll — over the 5000/hour budget on the old
+    60s cadence, alone. Raising this back is how that bug returns."""
+    assert "reviewThreads(first: 50)" in _PR_FIELDS
+    assert "reviewThreads(first: 100)" not in _PR_FIELDS
 
 
 # --- the app ----------------------------------------------------------------

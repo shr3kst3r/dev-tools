@@ -9,6 +9,13 @@ locally, so it costs no request. The hard
 parsing is delegated to pr-watch's pure `parse_pull_request`; this module only
 wraps each node with its repo/branch and turns `gh` failures into concise,
 actionable errors the dashboard can act on.
+
+Request *count* was never the binding constraint, though — GitHub's GraphQL
+budget is scored in points, not calls, and this is by some distance the most
+expensive query in the repo. See the note above `_PR_FIELDS` for what drives
+that number and why `reviewThreads` is capped where it is; the short version
+is that one poll costs ~54 points out of 5000/hour, so the cadence in cli.py
+and the cap in the fragment are what keep the tool inside its budget.
 """
 
 from __future__ import annotations
@@ -48,6 +55,27 @@ _VIEW_QUALIFIERS = {
 # view only shows who opened the thread and the total count. Kept as a shared
 # fragment so both the single-view and combined-views queries select the same
 # fields without duplicating ~60 lines.
+#
+# `reviewThreads` is the one expensive selection here, and it is worth
+# understanding before anyone raises it back. GitHub scores a GraphQL call on
+# the nodes it *might* return, and a connection nested inside another
+# connection multiplies: this query's cost is roughly
+# `2 searches × limit × reviewThreads-first / 100`. Measured against the real
+# API at the default `--limit 50`, that is:
+#
+#     reviewThreads(first: 100) -> 104 points    reviewThreads(first: 50) -> 54
+#     reviewThreads(first: 30)  ->  34 points    reviewThreads(first: 25) -> 29
+#
+# The GraphQL budget is 5000 points/hour, so the old `first: 100` cost 104
+# points a poll — 6240/hour on the old 60s cadence, past the limit on its own
+# and before my-issues or any pr-watch got a look in. Nothing else in the
+# fragment moves the number: dropping the nested `comments` selection takes
+# `first: 100` from 104 points to 4, and `latestOpinionatedReviews`/`contexts`
+# cost nothing measurable because they have no connection under them.
+#
+# 50 is the compromise: half the cost, and a PR would need more than 50 review
+# threads (resolved ones included — GitHub can't filter them server-side)
+# before the unresolved count shown in the list starts to undercount.
 _PR_FIELDS = """
 fragment PrFields on PullRequest {
   repository { nameWithOwner }
@@ -96,7 +124,7 @@ fragment PrFields on PullRequest {
       }
     }
   }
-  reviewThreads(first: 100) {
+  reviewThreads(first: 50) {
     nodes {
       isResolved
       isOutdated

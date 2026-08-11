@@ -63,7 +63,7 @@ Each tool is a package under `tools/` and gets an entry point in
 ### `pr-watch`
 
 A live, auto-refreshing terminal view of the GitHub PR for a directory's current
-branch — modeled after the databricks-tools `follow` command. Every 30s it shows:
+branch — modeled after the databricks-tools `follow` command. Every 60s it shows:
 
 - **metrics** at a glance: diff size (+/−), files, commits, opened/updated age,
   review decision (with approval / changes-requested counts), and mergeable state;
@@ -169,6 +169,29 @@ state under its own `$XDG_CONFIG_HOME/<tool>/` — the hide-list keys are the sa
 `owner/repo#number` shape, so a shared file would silently clobber the other's.
 The cost is that a fix to one shell is not a fix to the other; see
 `docs/adrs/2026-08-11-my-issues-copies-the-my-prs-shell.md`.
+
+#### Refresh cadence and the GitHub API budget
+
+`pr-watch`, `my-prs` and `my-issues` all poll GitHub's GraphQL API, and they draw
+on **one shared budget of 5000 points/hour** — points, not requests, scored on the
+nodes a query might return. Their defaults are picked to fit inside it together:
+
+| tool | cost/poll | default interval | points/hour |
+| --- | --- | --- | --- |
+| `my-prs` | ~54 | 180s | ~1080 |
+| `my-issues` | ~5 | 180s | ~100 |
+| `pr-watch` | ~5 | 60s | ~300 (per instance) |
+
+`my-prs` dominates because a PR search nests a `comments` connection inside a
+`reviewThreads` connection, and nested connections multiply: its cost is roughly
+`2 searches × --limit × reviewThreads-first / 100`. That is worth knowing before
+raising `--limit` — `--limit 100` doubles the cost of every poll.
+
+`-i` lowers the interval, but each tool clamps it to a floor (30s for the two
+dashboards, 15s for `pr-watch`) so a stray `-i 1` can't spend the whole hourly
+budget in a few minutes. If a limit is hit anyway, the dashboards back off
+exponentially rather than retrying on the normal cadence, and say so in the
+activity log (`l`).
 
 ### `airflow-watch`
 

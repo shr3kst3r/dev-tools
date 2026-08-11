@@ -5,7 +5,7 @@ incoming-webhook URL to post to::
 
     webhook = "https://hooks.slack.com/services/XXX/YYY/ZZZ"
 
-    # Optional: prefix every message with this (e.g. the host name).
+    # Optional: override the display name the message is posted under.
     username = "slack-me"
 
 The parse layer (`parse_config`) is pure and string-in/dataclass-out so it can

@@ -59,3 +59,9 @@ pr-watch dir="." *args:
 # Send yourself a Slack message via the webhook in ~/.slack-me.toml.
 slack-me *args:
     uv run slack-me {{args}}
+
+# --- Claude Code config ------------------------------------------------
+
+# Preview the status line from statusline/sample.json (needs jq).
+statusline:
+    @statusline/statusline.sh < statusline/sample.json

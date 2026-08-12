@@ -65,3 +65,15 @@ slack-me *args:
 # Preview the status line from statusline/sample.json (needs jq).
 statusline:
     @statusline/statusline.sh < statusline/sample.json
+
+# --- terminal config ---------------------------------------------------
+
+# Load tmux/tmux.conf into a throwaway tmux server to check it for errors.
+tmux-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    socket="dev-tools-check-$$"
+    trap 'tmux -L "$socket" kill-server 2>/dev/null || true' EXIT
+    tmux -L "$socket" -f /dev/null new-session -d
+    tmux -L "$socket" source-file tmux/tmux.conf
+    echo "tmux/tmux.conf: OK"

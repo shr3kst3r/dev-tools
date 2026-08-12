@@ -45,6 +45,7 @@ tools/<name>/            # one package per tool, each with cli.py:main() -> int
 skills/<name>/SKILL.md   # agent skills — the real files (see below)
 agents/<name>.md         # subagent definitions — the real files
 statusline/statusline.sh # Claude Code status line (bash, see below)
+tmux/tmux.conf           # tmux config, published to ~/.tmux.conf (see below)
 .claude/                 # symlinks only, nothing else lives here
 docs/adrs/               # architecture decision records (see skills/adr-rpi)
 tests/                   # test suite for all tools
@@ -85,7 +86,8 @@ links). If agent discovery ever breaks, that's the thing to suspect — move the
   `spg install` it writes a `~/bin/<name>` wrapper (plus zsh completion) for each
   `[commands.<name>]` entry, so this repo's tools land on your `$PATH`, and it
   creates a symlink for each `[links.<name>]` entry, so this repo's skills and
-  agents (and the status line) land where Claude Code looks for them. Commands
+  agents (and the status line) land where Claude Code looks for them, and the
+  tmux config lands at `~/.tmux.conf`. Commands
   have a `run` (shell to execute from the repo root), a `description`, and
   optional `args` that drive tab completion; links have a `source`
   (repo-relative) and a `target`
@@ -125,6 +127,28 @@ It is tested by running it: `tests/test_statusline.py` pipes fixture payloads in
 and asserts on the rendered lines. Every fixture supplies `.rate_limits` and an
 overridden `$HOME`, so no test touches the network or the real `~/.claude`.
 `just statusline` previews the render from `statusline/sample.json`.
+
+## The tmux config is a dotfile, not a tool
+
+`tmux/tmux.conf` is the second non-Python thing here, and the first `[links]`
+target outside `~/.claude`: tmux reads `~/.tmux.conf` directly, so the symlink
+`spg install` creates *is* the install — there is no settings key to point at
+it, and no wrapper on `$PATH`.
+
+- **tpm is not vendored.** Plugins are declared with `@plugin` but the plugin
+  manager itself is cloned by hand. The `run` at the bottom is therefore wrapped
+  in an `if-shell` existence check — unguarded it exits 127 on a machine without
+  tpm, which the user sees on every tmux start and every `prefix + r`.
+- **Keep the tpm line last**, as tpm requires, and keep the guard when you touch
+  it.
+
+Like the status line, it is tested by running it: `tests/test_tmux_conf.py`
+starts a private tmux server on its own socket with `-f /dev/null`, sources the
+file into it with `source-file` (which, unlike `tmux -f`, reports a bad option as
+a non-zero exit), and asserts on the options and key bindings the server ends up
+with. `$HOME` is a tmp directory in every test, so nothing reads or writes the
+developer's plugins or resurrect state. `just tmux-check` is the same load
+without the assertions. Tests skip when `tmux` isn't installed.
 
 ## No account or employer identifiers in this repo
 

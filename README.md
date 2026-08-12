@@ -2,8 +2,9 @@
 
 Personal developer tools: live terminal dashboards for the systems I spend the
 day waiting on — GitHub PRs, Airflow, Azure DevOps Pipelines — alongside the
-agent skills, subagents, and status line I work with. **One uv project, one tool
-per directory** under `tools/`, all configured from a single `pyproject.toml`.
+agent skills, subagents, status line, and tmux config I work with. **One uv
+project, one tool per directory** under `tools/`, all configured from a single
+`pyproject.toml`.
 
 ## Toolchain
 
@@ -52,6 +53,7 @@ skills/
 agents/
   adr-implementer.md     # subagent definitions
 statusline/statusline.sh # the Claude Code status line
+tmux/tmux.conf           # the tmux config, linked to ~/.tmux.conf
 docs/adrs/               # architecture decision records
 tests/                   # test suite for all tools
 ```
@@ -483,6 +485,49 @@ settings:
 jq '. + {statusLine: {type: "command", command: "~/.claude/statusline.sh"}}' \
   ~/.claude/settings.json > /tmp/s.json && mv /tmp/s.json ~/.claude/settings.json
 ```
+
+## tmux
+
+`tmux/tmux.conf` is the tmux config these dashboards get run inside. `spg
+install` links it to `~/.tmux.conf`, which *is* the install — tmux reads that
+path directly, so there is no settings key to point at it.
+
+What it changes, beyond tmux's defaults:
+
+| | |
+| --- | --- |
+| `C-a` prefix | `C-b` unbound; `prefix + a` sends a literal `C-a` through to a nested tmux or readline |
+| `prefix + Tab` | cycle panes (which is why extrakto is remapped to `prefix + C-e`) |
+| `prefix + \|` / `-` / `c` | split and open windows in the current pane's directory |
+| `prefix + r` | re-source this file in place |
+| `prefix + e` | toggle `synchronize-panes` — type once into every pane |
+| vi copy mode | `v` selects, `y` yanks; `set-clipboard on` so OSC 52 carries a yank back over ssh |
+| two-line status | row 1 is session + windows, row 2 the pane's *untruncated* title and the clock |
+| mouse on | click panes and windows, drag borders, drag a window name to reorder it |
+| 50k scrollback | `base-index 1`, `renumber-windows on`, 10ms escape-time, focus events on |
+
+Plugins are declared for [tpm](https://github.com/tmux-plugins/tpm) but tpm
+itself is cloned by hand, once per machine:
+
+```bash
+git clone https://github.com/tmux-plugins/tpm ~/.tmux/plugins/tpm
+# then, inside tmux: prefix + I
+```
+
+The `run` line at the bottom is guarded by an `if-shell` existence check, so a
+machine without tpm loads the config clean instead of erroring on every start
+and every `prefix + r`. That is what makes the config testable:
+
+```bash
+just tmux-check                    # source it into a throwaway tmux server
+just test tests/test_tmux_conf.py  # same, plus assertions on what the server believes
+```
+
+The tests run against a private socket with `$HOME` pointed at a tmp directory,
+so they never see your sessions, plugins, or resurrect state.
+
+`spg` will not clobber a file it doesn't manage, so if you already have a real
+`~/.tmux.conf`, move it aside (or `spg install --force`) the first time.
 
 ## Adding a tool
 

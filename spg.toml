@@ -81,9 +81,9 @@ args = [
     { name = "--quiet", description = "send silently, no confirmation output" },
 ]
 
-# --- links: publish this repo's Claude Code config ----------------------------
+# --- links: publish this repo's dotfiles and Claude Code config ---------------
 #
-# Skills, subagents, and the status line script.
+# Skills, subagents, the status line script, and the tmux config.
 #
 # `spg install` / `sync` creates these symlinks (and `uninstall` removes them),
 # so the skills work in every session rather than only when the shell is inside
@@ -163,3 +163,12 @@ description = "pr-land's review-feedback adjudicator (Opus, high effort) — ver
 source = "statusline/statusline.sh"
 target = "~/.claude/statusline.sh"
 description = "Claude Code status line: cwd + git, model/tokens/cost, context grid, 5h & 7d rate limits"
+
+# Nor is this: tmux reads ~/.tmux.conf directly, so the link *is* the install.
+# spg refuses to clobber an unmanaged file, so an existing ~/.tmux.conf has to
+# be moved aside (or `spg install --force`d over) once per machine.
+
+[links.tmux]
+source = "tmux/tmux.conf"
+target = "~/.tmux.conf"
+description = "tmux config: C-a prefix, vi copy mode, two-line status bar, tpm plugins"

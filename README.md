@@ -374,17 +374,18 @@ To use these from anywhere — not just when your shell is inside this repo —
 materializes them:
 
 ```bash
-spg install    # creates ~/bin wrappers AND the ~/.claude symlinks
+spg install    # creates ~/bin wrappers AND the ~/.claude / ~/.agents symlinks
 spg sync       # refresh them later; spg uninstall removes them
 ```
 
 Each link's `source` points at the top-level path (`skills/adr-rpi`,
 `agents/adr-reviewer.md`), not at the `.claude/` bridge, so nothing resolves
 through two hops. Skills use `target = "~/.claude/skills/"` (trailing slash: link
-*into* the directory, table name as the leaf); the agents use an explicit
-`target = "~/.claude/agents/<name>.md"`, because Claude Code only reads `.md`
-files out of an agents directory and the trailing-slash form would drop the
-extension.
+*into* the directory, table name as the leaf) and explicit
+`target = "~/.agents/skills/<name>"` entries (for Antigravity and agent runtimes);
+the agents use an explicit `target = "~/.claude/agents/<name>.md"`, because
+Claude Code only reads `.md` files out of an agents directory and the
+trailing-slash form would drop the extension.
 
 Requires a `spg` new enough to support `[links]`. An older `spg` ignores the
 tables silently rather than erroring — wrappers appear, links don't.
@@ -541,7 +542,8 @@ so they never see your sessions, plugins, or resurrect state.
 1. Create `skills/<name>/SKILL.md` with `name` + `description` frontmatter.
 2. Bridge it for Claude Code:
    `ln -s ../../skills/<name> .claude/skills/<name>` (commit the symlink).
-3. Optionally link it into `~/.claude/skills/` to use it outside this repo.
+3. Optionally link it into `~/.claude/skills/` and `~/.agents/skills/` to
+   use it outside this repo (via `spg.toml`).
 
 Same shape for a subagent: `agents/<name>.md`, bridged with
 `ln -s ../../agents/<name>.md .claude/agents/<name>.md`.

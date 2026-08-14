@@ -69,7 +69,7 @@ subagents under `.claude/agents/`, so each one is bridged with a committed
 `.claude/` therefore contains no content of its own, only links. The indirection
 is deliberate: skills and agents are a first-class, visible part of this repo,
 not tooling config buried in a dotdir. A skill may also be linked into a
-developer's `~/.claude/skills/` so it works outside this repo — that chain
+developer's `~/.claude/skills/` or `~/.agents/skills/` so it works outside this repo — that chain
 resolves through the committed symlink, so don't delete it.
 
 Symlinked *skill* directories are documented behavior. Symlinked *agent* files
@@ -86,8 +86,8 @@ links). If agent discovery ever breaks, that's the thing to suspect — move the
   `spg install` it writes a `~/bin/<name>` wrapper (plus zsh completion) for each
   `[commands.<name>]` entry, so this repo's tools land on your `$PATH`, and it
   creates a symlink for each `[links.<name>]` entry, so this repo's skills and
-  agents (and the status line) land where Claude Code looks for them, and the
-  tmux config lands at `~/.tmux.conf`. Commands
+  agents (and the status line) land where Claude Code and Antigravity look for them
+  (`~/.claude/` and `~/.agents/`), and the tmux config lands at `~/.tmux.conf`. Commands
   have a `run` (shell to execute from the repo root), a `description`, and
   optional `args` that drive tab completion; links have a `source`
   (repo-relative) and a `target`
@@ -206,10 +206,9 @@ same weight without naming the pipeline.
 2. Bridge it: `ln -s ../../skills/<name> .claude/skills/<name>`, then
    `git add .claude/skills/<name>` so the symlink itself is committed (mode
    `120000`).
-3. Publish it: add a `[links.<name>]` entry to `spg.toml` with
-   `source = "skills/<name>"` and `target = "~/.claude/skills/"` (trailing slash
-   means "link into that directory, using the table name as the leaf"), then run
-   `spg install`.
+3. Publish it: add `[links.<name>]` (`target = "~/.claude/skills/"`) and
+   `[links.agents-<name>]` (`target = "~/.agents/skills/<name>"`) entries to
+   `spg.toml`, then run `spg install`.
 4. Keep any supporting files (references, scripts) inside `skills/<name>/`.
 
 A skill's bundled scripts may need to run in *other* repos, not just this one.

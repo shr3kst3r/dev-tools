@@ -81,9 +81,10 @@ args = [
     { name = "--quiet", description = "send silently, no confirmation output" },
 ]
 
-# --- links: publish this repo's dotfiles and Claude Code config ---------------
+# --- links: publish this repo's dotfiles, Claude Code, and agent configs ------
 #
-# Skills, subagents, the status line script, and the tmux config.
+# Skills (to both ~/.claude/skills/ and ~/.agents/skills/), subagents, the
+# status line script, and the tmux config.
 #
 # `spg install` / `sync` creates these symlinks (and `uninstall` removes them),
 # so the skills work in every session rather than only when the shell is inside
@@ -91,9 +92,10 @@ args = [
 # never at the `.claude/` bridge symlink, so nothing resolves through two hops.
 #
 # A `target` ending in `/` links *into* that directory using the table name as
-# the leaf. The agents need the explicit form instead, because Claude Code only
-# reads `.md` files out of an agents directory and the table name carries no
-# extension.
+# the leaf. The agents and ~/.agents links need the explicit form instead:
+# Claude Code only reads `.md` files out of an agents directory and the table
+# name carries no extension, while ~/.agents links use the `agents-<name>` table
+# name to avoid collisions with the ~/.claude entries.
 
 [links.slack-me]
 source = "skills/slack-me"
@@ -138,6 +140,53 @@ description = "knowledge-base-article skill: write a structured KBA into docs/, 
 [links.topic-intro]
 source = "skills/topic-intro"
 target = "~/.claude/skills/"
+description = "topic-intro skill: research and write a primer for learning a new topic"
+
+# --- ~/.agents: duplicate skills links for Antigravity and agent runtimes -----
+
+[links.agents-slack-me]
+source = "skills/slack-me"
+target = "~/.agents/skills/slack-me"
+description = "slack-me skill: ping yourself on Slack, plus the Slack mrkdwn reference"
+
+[links.agents-adr-rpi]
+source = "skills/adr-rpi"
+target = "~/.agents/skills/adr-rpi"
+description = "adr-rpi skill: Research → Plan → Implement with ADRs as the durable memory layer"
+
+[links.agents-adr-format]
+source = "skills/adr-format"
+target = "~/.agents/skills/adr-format"
+description = "adr-format skill: ADR format spec + significance bar, preloaded into the adr-rpi subagents"
+
+[links.agents-pr-land]
+source = "skills/pr-land"
+target = "~/.agents/skills/pr-land"
+description = "pr-land skill: drive a PR to green — fix checks, adjudicate bot/human review feedback, reply, push"
+
+[links.agents-azdo-pr]
+source = "skills/azdo-pr"
+target = "~/.agents/skills/azdo-pr"
+description = "azdo-pr skill: diagnose and locally fix the PR's Azure DevOps build (delegated to by pr-land)"
+
+[links.agents-pr-notebook]
+source = "skills/pr-notebook"
+target = "~/.agents/skills/pr-notebook"
+description = "pr-notebook skill: run a Databricks notebook against the PR's image, pinned by digest"
+
+[links.agents-azdo-then-notebook]
+source = "skills/azdo-then-notebook"
+target = "~/.agents/skills/azdo-then-notebook"
+description = "azdo-then-notebook skill: gate pr-notebook on a green azdo pipeline; chains azdo-pr → pr-notebook"
+
+[links.agents-knowledge-base-article]
+source = "skills/knowledge-base-article"
+target = "~/.agents/skills/knowledge-base-article"
+description = "knowledge-base-article skill: write a structured KBA into docs/, from one of four templates"
+
+[links.agents-topic-intro]
+source = "skills/topic-intro"
+target = "~/.agents/skills/topic-intro"
 description = "topic-intro skill: research and write a primer for learning a new topic"
 
 [links.adr-implementer]

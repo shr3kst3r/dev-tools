@@ -3,13 +3,16 @@
 The spine is the investigation loop, and the app is shaped around it: a list of
 recent DAG runs across every DAG on the left, and a detail pane that drills
 `run → task instances → log` on the right. `enter` goes in a level, `escape`
-comes back out, `<`/`>` step through a task's log attempts. The runs list is
-not a fixed window: moving the cursor near its bottom widens the poll's run
-window by a page, so older runs stream in as you scroll back — see
-`_maybe_extend_runs`. `i` hands the selected run to goblin-watcher: a worker
-gathers the run's metadata and task logs into a report file, then `gw scratch`
-is launched (app suspended — gw needs the real terminal) with a prompt to
-summarize it, change nothing, and wait.
+comes back out, `<`/`>` step through a task's log attempts. An open task list
+is refreshed by the poll exactly like the runs list is, so a running run's
+states keep up with it instead of freezing at the moment you drilled in — see
+`_refresh_drilled_tasks`. The runs list is not a fixed window: moving the
+cursor near its bottom widens the poll's run window by a page, so older runs
+stream in as you scroll back — see `_maybe_extend_runs`. `i` hands the
+selected run to goblin-watcher: a worker gathers the run's metadata and task
+logs into a report file, then `gw scratch` is launched (app suspended — gw
+needs the real terminal) with a prompt to summarize it, change nothing, and
+wait.
 
 Windowing follows my-prs: `d` cycles the detail pane through right of the list,
 below it, or hidden; `[` / `]` move the divider. Under the detail pane sits a
@@ -48,6 +51,7 @@ this module free of I/O and testable through `run_test()`.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, cast
@@ -587,6 +591,12 @@ class AirflowWatchApp(App[None]):
         self._investigating = False
         self._updated = datetime.now()
         self._polling = False
+        # True while the poll is re-fetching the task list of the run that is
+        # drilled into, so two refreshes of the same list can never overlap.
+        self._refreshing_tasks = False
+        # The last task-refresh failure already reported. A webserver that stays
+        # down would otherwise write one activity-log line per poll.
+        self._task_refresh_error: str | None = None
         # Bumped whenever the *target* of a poll changes (a deployment switch).
         # A poll carries the epoch it was started under, so a result that lands
         # after the target moved can be dropped instead of showing one
@@ -824,8 +834,10 @@ class AirflowWatchApp(App[None]):
         self._current_delay = self._delay_after(error)
         self._seconds_left = self._current_delay
         self._record_poll(snapshot, error)
+        self._resync_drilled_run()
         self._rebuild_table()
         self._refresh_view()
+        self._refresh_drilled_tasks()
 
     def _delay_after(self, error: PollError | None) -> int:
         """Seconds until the next poll.
@@ -1258,6 +1270,100 @@ class AirflowWatchApp(App[None]):
                     f"{run.dag_id}: showing {len(result.tasks)} of {result.total} "
                     "task instances — list truncated.",
                 )
+        self._refresh_view()
+
+    def _resync_drilled_run(self) -> None:
+        """Adopt the freshly polled copy of the run that is drilled into.
+
+        The run captured at drill-in never changes on its own, so without this
+        the header above a task list keeps calling a finished run `running`. A
+        run that has aged out of the poll's window keeps the copy it has —
+        stale beats empty.
+        """
+        run = self._drill.run
+        if run is None:
+            return
+        for fresh in self._runs:
+            if fresh.key == run.key:
+                if fresh != run:
+                    self._drill = replace(self._drill, run=fresh)
+                return
+
+    def _refresh_drilled_tasks(self) -> None:
+        """Re-fetch the task list of the run that is drilled into, each poll.
+
+        The drill-in fetch is a snapshot of a moving thing: sit in a running
+        run's task list and every state, try count and operator on screen is
+        frozen at the instant `enter` was pressed, while the started and
+        duration columns keep ticking against the clock — which reads as a live
+        list that is not one. So the poll refreshes it too, for as long as it
+        is on screen, and `r` therefore refreshes it as well.
+
+        The cost is one extra fetch per poll, and only while a task list is
+        actually being looked at: the DAG's structure is cached by the fetch
+        layer, so a repeat is just the task-instance pages.
+        """
+        deployment = self.deployment
+        run = self._drill.run
+        if deployment is None or self._fetch_tasks is None or run is None:
+            return
+        if not self._showing_tasks:
+            return
+        if self._refreshing_tasks:
+            return  # the previous refresh has not landed yet
+        if self._drill.level == "tasks" and self._drill.loading:
+            return  # the drill-in fetch is still in flight; it owns the list
+        self._refreshing_tasks = True
+        self.run_worker(
+            lambda: self._refresh_tasks_in_thread(deployment, run),
+            thread=True,
+            group="task-refresh",
+        )
+
+    def _refresh_tasks_in_thread(self, deployment: Deployment, run: DagRun) -> None:
+        assert self._fetch_tasks is not None
+        result, error = self._fetch_tasks(deployment, run)
+        self.call_from_thread(self._apply_task_refresh, run, result, error)
+
+    def _apply_task_refresh(
+        self,
+        run: DagRun,
+        result: RunTasks | None,
+        error: PollError | None,
+    ) -> None:
+        """Fold a refreshed task list into the drill-down in place.
+
+        Unlike the drill-in fetch this must not move the user: the level stays
+        (an open log stays open), the cursor stays on the task it was on —
+        `_rebuild_table` reseats it by key — and the `/` filter still applies.
+        A failed refresh keeps the last good list on screen and says so once,
+        not once per poll; a successful one clears a drill-in that had failed.
+        """
+        self._refreshing_tasks = False
+        drill = self._drill
+        if drill.run is None or drill.run.key != run.key or not self._showing_tasks:
+            return  # the user moved on while we were fetching
+        if error is not None or result is None:
+            message = error.message if error is not None else "No task instances."
+            if message != self._task_refresh_error:
+                self._task_refresh_error = message
+                self._append_log("warn", f"{run.dag_id}: task refresh — {message}")
+            return
+        self._task_refresh_error = None
+        task = drill.task
+        if task is not None:
+            # The open log's header is drawn from `drill.task`, so point it at
+            # the same task's fresh copy rather than the one drilled in with.
+            task = next((new for new in result.tasks if new.key == task.key), task)
+        self._drill = replace(
+            drill,
+            task=task,
+            tasks=result.tasks,
+            rows=result.rows,
+            tasks_total=result.total,
+            error=None,
+        )
+        self._rebuild_table()
         self._refresh_view()
 
     def _show_log_for_selected_task(self) -> None:

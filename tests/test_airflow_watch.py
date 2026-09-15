@@ -5491,6 +5491,169 @@ async def test_task_pane_warns_when_the_task_list_is_truncated() -> None:
         assert warning and "1 of 1500 task instances" in warning[-1].message
 
 
+# --- keeping an open task list live -----------------------------------------
+
+
+def _task_fetcher(
+    batches: list[list[TaskInstance] | PollError],
+    *,
+    graph: dict[str, tuple[str, ...]] | None = None,
+):
+    """A `fetch_tasks` that answers each call with the next batch, so a refresh
+    can be told apart from the drill-in fetch. The last batch repeats forever; a
+    `PollError` in place of a batch is returned as a failure."""
+    edges: dict[str, tuple[str, ...]] = (
+        graph if graph is not None else {"sensor": ("loader",), "loader": ()}
+    )
+    calls: list[int] = []
+
+    def fetch(_deployment, _run):
+        batch = batches[min(len(calls), len(batches) - 1)]
+        calls.append(1)
+        if isinstance(batch, PollError):
+            return None, batch
+        return (
+            astro.RunTasks(
+                tasks=tuple(batch),
+                rows=tuple(order_task_instances(list(batch), edges)),
+                total=len(batch),
+                truncated=False,
+                graph=edges,
+                calls=2,
+            ),
+            None,
+        )
+
+    return fetch, calls
+
+
+async def test_poll_refreshes_the_task_list_of_the_drilled_run() -> None:
+    """The drill-in fetch is a snapshot of a moving thing. Without a refresh the
+    states sit frozen while the duration column keeps ticking, which reads as a
+    live list that is not one."""
+    fetch, calls = _task_fetcher(
+        [
+            [_task("sensor", state="running"), _task("loader", state="queued")],
+            [_task("sensor", state="success"), _task("loader", state="running")],
+        ]
+    )
+    app = _app()
+    app._fetch_tasks = fetch
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("down")  # sit on the second task, not the first
+        await pilot.pause()
+        assert [row.task.state for row in app._drill.rows] == ["running", "queued"]
+        assert app._task_key is not None and app._task_key.startswith("loader")
+
+        app.action_poll_now()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert len(calls) == 2  # the poll re-fetched the open list
+        assert [row.task.state for row in app._drill.rows] == ["success", "running"]
+        # The refresh must not move the user: same level, same row.
+        assert app._drill.level == "tasks"
+        assert app._task_key is not None and app._task_key.startswith("loader")
+        assert "running" in _plain(app.query_one("#detail", Static))
+
+
+async def test_poll_does_not_refresh_tasks_outside_a_drill_down() -> None:
+    """The extra fetch is owed only to a task list actually on screen."""
+    fetch, calls = _task_fetcher([[_task("sensor")]])
+    app = _app()
+    app._fetch_tasks = fetch
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app.action_poll_now()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert calls == []
+
+
+async def test_poll_refresh_leaves_an_open_log_open() -> None:
+    """Refreshing the list under a log must not close the log — but the header
+    it draws from `drill.task` still catches up with the task's new state."""
+    fetch, _ = _task_fetcher(
+        [
+            [_task("sensor", state="running"), _task("loader", state="queued")],
+            [_task("sensor", state="failed"), _task("loader", state="queued")],
+        ]
+    )
+    app = _app()
+    app._fetch_tasks = fetch
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("enter")  # tasks
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("enter")  # log
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app._drill.level == "log"
+
+        app.action_poll_now()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app._drill.level == "log"
+        assert app._drill.log is not None
+        assert app._drill.task is not None and app._drill.task.state == "failed"
+
+
+async def test_task_refresh_failure_keeps_the_list_and_warns_once() -> None:
+    """A webserver that stays down must not cost the list on screen, nor write
+    one activity-log line per poll."""
+    error = PollError(message="Airflow exploded")
+    fetch, calls = _task_fetcher([[_task("sensor", state="running")], error])
+    app = _app()
+    app._fetch_tasks = fetch
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        for _ in range(2):
+            app.action_poll_now()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+        assert len(calls) == 3
+        assert [row.task.state for row in app._drill.rows] == ["running"]
+        warnings = [e for e in app.activity_log if "task refresh" in e.message]
+        assert len(warnings) == 1 and "Airflow exploded" in warnings[0].message
+
+
+async def test_poll_resyncs_the_run_the_task_list_belongs_to() -> None:
+    """The run captured at drill-in never changes on its own, so the header above
+    a task list would keep calling a finished run `running`."""
+    running = _run_("sync_beta", run_id="r-broken", state="running", start=NOW)
+    finished = _run_("sync_beta", run_id="r-broken", state="failed", start=NOW, end=NOW)
+    app = _app(
+        [
+            (_snapshot(runs=(running,)), None),
+            (_snapshot(runs=(finished,)), None),
+        ]
+    )
+    async with app.run_test(size=(150, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app._drill.run is not None and app._drill.run.state == "running"
+
+        app.action_poll_now()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app._drill.run is not None and app._drill.run.state == "failed"
+
+
 async def test_the_heartbeat_does_not_re_render_the_log_pane(monkeypatch) -> None:
     """A log pane has no clock in it, and laying out a large one measured ~330ms.
     Redrawing it every second would spend a third of a core on a body that cannot

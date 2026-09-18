@@ -24,6 +24,12 @@ Three things here are load-bearing and easy to get wrong by hand:
 3. **Bot finding bodies.** Cursor Bugbot and the Codex connector wrap their real
    content in HTML badges, tracking comments, and "Fix in Cursor" images. The
    parsers pull out title/severity/locations and drop the chrome.
+4. **Mergeability is two fields, and one of them lies at first.** A conflicted PR
+   can have every check green, so "no failing checks and no open threads" is not
+   the same as landable. `merge_state` folds `mergeable` and `mergeStateStatus`
+   into one verdict and, crucially, reports GitHub's transient `UNKNOWN` as
+   *waiting* rather than fine — that is the state a snapshot taken seconds after
+   a push lands in.
 
 Usage:
     pr_state.py                        # current branch's PR, human-readable
@@ -33,6 +39,7 @@ Usage:
     pr_state.py --unanswered           # only threads we have not replied to
     pr_state.py --include-resolved     # keep resolved threads in the output
     pr_state.py --exit-code            # 0 green · 1 actionable · 2 waiting · 3 error
+    pr_state.py --merge-only           # just the mergeability verdict
     pr_state.py --parse-file payload.json   # parse a saved payload, no network
 """
 
@@ -359,6 +366,36 @@ def effective_rollup(checks: list[dict[str, Any]]) -> str:
     return "NEUTRAL"
 
 
+# --- mergeability -------------------------------------------------------------
+#
+# `mergeable` answers "does this merge cleanly?" — MERGEABLE / CONFLICTING /
+# UNKNOWN — and GitHub computes it in the background, so it is UNKNOWN for the
+# first seconds after a push. `mergeStateStatus` is the merge-button state:
+# DIRTY (conflicts), BEHIND (base moved, and the branch protection wants the
+# branch up to date), BLOCKED (a required review or check), UNSTABLE (a
+# non-required check is failing), CLEAN, DRAFT. Neither field is sufficient
+# alone, and reading UNKNOWN as "fine" is how a loop declares a conflicted PR
+# green.
+
+
+def merge_state(pr: dict[str, Any]) -> dict[str, Any]:
+    """Fold GitHub's two mergeability fields into one verdict. Pure."""
+    mergeable = (pr.get("mergeable") or "UNKNOWN").upper()
+    status = (pr.get("mergeStateStatus") or "UNKNOWN").upper()
+    conflicted = mergeable == "CONFLICTING" or status == "DIRTY"
+    return {
+        "mergeable": mergeable,
+        "stateStatus": status,
+        "conflicted": conflicted,
+        "behind": status == "BEHIND",
+        "blocked": status == "BLOCKED",
+        "clean": mergeable == "MERGEABLE" and status == "CLEAN",
+        # Never "unknown" once we know it conflicts — CONFLICTING with an
+        # unresolved state status is a conflict, not a pending computation.
+        "unknown": not conflicted and "UNKNOWN" in (mergeable, status),
+    }
+
+
 def group_azdo_builds(checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Collapse azdo CheckRuns into one entry per buildId, worst state wins."""
     builds: dict[str, dict[str, Any]] = {}
@@ -646,6 +683,8 @@ def parse_pr_state(
     for check in checks:
         by_state[check["state"]].append(check)
 
+    merge = merge_state(pr)
+
     by_source: dict[str, int] = {}
     for finding in findings:
         by_source[finding.source] = by_source.get(finding.source, 0) + 1
@@ -687,6 +726,7 @@ def parse_pr_state(
             "neutral": by_state["neutral"],
             "azdoBuilds": group_azdo_builds(checks),
         },
+        "merge": merge,
         "reviews": reviews,
         "threads": [f.as_dict() for f in findings],
         "summary": {
@@ -694,8 +734,16 @@ def parse_pr_state(
             "pendingChecks": len(by_state["pending"]),
             "openThreads": len(findings),
             "threadsBySource": by_source,
-            "actionable": bool(by_state["failing"]) or bool(findings),
-            "waiting": not by_state["failing"] and not findings and bool(by_state["pending"]),
+            "conflicted": merge["conflicted"],
+            "actionable": bool(by_state["failing"]) or bool(findings) or merge["conflicted"],
+            # A PR whose mergeability GitHub has not computed yet is not green;
+            # it is the same "come back in a minute" as an in-flight check.
+            "waiting": (
+                not by_state["failing"]
+                and not findings
+                and not merge["conflicted"]
+                and (bool(by_state["pending"]) or merge["unknown"])
+            ),
         },
     }
 
@@ -750,14 +798,22 @@ _MARK = {"failing": "✗", "pending": "…", "passing": "✓", "neutral": "-"}
 def render(state: dict[str, Any]) -> str:
     pr = state["pr"]
     checks = state["checks"]
+    merge = state["merge"]
     lines: list[str] = []
     draft = " [draft]" if pr["isDraft"] else ""
     lines.append(f"PR #{pr['number']}{draft} — {pr['title']}")
     lines.append(f"  {pr['url']}")
     lines.append(
         f"  branch {pr['branch']} → {pr['base']} @ {(pr['headSha'] or '')[:7]}"
-        f" · review={pr['reviewDecision'] or 'NONE'} · mergeable={pr['mergeable']}"
+        f" · review={pr['reviewDecision'] or 'NONE'}"
+        f" · merge={merge['mergeable']}/{merge['stateStatus']}"
     )
+    if merge["conflicted"]:
+        lines.append(f"  ✗ CONFLICTS with {pr['base']} — must be resolved before anything else")
+    elif merge["behind"]:
+        lines.append(f"  ! behind {pr['base']} — update the branch before merging")
+    elif merge["unknown"]:
+        lines.append("  … mergeability not computed yet — re-check in a minute")
     counts = checks["counts"]
     lines.append("")
     lines.append(
@@ -823,6 +879,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="exit 0 green · 1 actionable · 2 waiting on in-flight checks",
     )
+    ap.add_argument(
+        "--merge-only",
+        action="store_true",
+        help="print only the mergeability verdict (with --json, only that block)",
+    )
     ap.add_argument("--parse-file", help="parse a saved GraphQL payload instead of querying")
     args = ap.parse_args(argv)
 
@@ -846,7 +907,23 @@ def main(argv: list[str] | None = None) -> int:
         print(f"pr_state: {exc}", file=sys.stderr)
         return EXIT_ERROR
 
-    print(json.dumps(state, indent=2) if args.json else render(state))
+    if args.merge_only:
+        merge = state["merge"]
+        if args.json:
+            print(json.dumps(merge, indent=2))
+        else:
+            verdict = (
+                "CONFLICTED"
+                if merge["conflicted"]
+                else "UNKNOWN"
+                if merge["unknown"]
+                else "CLEAN"
+                if merge["clean"]
+                else merge["stateStatus"]
+            )
+            print(f"{verdict} (mergeable={merge['mergeable']} state={merge['stateStatus']})")
+    else:
+        print(json.dumps(state, indent=2) if args.json else render(state))
 
     if not args.exit_code:
         return EXIT_GREEN

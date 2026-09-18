@@ -300,7 +300,7 @@ def _thread(
     }
 
 
-def _payload(threads, checks=None):
+def _payload(threads, checks=None, mergeable="MERGEABLE", merge_state_status="BLOCKED"):
     return {
         "data": {
             "viewer": {"login": "shr3kst3r"},
@@ -315,8 +315,8 @@ def _payload(threads, checks=None):
                     "headRefName": "feat-79",
                     "headRefOid": "7569409" + "0" * 33,
                     "updatedAt": "2026-07-29T18:01:53Z",
-                    "mergeable": "MERGEABLE",
-                    "mergeStateStatus": "BLOCKED",
+                    "mergeable": mergeable,
+                    "mergeStateStatus": merge_state_status,
                     "reviewDecision": "APPROVED",
                     "author": {"login": "shr3kst3r"},
                     "commits": {
@@ -396,6 +396,7 @@ def test_parse_pr_state_end_to_end():
         "pendingChecks": 0,
         "openThreads": 3,
         "threadsBySource": {"human": 1, "codex": 1, "cursor": 1},
+        "conflicted": False,
         "actionable": True,
         "waiting": False,
     }
@@ -440,6 +441,59 @@ def test_green_pr_is_neither_actionable_nor_waiting():
     )
     summary = ps.parse_pr_state(payload)["summary"]
     assert (summary["actionable"], summary["waiting"]) == (False, False)
+
+
+# --- mergeability -------------------------------------------------------------
+
+
+def test_merge_state_reads_conflicts_from_either_field():
+    """GitHub sets DIRTY and CONFLICTING together, but not always at once."""
+    assert ps.merge_state({"mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY"})["conflicted"]
+    assert ps.merge_state({"mergeable": "CONFLICTING", "mergeStateStatus": "UNKNOWN"})["conflicted"]
+    assert ps.merge_state({"mergeable": "UNKNOWN", "mergeStateStatus": "DIRTY"})["conflicted"]
+    assert not ps.merge_state({"mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"})["conflicted"]
+
+
+def test_merge_state_known_conflict_is_never_also_unknown():
+    merge = ps.merge_state({"mergeable": "CONFLICTING", "mergeStateStatus": "UNKNOWN"})
+    assert (merge["conflicted"], merge["unknown"]) == (True, False)
+
+
+def test_merge_state_clean_requires_both_fields():
+    assert ps.merge_state({"mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"})["clean"]
+    assert not ps.merge_state({"mergeable": "MERGEABLE", "mergeStateStatus": "BEHIND"})["clean"]
+    assert ps.merge_state({"mergeable": "MERGEABLE", "mergeStateStatus": "BEHIND"})["behind"]
+
+
+def test_merge_state_defaults_to_unknown_when_the_fields_are_absent():
+    merge = ps.merge_state({})
+    assert (merge["mergeable"], merge["stateStatus"]) == ("UNKNOWN", "UNKNOWN")
+    assert merge["unknown"] is True
+
+
+def test_conflicted_pr_is_actionable_even_with_everything_green():
+    payload = _payload(
+        threads=[],
+        checks=[_check_run("Test", "SUCCESS", started="2026-07-28T17:00:00Z")],
+        mergeable="CONFLICTING",
+        merge_state_status="DIRTY",
+    )
+    state = ps.parse_pr_state(payload)
+    assert state["merge"]["conflicted"] is True
+    assert state["summary"]["conflicted"] is True
+    assert (state["summary"]["actionable"], state["summary"]["waiting"]) == (True, False)
+
+
+def test_uncomputed_mergeability_counts_as_waiting_not_green():
+    """The state a snapshot taken seconds after a push lands in."""
+    payload = _payload(
+        threads=[],
+        checks=[_check_run("Test", "SUCCESS", started="2026-07-28T17:00:00Z")],
+        mergeable="UNKNOWN",
+        merge_state_status="UNKNOWN",
+    )
+    summary = ps.parse_pr_state(payload)["summary"]
+    assert (summary["actionable"], summary["waiting"]) == (False, True)
 
 
 def test_thread_with_no_comments_is_skipped():
@@ -488,6 +542,40 @@ def test_main_exit_codes_from_a_saved_payload(tmp_path, capsys):
     assert ps.main(["--parse-file", str(waiting), "--exit-code"]) == ps.EXIT_WAITING
 
 
+def test_main_exit_code_is_actionable_for_a_conflicted_green_pr(tmp_path, capsys):
+    payload = tmp_path / "conflicted.json"
+    payload.write_text(
+        json.dumps(
+            _payload(
+                threads=[],
+                checks=[_check_run("T", "SUCCESS", started="2026-07-28T00:00:00Z")],
+                mergeable="CONFLICTING",
+                merge_state_status="DIRTY",
+            )
+        ),
+        encoding="utf-8",
+    )
+    assert ps.main(["--parse-file", str(payload), "--exit-code"]) == ps.EXIT_ACTIONABLE
+    assert "CONFLICTS with main" in capsys.readouterr().out
+
+
+def test_main_merge_only_prints_just_the_verdict(tmp_path, capsys):
+    payload = tmp_path / "conflicted.json"
+    payload.write_text(
+        json.dumps(
+            _payload(threads=[], mergeable="CONFLICTING", merge_state_status="DIRTY")
+        ),
+        encoding="utf-8",
+    )
+    ps.main(["--parse-file", str(payload), "--merge-only"])
+    out = capsys.readouterr().out
+    assert out.startswith("CONFLICTED")
+    assert "Open threads" not in out
+
+    ps.main(["--parse-file", str(payload), "--merge-only", "--json"])
+    assert json.loads(capsys.readouterr().out)["conflicted"] is True
+
+
 def test_main_reports_missing_file_as_error(capsys):
     assert ps.main(["--parse-file", "/nonexistent/payload.json"]) == ps.EXIT_ERROR
     assert "pr_state:" in capsys.readouterr().err
@@ -505,6 +593,13 @@ def test_render_flags_the_stale_rollup_discrepancy():
     assert "stale re-run duplicate(s) ignored" in text
     assert "Open threads: 1" in text
     assert "FF silver table resolution crashes" in text
+
+
+def test_render_flags_a_branch_that_is_merely_behind_the_base():
+    payload = _payload(threads=[], merge_state_status="BEHIND")
+    text = ps.render(ps.parse_pr_state(payload))
+    assert "behind main" in text
+    assert "CONFLICTS" not in text
 
 
 def test_render_stays_quiet_when_a_pr_has_no_checks_at_all():

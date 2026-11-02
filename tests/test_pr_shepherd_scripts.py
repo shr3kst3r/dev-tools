@@ -400,18 +400,26 @@ def test_settled_requires_everything_quiet_and_then_names_who_to_re_request():
 
     requested = _view(_payload(reviews=reviews, comments=[marker], requested=["carol"]))
     assert requested["shepherd"]["summary"]["status"] == "settled"
-    assert requested["shepherd"]["summary"]["done"] is False
+    assert requested["shepherd"]["summary"]["approved"] is False
 
 
-def test_done_needs_a_human_approval_not_a_machine_one():
+def test_approved_needs_a_human_approval_not_a_machine_one_and_is_not_an_ending():
     marker = _comment(VIEWER, "<!-- pr-shepherd: started 2026-11-02T12:00:00Z -->")
     machine = _view(_payload(reviews=[_review("carol", "APPROVED", AUTO_APPROVE)], comments=[marker]))
-    assert machine["shepherd"]["summary"]["done"] is False
+    assert machine["shepherd"]["summary"]["approved"] is False
     assert machine["shepherd"]["summary"]["noReviewer"] is True
 
     human = _view(_payload(reviews=[_review("dave", "APPROVED")], comments=[marker], review_decision="APPROVED"))
-    assert human["shepherd"]["summary"]["done"] is True
-    assert human["shepherd"]["summary"]["status"] == "done"
+    summary = human["shepherd"]["summary"]
+    assert (summary["approved"], summary["merged"], summary["status"]) == (True, False, "approved")
+    assert ss.exit_code_for(human) == ss.EXIT_SETTLED  # nothing to do but keep polling
+
+    # Approved, then the base moved: back to work, approval or not.
+    behind = _view(
+        _payload(reviews=[_review("dave", "APPROVED")], comments=[marker], review_decision="APPROVED", merge_state_status="BEHIND")
+    )
+    assert behind["shepherd"]["summary"]["status"] == "actionable"
+    assert behind["shepherd"]["summary"]["approved"] is False
 
     overruled = _view(
         _payload(
@@ -420,21 +428,28 @@ def test_done_needs_a_human_approval_not_a_machine_one():
             review_decision="CHANGES_REQUESTED",
         )
     )
-    assert overruled["shepherd"]["summary"]["done"] is False
+    assert overruled["shepherd"]["summary"]["approved"] is False
 
 
-def test_status_expired_beats_actionable_but_not_done_or_closed():
+def test_status_expired_beats_everything_but_merged_or_closed():
     old = _comment(VIEWER, "<!-- pr-shepherd: started 2026-10-20T00:00:00Z deadline 2026-10-27T00:00:00Z -->")
     expired = _view(_payload(threads=[_thread("T1", "carol", "hm")], comments=[old]))
     assert expired["shepherd"]["summary"]["status"] == "expired"
     assert ss.exit_code_for(expired) == ss.EXIT_EXPIRED
 
-    done_late = _view(_payload(reviews=[_review("dave", "APPROVED")], comments=[old], review_decision="APPROVED"))
-    assert done_late["shepherd"]["summary"]["status"] == "done"
+    # Approved but never merged by the deadline is still giving up — that is the report the user needs.
+    approved_late = _view(_payload(reviews=[_review("dave", "APPROVED")], comments=[old], review_decision="APPROVED"))
+    assert approved_late["shepherd"]["summary"]["status"] == "expired"
+    assert approved_late["shepherd"]["summary"]["approved"] is True
 
-    closed = _view(_payload(threads=[_thread("T1", "carol", "hm")], comments=[old], state="MERGED"))
+    merged = _view(_payload(threads=[_thread("T1", "carol", "hm")], comments=[old], state="MERGED"))
+    assert merged["shepherd"]["summary"]["status"] == "merged"
+    assert (merged["shepherd"]["summary"]["merged"], merged["shepherd"]["summary"]["closed"]) == (True, True)
+    assert ss.exit_code_for(merged) == ss.EXIT_SETTLED
+
+    closed = _view(_payload(threads=[_thread("T1", "carol", "hm")], comments=[old], state="CLOSED"))
     assert closed["shepherd"]["summary"]["status"] == "closed"
-    assert closed["shepherd"]["summary"]["done"] is True
+    assert closed["shepherd"]["summary"]["merged"] is False
 
 
 def test_view_carries_the_stack_and_leaves_pr_state_fields_intact():

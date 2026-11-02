@@ -23,6 +23,10 @@ them from the same payload:
    CHANGES_REQUESTED get asked again. A pending request shows up in
    `reviewRequests` until they act, which is what keeps this idempotent.
 
+An approval is a state here, not an ending. The shepherd runs until the PR is
+merged (or closed) or the deadline passes, because an approved PR can still go
+stale, conflict, or pick up another review round before anyone presses merge.
+
 Everything here is pure given the payload plus three facts the I/O boundary
 supplies (`now`, the default branch, the PR open against the base branch), so
 `--parse-file` reproduces any decision offline.
@@ -33,8 +37,8 @@ Usage:
     shepherd_state.py --pr 635 --repo owner/name
     shepherd_state.py --ensure-started      # post the start marker if missing
     shepherd_state.py --deadline-days 7     # how long before it gives up
-    shepherd_state.py --exit-code           # 0 settled · 1 actionable · 2 waiting
-                                            # 3 error · 4 deadline passed
+    shepherd_state.py --exit-code           # 0 settled/approved/merged · 1 actionable
+                                            # 2 waiting · 3 error · 4 deadline passed
     shepherd_state.py --parse-file p.json --now 2026-11-03T00:00:00Z \\
         --default-branch main --base-pr '{"number": 635, "state": "OPEN"}'
 """
@@ -344,8 +348,9 @@ def shepherd_view(
     deadline = deadline_view(comments, viewer, now=now, deadline_days=deadline_days)
     stack = stack_view(pr, default_branch=default_branch, base_pr=base_pr)
 
-    closed = pr.get("state") in ("MERGED", "CLOSED")
-    done = closed or (
+    merged = pr.get("state") == "MERGED"
+    closed = merged or pr.get("state") == "CLOSED"
+    approved = (
         settled
         and bool(reviewers["humanApprovals"])
         and pr.get("reviewDecision") != "CHANGES_REQUESTED"
@@ -358,16 +363,21 @@ def shepherd_view(
         or reviewers["needsReRequest"]
     )
     waiting = not actionable and (bool(pending) or merge["unknown"])
-    if closed:
+    # Merged or closed ends the run whatever else is true; the deadline ends it
+    # next, even for an approved PR nobody has merged — that is the report the
+    # user needs. Everything else is a state the loop keeps working from.
+    if merged:
+        status = "merged"
+    elif closed:
         status = "closed"
-    elif deadline["expired"] and not done:
+    elif deadline["expired"]:
         status = "expired"
-    elif done:
-        status = "done"
     elif actionable:
         status = "actionable"
     elif waiting:
         status = "waiting"
+    elif approved:
+        status = "approved"
     else:
         status = "settled"
 
@@ -391,7 +401,9 @@ def shepherd_view(
         "summary": {
             "status": status,
             "settled": settled,
-            "done": done,
+            "approved": approved,
+            "merged": merged,
+            "closed": closed,
             "actionable": actionable,
             "waiting": waiting,
             "expired": deadline["expired"],
@@ -407,6 +419,8 @@ def shepherd_view(
 
 def exit_code_for(view: dict[str, Any]) -> int:
     summary = view["shepherd"]["summary"]
+    if summary["status"] in ("merged", "closed"):
+        return EXIT_SETTLED
     if summary["status"] == "expired":
         return EXIT_EXPIRED
     if summary["actionable"]:
@@ -516,7 +530,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--pr", type=int, help="PR number (default: current branch's PR)")
     ap.add_argument("--repo", help="owner/name (default: detect via gh)")
     ap.add_argument("--json", action="store_true", help="emit JSON instead of a report")
-    ap.add_argument("--exit-code", action="store_true", help="0 settled · 1 actionable · 2 waiting · 4 deadline passed")
+    ap.add_argument(
+        "--exit-code",
+        action="store_true",
+        help="0 settled, approved or merged · 1 actionable · 2 waiting · 4 deadline passed",
+    )
     ap.add_argument(
         "--deadline-days",
         type=float,

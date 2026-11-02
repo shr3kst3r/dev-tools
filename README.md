@@ -353,9 +353,10 @@ agents/
 `pr-shepherd` is `pr-land` with a week-long horizon: it closes every review
 thread with a fix or an evidence-backed reply (human threads included), answers
 review bots that post from a person's account round after round, merges a moving
-base forward, re-requests review once everything is addressed, and Slacks you
-when a finding needs your call or when it gives up. Its clock lives in a marker
-comment on the PR, so a restarted session resumes where it left off.
+base forward, re-requests review once everything is addressed, keeps going
+after an approval until the PR is actually merged or seven days are up, and
+Slacks you when a finding needs your call or when it gives up. Its clock lives
+in a marker comment on the PR, so a restarted session resumes where it left off.
 
 The last two are writing skills rather than workflow ones.
 `knowledge-base-article` classifies a topic as how-to / conceptual /

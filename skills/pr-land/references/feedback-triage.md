@@ -75,7 +75,16 @@ Source changes the prior, never the standard of evidence:
 - **Humans** get deference on intent, product behavior, and taste — they know why
   the code exists. They are still wrong about mechanics sometimes. When declining
   a human, reply with the evidence and **leave the thread open**; resolving a
-  person's disagreement on your own PR is not yours to do.
+  person's disagreement on your own PR is not yours to do. (`/pr-shepherd`
+  resolves it anyway, under a two-strikes rule — its contract is zero open
+  threads; see `skills/pr-shepherd/references/closing-threads.md`.)
+- **Review bots run from a person's account** (`review-bot`) post round after
+  round with `important` / `question` / `nit` labels. `important` findings are
+  as good as Bugbot's crash paths and better at cross-file reasoning within one
+  repo; they are blind across repos, so a cross-repo claim marked "unverified"
+  is yours to verify, not to concede. `question`s want an answer, not a change.
+  Four in ten findings are nits. They also flip-flop between rounds and re-find
+  code the PR below a stacked PR introduced — both are `DECLINE` with a link.
 - **Cursor Bugbot** (`cursor`) is good at real crash paths and null-handling, and
   weak at cross-file reasoning — it confidently attributes methods to the wrong
   class. Its `**High Severity**` label is a claim, not a finding. Check the class

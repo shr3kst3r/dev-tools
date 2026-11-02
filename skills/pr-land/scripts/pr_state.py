@@ -30,6 +30,15 @@ Three things here are load-bearing and easy to get wrong by hand:
    into one verdict and, crucially, reports GitHub's transient `UNKNOWN` as
    *waiting* rather than fine — that is the state a snapshot taken seconds after
    a push lands in.
+5. **Review bots that post from a person's account.** A reviewer can run a
+   review skill under their own login, so `author.login` says "human" and only
+   the comment body says "machine". `classify_comment` reads the body's markers
+   (`<!-- deliver-review -->`, the `**important:**` / `**question:**` /
+   `**nit:**` label) and files those threads under `review-bot`; the matching
+   review submissions carry a round number, the commit they reviewed, and the
+   findings they posted *outside* the diff (which never become threads). An
+   approval tagged `pr-gate: auto-approve` is a machine approval and is marked as
+   one — it is not the human sign-off a PR needs.
 
 Usage:
     pr_state.py                        # current branch's PR, human-readable
@@ -83,6 +92,24 @@ SOURCE_CURSOR = "cursor"
 SOURCE_CODEX = "codex"
 SOURCE_BOT = "bot"
 SOURCE_HUMAN = "human"
+SOURCE_REVIEW_BOT = "review-bot"
+
+# Markers a review skill run from a *human's* account leaves behind. The login
+# cannot tell these apart from the same person reviewing by hand, so every one
+# of them is keyed on the body, never on the author.
+_REVIEW_BOT_THREAD_MARK = re.compile(r"<!--\s*deliver-review\s*-->")
+_REVIEW_BOT_BUILD_MARK = re.compile(r"<!--\s*deliver-review-build:[^>]*-->")
+_REVIEW_BOT_ROUND = re.compile(
+    r"<!--\s*deliver-review:\s*round\s+(?P<round>\d+),\s*(?P<sha>[0-9a-fA-F]{7,40})\s*-->"
+)
+_REVIEW_BOT_AUTO_APPROVE = re.compile(r"<!--\s*pr-gate:\s*auto-approve\s*-->")
+_REVIEW_BOT_LABEL = re.compile(r"^\s*\*\*(?P<label>important|question|nit):\*\*\s*", re.IGNORECASE)
+_REVIEW_BOT_TRACE = re.compile(r"^_TRACED\s*[·•]\s*\w+_\s*$", re.MULTILINE)
+_OUTSIDE_DIFF_HEADER = re.compile(r"^On lines outside the diff:\s*$", re.MULTILINE)
+_OUTSIDE_DIFF_BULLET = re.compile(
+    r"^-\s+\*\*(?P<label>important|question|nit):\*\*\s+`(?P<path>[^`\s]+?):(?P<line>\d+)`\s*(?P<text>.*)$",
+    re.IGNORECASE,
+)
 
 # --- the query ----------------------------------------------------------------
 
@@ -133,8 +160,20 @@ query($owner: String!, $repo: String!, $pr: Int!) {
           }
         }
       }
+      reviewRequests(first: 20) {
+        nodes {
+          requestedReviewer {
+            __typename
+            ... on User { login }
+            ... on Team { name }
+          }
+        }
+      }
       reviews(first: 50) {
         nodes { author { login } state submittedAt body }
+      }
+      comments(last: 100) {
+        nodes { author { login } createdAt body }
       }
       reviewThreads(first: 100) {
         nodes {
@@ -195,6 +234,7 @@ class Finding:
     comment_count: int = 0
     last_author: str | None = None
     answered_by_viewer: bool = False
+    viewer_has_last_word: bool = False
     reviewed_commit: str | None = None
     bug_id: str | None = None
     references: list[str] = field(default_factory=list)
@@ -216,6 +256,7 @@ class Finding:
             "commentCount": self.comment_count,
             "lastAuthor": self.last_author,
             "answeredByViewer": self.answered_by_viewer,
+            "viewerHasLastWord": self.viewer_has_last_word,
             "reviewedCommit": self.reviewed_commit,
             "bugId": self.bug_id,
             "references": self.references,
@@ -234,6 +275,30 @@ def classify_author(login: str | None) -> str:
     if lowered in OTHER_BOT_LOGINS or lowered.endswith("[bot]"):
         return SOURCE_BOT
     return SOURCE_HUMAN
+
+
+def is_review_bot_body(body: str | None) -> bool:
+    """True when a comment body carries a review skill's markers.
+
+    Either the hidden `<!-- deliver-review -->` tag or the leading
+    `**important:**` / `**question:**` / `**nit:**` label is enough: the tag is
+    what the skill posts, the label is what survives if someone strips the HTML.
+    """
+    if not body:
+        return False
+    return bool(_REVIEW_BOT_THREAD_MARK.search(body) or _REVIEW_BOT_LABEL.match(body))
+
+
+def classify_comment(login: str | None, body: str | None) -> str:
+    """Classify a thread's first comment by author *and* body.
+
+    The body wins: a review bot run from a person's account is still a bot, and
+    the same person's hand-written comment on the next line is still a human.
+    """
+    source = classify_author(login)
+    if source == SOURCE_HUMAN and is_review_bot_body(body):
+        return SOURCE_REVIEW_BOT
+    return source
 
 
 def parse_azdo_details_url(url: str | None) -> dict[str, str] | None:
@@ -549,6 +614,85 @@ def parse_codex_body(body: str) -> dict[str, Any]:
     }
 
 
+def parse_review_bot_body(body: str) -> dict[str, Any]:
+    """Extract label / prose from a finding a review skill posted inline.
+
+    The shape is `**<label>:** <prose>` followed by a `_TRACED · engine_` line and
+    the hidden marker. The label becomes `severity` so it sorts with the other
+    sources' labels: `important` outranks `question` outranks `nit`.
+    """
+    label = None
+    text = body
+    match = _REVIEW_BOT_LABEL.match(body)
+    if match:
+        label = match.group("label").lower()
+        text = body[match.end() :]
+    text = _REVIEW_BOT_TRACE.sub("", text)
+    cleaned = strip_chrome(text)
+    return {
+        "title": _first_sentence(cleaned),
+        "severity": label,
+        "body": cleaned,
+        "locations": [],
+        "reviewed_commit": None,
+        "bug_id": None,
+        "references": [],
+    }
+
+
+def parse_outside_diff(body: str) -> list[dict[str, Any]]:
+    """Pull the findings a review skill lists *in the review body* for lines
+    outside the diff.
+
+    GitHub only lets a review comment on lines the diff touches, so a skill that
+    finds something elsewhere has nowhere to put it but the review's own body,
+    under `On lines outside the diff:`, one bullet per finding. These never
+    become threads — nothing to resolve — so a loop whose goal is "no open
+    feedback" has to find them here and answer them in a PR comment.
+    """
+    header = _OUTSIDE_DIFF_HEADER.search(body)
+    if not header:
+        return []
+    findings: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for raw in body[header.end() :].splitlines():
+        line = raw.rstrip()
+        if line.startswith("<!--") or line.startswith("<details"):
+            break
+        bullet = _OUTSIDE_DIFF_BULLET.match(line)
+        if bullet:
+            current = {
+                "severity": bullet.group("label").lower(),
+                "path": bullet.group("path"),
+                "line": int(bullet.group("line")),
+                "body": bullet.group("text").strip(),
+            }
+            findings.append(current)
+        elif current is not None and line.strip():
+            current["body"] = (current["body"] + "\n" + line.strip()).strip()
+    for finding in findings:
+        finding["title"] = _first_sentence(finding["body"])
+    return findings
+
+
+def parse_review(node: dict[str, Any]) -> dict[str, Any]:
+    """Normalize one review submission, telling machine reviews from human ones."""
+    body = node.get("body") or ""
+    round_match = _REVIEW_BOT_ROUND.search(body)
+    auto_approve = bool(_REVIEW_BOT_AUTO_APPROVE.search(body))
+    machine = auto_approve or bool(round_match) or bool(_REVIEW_BOT_BUILD_MARK.search(body))
+    return {
+        "author": ((node.get("author") or {}).get("login")) or "",
+        "state": node.get("state"),
+        "submittedAt": node.get("submittedAt"),
+        "machine": machine,
+        "autoApprove": auto_approve,
+        "round": int(round_match.group("round")) if round_match else None,
+        "reviewedCommit": round_match.group("sha") if round_match else None,
+        "outsideDiff": parse_outside_diff(body) if machine else [],
+    }
+
+
 def parse_human_body(body: str) -> dict[str, Any]:
     cleaned = strip_chrome(body)
     return {
@@ -577,12 +721,14 @@ def parse_thread(thread: dict[str, Any], viewer: str | None) -> Finding | None:
         return None
     first = comments[0]
     author = ((first.get("author") or {}).get("login")) or ""
-    source = classify_author(author)
     body = first.get("body") or ""
+    source = classify_comment(author, body)
     if source == SOURCE_CURSOR:
         parsed = parse_cursor_body(body)
     elif source == SOURCE_CODEX:
         parsed = parse_codex_body(body)
+    elif source == SOURCE_REVIEW_BOT:
+        parsed = parse_review_bot_body(body)
     else:
         parsed = parse_human_body(body)
 
@@ -597,6 +743,7 @@ def parse_thread(thread: dict[str, Any], viewer: str | None) -> Finding | None:
     later_authors = [
         ((c.get("author") or {}).get("login") or "").lower() for c in comments[1:]
     ]
+    last_author = ((comments[-1].get("author") or {}).get("login")) or None
     return Finding(
         thread_id=thread.get("id") or "",
         source=source,
@@ -611,8 +758,9 @@ def parse_thread(thread: dict[str, Any], viewer: str | None) -> Finding | None:
         outdated=bool(thread.get("isOutdated")),
         locations=locations,
         comment_count=len(comments),
-        last_author=((comments[-1].get("author") or {}).get("login")) or None,
+        last_author=last_author,
         answered_by_viewer=bool(viewer_lower) and viewer_lower in later_authors,
+        viewer_has_last_word=bool(viewer_lower) and (last_author or "").lower() == viewer_lower,
         reviewed_commit=parsed["reviewed_commit"],
         bug_id=parsed["bug_id"],
         references=parsed["references"],
@@ -623,10 +771,13 @@ _SEVERITY_RANK = {
     "critical": 0,
     "high": 1,
     "p1": 1,
+    "important": 1,
     "medium": 2,
     "p2": 2,
+    "question": 2,
     "low": 3,
     "p3": 3,
+    "nit": 3,
     None: 4,
 }
 
@@ -689,13 +840,22 @@ def parse_pr_state(
     for finding in findings:
         by_source[finding.source] = by_source.get(finding.source, 0) + 1
 
-    reviews = [
+    reviews = [parse_review(r) for r in ((pr.get("reviews") or {}).get("nodes") or [])]
+
+    requested: list[str] = []
+    for node in ((pr.get("reviewRequests") or {}).get("nodes") or []):
+        who = node.get("requestedReviewer") or {}
+        name = who.get("login") or who.get("name")
+        if name:
+            requested.append(name)
+
+    comments = [
         {
-            "author": ((r.get("author") or {}).get("login")) or "",
-            "state": r.get("state"),
-            "submittedAt": r.get("submittedAt"),
+            "author": ((c.get("author") or {}).get("login")) or "",
+            "createdAt": c.get("createdAt"),
+            "body": c.get("body") or "",
         }
-        for r in ((pr.get("reviews") or {}).get("nodes") or [])
+        for c in ((pr.get("comments") or {}).get("nodes") or [])
     ]
 
     return {
@@ -714,6 +874,7 @@ def parse_pr_state(
             "mergeable": pr.get("mergeable"),
             "mergeStateStatus": pr.get("mergeStateStatus"),
             "reviewDecision": pr.get("reviewDecision"),
+            "requestedReviewers": requested,
         },
         "checks": {
             "reportedRollup": rollup.get("state"),
@@ -728,6 +889,7 @@ def parse_pr_state(
         },
         "merge": merge,
         "reviews": reviews,
+        "comments": comments,
         "threads": [f.as_dict() for f in findings],
         "summary": {
             "failingChecks": len(by_state["failing"]),

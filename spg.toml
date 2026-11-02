@@ -117,6 +117,11 @@ source = "skills/pr-land"
 target = "~/.claude/skills/"
 description = "pr-land skill: drive a PR to green — fix checks, adjudicate bot/human review feedback, reply, push"
 
+[links.pr-shepherd]
+source = "skills/pr-shepherd"
+target = "~/.claude/skills/"
+description = "pr-shepherd skill: tend a PR for days — close every thread, ride review-bot rounds and stacked bases, re-request review, Slack when stuck"
+
 [links.azdo-pr]
 source = "skills/azdo-pr"
 target = "~/.claude/skills/"
@@ -164,6 +169,11 @@ source = "skills/pr-land"
 target = "~/.agents/skills/pr-land"
 description = "pr-land skill: drive a PR to green — fix checks, adjudicate bot/human review feedback, reply, push"
 
+[links.agents-pr-shepherd]
+source = "skills/pr-shepherd"
+target = "~/.agents/skills/pr-shepherd"
+description = "pr-shepherd skill: tend a PR for days — close every thread, ride review-bot rounds and stacked bases, re-request review, Slack when stuck"
+
 [links.agents-azdo-pr]
 source = "skills/azdo-pr"
 target = "~/.agents/skills/azdo-pr"
@@ -202,7 +212,7 @@ description = "adr-rpi review phase subagent (Opus, xhigh effort) — adr-rpi ca
 [links.pr-feedback-judge]
 source = "agents/pr-feedback-judge.md"
 target = "~/.claude/agents/pr-feedback-judge.md"
-description = "pr-land's review-feedback adjudicator (Opus, high effort) — verifies each bot/human finding before pr-land changes code"
+description = "pr-land / pr-shepherd review-feedback adjudicator (Opus, high effort) — verifies each bot/human finding before either loop changes code"
 
 # Not a skill or an agent: the status line is a script Claude Code shells out to
 # on every render. The link only puts the file where settings.json expects it —

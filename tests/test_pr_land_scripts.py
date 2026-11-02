@@ -608,3 +608,114 @@ def test_render_stays_quiet_when_a_pr_has_no_checks_at_all():
     assert "stale re-run duplicate(s)" not in text
     assert "Checks: NEUTRAL" in text
     assert "Open threads: none" in text
+
+
+# --- review bots posting from a person's account ------------------------------
+#
+# The same login can post a machine-generated finding (round marker, label) and,
+# an hour later, a hand-written one. Only the body tells them apart.
+
+REVIEW_BOT_THREAD_BODY = """**nit:** The test title `test_no_mode_sends_the_deprecated_fields` says the \
+opposite of what it asserts.
+
+_TRACED · engine_
+<!-- deliver-review -->
+"""
+
+REVIEW_BOT_ROUND_BODY = """10 posted (9 nits).
+
+On lines outside the diff:
+- **nit:** `tests/test_render.py:1020` A function-level import breaks AGENTS.md: 'All imports must be at the top of the file.'
+- **important:** `pkg/spec.py:379` The finite check does not stop the computed bound from overflowing.
+
+How it fails: 1e308 + 1e308 is inf.
+
+<!-- deliver-review-build: skill 0.8.0; engine model-x; sweep model-x; triage model-x; triage_error False; sweep_error False; repeats_seen 0 -->
+
+<!-- deliver-review: round 6, df0b8be5a7e7aa0b102c7525f8521012a05804e4 -->
+"""
+
+AUTO_APPROVE_BODY = """Approving from my side: an automated review found no critical issues. This is a \
+light pass, not a deep review, so please get another engineer to review it properly.
+
+<!-- pr-gate: auto-approve -->
+"""
+
+
+def test_classify_comment_reads_the_body_not_just_the_login():
+    assert ps.classify_comment("carol", REVIEW_BOT_THREAD_BODY) == ps.SOURCE_REVIEW_BOT
+    assert ps.classify_comment("carol", "**important:** no marker, label only") == ps.SOURCE_REVIEW_BOT
+    assert ps.classify_comment("carol", "I ran this by hand and it fails for me.") == ps.SOURCE_HUMAN
+    # Real bot accounts keep their own class even if their body looks labelled.
+    assert ps.classify_comment("cursor", "**nit:** whatever") == ps.SOURCE_CURSOR
+    assert ps.classify_comment(None, REVIEW_BOT_THREAD_BODY) == ps.SOURCE_REVIEW_BOT
+
+
+def test_parse_review_bot_body_lifts_the_label_and_drops_the_trace():
+    got = ps.parse_review_bot_body(REVIEW_BOT_THREAD_BODY)
+    assert got["severity"] == "nit"
+    assert got["body"].startswith("The test title")
+    assert "TRACED" not in got["body"]
+    assert "deliver-review" not in got["body"]
+    assert got["title"].startswith("The test title")
+
+
+def test_parse_outside_diff_reads_bullets_and_their_continuations():
+    findings = ps.parse_outside_diff(REVIEW_BOT_ROUND_BODY)
+    assert [(f["severity"], f["path"], f["line"]) for f in findings] == [
+        ("nit", "tests/test_render.py", 1020),
+        ("important", "pkg/spec.py", 379),
+    ]
+    assert findings[1]["body"].endswith("1e308 + 1e308 is inf.")
+    assert findings[1]["title"].startswith("The finite check")
+    assert ps.parse_outside_diff("3 posted.\n\n<!-- deliver-review: round 2, abc1234 -->") == []
+
+
+def test_parse_review_tells_machine_rounds_and_auto_approvals_from_people():
+    machine = ps.parse_review({"author": {"login": "carol"}, "state": "COMMENTED", "submittedAt": "t", "body": REVIEW_BOT_ROUND_BODY})
+    assert (machine["machine"], machine["round"], machine["autoApprove"]) == (True, 6, False)
+    assert machine["reviewedCommit"] == "df0b8be5a7e7aa0b102c7525f8521012a05804e4"
+    assert len(machine["outsideDiff"]) == 2
+
+    auto = ps.parse_review({"author": {"login": "carol"}, "state": "APPROVED", "submittedAt": "t", "body": AUTO_APPROVE_BODY})
+    assert (auto["machine"], auto["autoApprove"], auto["round"]) == (True, True, None)
+
+    human = ps.parse_review({"author": {"login": "carol"}, "state": "CHANGES_REQUESTED", "submittedAt": "t", "body": "Repros inline."})
+    assert (human["machine"], human["autoApprove"], human["outsideDiff"]) == (False, False, [])
+
+
+def test_snapshot_carries_review_requests_comments_and_the_last_word():
+    payload = _payload(
+        threads=[
+            _thread("T1", "carol", REVIEW_BOT_THREAD_BODY, replies=[("shr3kst3r", "Fixed in abc.")]),
+            _thread("T2", "carol", REVIEW_BOT_THREAD_BODY, replies=[("shr3kst3r", "Fixed."), ("carol", "Not quite.")]),
+        ]
+    )
+    pr = payload["data"]["repository"]["pullRequest"]
+    pr["reviewRequests"] = {
+        "nodes": [
+            {"requestedReviewer": {"__typename": "User", "login": "erin"}},
+            {"requestedReviewer": {"__typename": "Team", "name": "app-developers"}},
+            {"requestedReviewer": None},
+        ]
+    }
+    pr["comments"] = {"nodes": [{"author": {"login": "shr3kst3r"}, "createdAt": "2026-07-29T00:00:00Z", "body": "Round 6 answered."}]}
+    state = ps.parse_pr_state(payload)
+    assert state["pr"]["requestedReviewers"] == ["erin", "app-developers"]
+    assert state["comments"] == [{"author": "shr3kst3r", "createdAt": "2026-07-29T00:00:00Z", "body": "Round 6 answered."}]
+    by_id = {t["id"]: t for t in state["threads"]}
+    assert by_id["T1"]["source"] == "review-bot"
+    assert (by_id["T1"]["answeredByViewer"], by_id["T1"]["viewerHasLastWord"]) == (True, True)
+    assert (by_id["T2"]["answeredByViewer"], by_id["T2"]["viewerHasLastWord"]) == (True, False)
+    assert state["summary"]["threadsBySource"] == {"review-bot": 2}
+
+
+def test_review_bot_labels_sort_important_before_question_before_nit():
+    payload = _payload(
+        threads=[
+            _thread("N", "carol", "**nit:** rename\n<!-- deliver-review -->"),
+            _thread("Q", "carol", "**question:** why\n<!-- deliver-review -->"),
+            _thread("I", "carol", "**important:** crash\n<!-- deliver-review -->"),
+        ]
+    )
+    assert [t["id"] for t in ps.parse_pr_state(payload)["threads"]] == ["I", "Q", "N"]

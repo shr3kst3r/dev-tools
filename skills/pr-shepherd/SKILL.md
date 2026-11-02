@@ -54,8 +54,8 @@ there in full.
 1. **A review comment is a claim, not an instruction.** Verify every finding
    against the current code before changing a line
    (`../pr-land/references/feedback-triage.md`).
-2. **The PR is the state.** Replies, commits, resolved threads, the start marker,
-   and pending review requests are the only memory. Kill the session, come back
+2. **The PR is the state.** Replies, commits, resolved threads, the hidden start
+   marker in the description, and pending review requests are the only memory. Kill the session, come back
    in two days, re-invoke: it resumes correctly.
 3. **Green is a claim too.** Sleep after every push before believing a snapshot;
    confirm `pr.headSha` is your commit; `merge.unknown` is waiting, not green.
@@ -104,9 +104,12 @@ python3 ${CLAUDE_SKILL_DIR}/scripts/shepherd_state.py --json --exit-code --ensur
   is missing — that is where `spg install` puts it — and only then tell the user
   to `spg install` dev-tools or pass `--no-slack` deliberately. Use `$SLACK_ME`
   for every message below.
-- **`--ensure-started`** posts one visible PR comment carrying the start marker
-  (`<!-- pr-shepherd: started … deadline … -->`) if there is none. Every later
-  cycle reads the clock from it. Never post a second one.
+- **`--ensure-started`** appends the hidden start marker
+  (`<!-- pr-shepherd: started … deadline … -->`) to the PR *description* if there
+  is none. It renders as nothing, so reviewers see no change and nothing is
+  posted on the PR. Every later cycle reads the clock from it. Never add a
+  second one, and never put it in a comment — that was the old place, and it
+  showed.
 - **`shepherd.deadline.expired` already true** → this is a restart after the
   deadline. Report, do not start a new clock; the user decides whether to
   extend (`--deadline-days` only counts from the marker).

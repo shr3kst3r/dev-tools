@@ -121,6 +121,7 @@ def _payload(
     merge_state_status="CLEAN",
     review_decision=None,
     state="OPEN",
+    body="",
 ):
     if checks is None:
         checks = [_check("Test", "SUCCESS")]
@@ -132,6 +133,7 @@ def _payload(
                     "number": 649,
                     "title": "factor targets",
                     "url": "https://github.com/o/r/pull/649",
+                    "body": body,
                     "isDraft": False,
                     "state": state,
                     "baseRefName": base,
@@ -181,15 +183,37 @@ def test_parse_iso_accepts_z_and_offsets_and_rejects_junk():
     assert ss.parse_iso(None) is None
 
 
-def test_marker_body_round_trips_through_the_marker_regex():
+def test_marker_is_an_html_comment_only_and_round_trips():
     started = datetime(2026, 11, 2, 9, 30, tzinfo=UTC)
     deadline = datetime(2026, 11, 9, 9, 30, tzinfo=UTC)
-    body = ss.marker_body(started, deadline)
-    match = ss.MARKER_RE.search(body)
+    marker = ss.marker_text(started, deadline)
+    assert marker.startswith("<!--") and marker.endswith("-->") and "\n" not in marker  # renders as nothing
+    match = ss.MARKER_RE.search(marker)
     assert match is not None
     assert ss.parse_iso(match.group("started")) == started
     assert ss.parse_iso(match.group("deadline")) == deadline
-    assert "2026-11-09" in body.splitlines()[0]  # the visible line says when it gives up
+
+
+def test_with_marker_appends_once_and_keeps_the_description():
+    marker = "<!-- pr-shepherd: started 2026-11-02T09:30:00Z deadline 2026-11-09T09:30:00Z -->"
+    assert ss.with_marker("", marker) == marker + "\n"
+    appended = ss.with_marker("## What changed\n\n- things\n", marker)
+    assert appended.startswith("## What changed\n\n- things\n\n<!-- pr-shepherd")
+    assert ss.with_marker(appended, marker) == appended  # idempotent
+    other = "<!-- pr-shepherd: started 2026-10-01T00:00:00Z -->"
+    assert ss.with_marker(appended, other) == appended  # never a second marker
+
+
+def test_find_marker_reads_the_description_first_then_the_viewers_comments():
+    body = "Intro.\n\n<!-- pr-shepherd: started 2026-11-02T00:00:00Z deadline 2026-11-09T00:00:00Z -->\n"
+    found = ss.find_marker([], VIEWER, body)
+    assert found["startedAt"] == datetime(2026, 11, 2, tzinfo=UTC)
+    assert found["createdAt"] is None
+    legacy = [_comment(VIEWER, "Shepherding… <!-- pr-shepherd: started 2026-11-01T00:00:00Z -->")]
+    assert ss.find_marker(legacy, VIEWER, "no marker here")["startedAt"] == datetime(2026, 11, 1, tzinfo=UTC)
+    assert ss.find_marker(legacy, VIEWER, body)["startedAt"] == datetime(2026, 11, 1, tzinfo=UTC)  # earliest wins
+    view = ss.deadline_view([], VIEWER, now=NOW, body=body)
+    assert view["deadline"] == "2026-11-09T00:00:00Z"
 
 
 def test_deadline_view_without_a_marker_is_not_started():
@@ -470,10 +494,14 @@ def test_view_carries_the_stack_and_leaves_pr_state_fields_intact():
 
 
 def test_main_reproduces_a_decision_offline(tmp_path, capsys):
-    marker = _comment(VIEWER, "<!-- pr-shepherd: started 2026-11-02T12:00:00Z -->")
     payload = tmp_path / "p.json"
     payload.write_text(
-        json.dumps(_payload(reviews=[_review("carol", "CHANGES_REQUESTED", "no")], comments=[marker])),
+        json.dumps(
+            _payload(
+                reviews=[_review("carol", "CHANGES_REQUESTED", "no")],
+                body="Why.\n\n<!-- pr-shepherd: started 2026-11-02T12:00:00Z -->",
+            )
+        ),
         encoding="utf-8",
     )
     code = ss.main(

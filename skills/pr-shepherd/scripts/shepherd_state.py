@@ -6,10 +6,12 @@ going to sit on a PR for a week needs four more answers, and this script gives
 them from the same payload:
 
 1. **How long have I been at this, and when do I give up?** The start time is a
-   marker the shepherd leaves in a PR comment on its first cycle
+   hidden marker the shepherd appends to the PR *description* on its first cycle
    (`<!-- pr-shepherd: started <iso> deadline <iso> -->`), so the clock survives
    a restarted session, a summarized context, or a different machine. The PR is
-   the state; there is no local file.
+   the state; there is no local file — and nothing visible is posted: an HTML
+   comment in the body renders as nothing. (Runs started before this lived in a
+   PR comment; those are still read.)
 2. **Is this PR stacked?** A base that is not the repo's default branch means
    there is a PR below this one. Findings on code that PR introduced belong
    there, and when it merges GitHub retargets this one and the branch is
@@ -105,32 +107,38 @@ def iso(value: datetime) -> str:
     return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def marker_body(started: datetime, deadline: datetime) -> str:
-    """The PR comment the shepherd leaves on its first cycle.
+def marker_text(started: datetime, deadline: datetime) -> str:
+    """The marker appended to the PR description on the first cycle.
 
-    Visible on purpose — a reviewer should know the PR is being tended and that
-    every thread will get a fix or an answer — but the only thing read back is
-    the HTML comment on the last line.
+    An HTML comment only: GitHub renders it as nothing, so reviewers see no
+    change to the PR, and the next cycle (or a restarted one) reads it back.
     """
-    return (
-        f"Shepherding this PR until {deadline.strftime('%Y-%m-%d')}: every review thread "
-        "gets a fix or an answer, then gets resolved; conflicts with the base get merged "
-        "forward; review is re-requested once everything is addressed.\n\n"
-        f"<!-- pr-shepherd: started {iso(started)} deadline {iso(deadline)} -->"
-    )
+    return f"<!-- pr-shepherd: started {iso(started)} deadline {iso(deadline)} -->"
+
+
+def with_marker(body: str, marker: str) -> str:
+    """The PR body with the marker appended, untouched if it is already there."""
+    if MARKER_RE.search(body or ""):
+        return body
+    return f"{(body or '').rstrip()}\n\n{marker}\n" if body and body.strip() else f"{marker}\n"
 
 
 # --- pure views ---------------------------------------------------------------
 
 
-def find_marker(comments: list[dict[str, Any]], viewer: str | None) -> dict[str, Any] | None:
-    """The earliest start marker the viewer left on this PR, if any."""
+def find_marker(
+    comments: list[dict[str, Any]], viewer: str | None, body: str | None = None
+) -> dict[str, Any] | None:
+    """The earliest start marker on this PR: in its description, or — for runs
+    started before the marker moved there — in a comment by the viewer."""
     viewer_lower = (viewer or "").lower()
-    found: list[dict[str, Any]] = []
+    candidates: list[tuple[str, str | None]] = [(body or "", None)]
     for comment in comments:
-        if (comment.get("author") or "").lower() != viewer_lower:
-            continue
-        match = MARKER_RE.search(comment.get("body") or "")
+        if (comment.get("author") or "").lower() == viewer_lower:
+            candidates.append((comment.get("body") or "", comment.get("createdAt")))
+    found: list[dict[str, Any]] = []
+    for text, created_at in candidates:
+        match = MARKER_RE.search(text)
         if not match:
             continue
         started = parse_iso(match.group("started"))
@@ -140,7 +148,7 @@ def find_marker(comments: list[dict[str, Any]], viewer: str | None) -> dict[str,
             {
                 "startedAt": started,
                 "deadline": parse_iso(match.group("deadline")),
-                "createdAt": parse_iso(comment.get("createdAt")),
+                "createdAt": parse_iso(created_at),
             }
         )
     if not found:
@@ -154,13 +162,14 @@ def deadline_view(
     *,
     now: datetime,
     deadline_days: float = DEFAULT_DEADLINE_DAYS,
+    body: str | None = None,
 ) -> dict[str, Any]:
     """When the shepherd started, when it gives up, and whether that has passed.
 
     The marker's own deadline wins over `--deadline-days`, so a run started with
     one horizon is not silently shortened by a restart that used the default.
     """
-    marker = find_marker(comments, viewer)
+    marker = find_marker(comments, viewer, body)
     if marker is None:
         return {
             "started": False,
@@ -345,7 +354,7 @@ def shepherd_view(
     reviewers = reviewer_view(
         state.get("reviews") or [], pr.get("requestedReviewers") or [], viewer, settled=settled
     )
-    deadline = deadline_view(comments, viewer, now=now, deadline_days=deadline_days)
+    deadline = deadline_view(comments, viewer, now=now, deadline_days=deadline_days, body=pr.get("body"))
     stack = stack_view(pr, default_branch=default_branch, base_pr=base_pr)
 
     merged = pr.get("state") == "MERGED"
@@ -441,7 +450,7 @@ def render(view: dict[str, Any]) -> str:
         when = "PASSED" if dl["expired"] else f"{dl['remainingHours']}h left"
         lines.append(f"Shepherd: started {dl['startedAt']} · deadline {dl['deadline']} ({when})")
     else:
-        lines.append("Shepherd: not started — run with --ensure-started to post the marker")
+        lines.append("Shepherd: not started — run with --ensure-started to add the marker")
     stack = shep["stack"]
     if stack["stacked"]:
         below = stack["basePr"]
@@ -513,15 +522,16 @@ def find_base_pr(owner: str, repo: str, base: str) -> dict[str, Any] | None:
     return rows[0]
 
 
-def post_marker(owner: str, repo: str, pr: int, now: datetime, deadline_days: float) -> str:
-    body = marker_body(now, now + timedelta(days=deadline_days))
+def add_marker(owner: str, repo: str, pr: int, current_body: str, now: datetime, deadline_days: float) -> str:
+    """Append the hidden marker to the PR description. The one mutation here."""
+    body = with_marker(current_body, marker_text(now, now + timedelta(days=deadline_days)))
     proc = subprocess.run(
-        ["gh", "pr", "comment", str(pr), "--repo", f"{owner}/{repo}", "--body", body],
+        ["gh", "pr", "edit", str(pr), "--repo", f"{owner}/{repo}", "--body", body],
         capture_output=True,
         text=True,
     )
     if proc.returncode != 0:
-        raise RuntimeError(f"gh pr comment failed: {proc.stderr.strip() or proc.stdout.strip()}")
+        raise RuntimeError(f"gh pr edit failed: {proc.stderr.strip() or proc.stdout.strip()}")
     return body
 
 
@@ -544,7 +554,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--ensure-started",
         action="store_true",
-        help="post the start marker on the PR if there is none (one comment, once)",
+        help="append the hidden start marker to the PR description if there is none (once)",
     )
     ap.add_argument("--parse-file", help="parse a saved GraphQL payload instead of querying")
     ap.add_argument("--now", help="ISO-8601 'now' for offline runs (default: the clock)")
@@ -573,8 +583,10 @@ def main(argv: list[str] | None = None) -> int:
             pr = args.pr or ps.detect_pr()
             payload = ps.fetch_payload(owner, name, pr)
             state = ps.parse_pr_state(payload)
-            if args.ensure_started and find_marker(state.get("comments") or [], state.get("viewer")) is None:
-                post_marker(owner, name, pr, now, args.deadline_days)
+            if args.ensure_started and find_marker(
+                state.get("comments") or [], state.get("viewer"), state["pr"].get("body")
+            ) is None:
+                add_marker(owner, name, pr, state["pr"].get("body") or "", now, args.deadline_days)
                 payload = ps.fetch_payload(owner, name, pr)
             default_branch = args.default_branch or detect_default_branch(owner, name)
             base_pr = json.loads(args.base_pr) if args.base_pr else None

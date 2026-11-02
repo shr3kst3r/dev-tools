@@ -121,6 +121,7 @@ query($owner: String!, $repo: String!, $pr: Int!) {
       number
       title
       url
+      body
       isDraft
       state
       baseRefName
@@ -864,6 +865,7 @@ def parse_pr_state(
             "number": pr.get("number"),
             "title": pr.get("title"),
             "url": pr.get("url"),
+            "body": pr.get("body") or "",
             "state": pr.get("state"),
             "isDraft": pr.get("isDraft"),
             "author": ((pr.get("author") or {}).get("login")) or None,

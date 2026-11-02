@@ -700,7 +700,9 @@ def test_snapshot_carries_review_requests_comments_and_the_last_word():
         ]
     }
     pr["comments"] = {"nodes": [{"author": {"login": "shr3kst3r"}, "createdAt": "2026-07-29T00:00:00Z", "body": "Round 6 answered."}]}
+    pr["body"] = "Why this PR.\n\n<!-- pr-shepherd: started 2026-11-02T00:00:00Z -->"
     state = ps.parse_pr_state(payload)
+    assert state["pr"]["body"] == pr["body"]
     assert state["pr"]["requestedReviewers"] == ["erin", "app-developers"]
     assert state["comments"] == [{"author": "shr3kst3r", "createdAt": "2026-07-29T00:00:00Z", "body": "Round 6 answered."}]
     by_id = {t["id"]: t for t in state["threads"]}

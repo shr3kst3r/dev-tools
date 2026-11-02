@@ -45,7 +45,8 @@ different contract:
 | Stacked PRs | not aware | finds the PR below; declines findings on its code; rides the retarget when it merges |
 | Conflicts | mechanical only, else stop | mechanical and semantic-when-clear; Slack when not |
 | After everything is addressed | stop | **re-request review** from whoever asked for changes, then keep waiting |
-| Telling you | `--slack` at the end | Slack on every decision you have to make, on settled, on done, on giving up |
+| After a human approves | stop | keep going — until the PR is **merged** or the deadline passes |
+| Telling you | `--slack` at the end | Slack on every decision you have to make, on settled, on approved, on merged, on giving up |
 
 Five rules shape everything below. The first three are `/pr-land`'s; read them
 there in full.
@@ -53,8 +54,8 @@ there in full.
 1. **A review comment is a claim, not an instruction.** Verify every finding
    against the current code before changing a line
    (`../pr-land/references/feedback-triage.md`).
-2. **The PR is the state.** Replies, commits, resolved threads, the start marker,
-   and pending review requests are the only memory. Kill the session, come back
+2. **The PR is the state.** Replies, commits, resolved threads, the hidden start
+   marker in the description, and pending review requests are the only memory. Kill the session, come back
    in two days, re-invoke: it resumes correctly.
 3. **Green is a claim too.** Sleep after every push before believing a snapshot;
    confirm `pr.headSha` is your commit; `merge.unknown` is waiting, not green.
@@ -66,13 +67,17 @@ there in full.
 5. **When you cannot settle something, say so to a person, not to the PR.** No
    guessing at intent in public. An `ASK` goes to Slack, the rest of the cycle
    carries on, and the thread waits for the answer.
+6. **Only a merge or the deadline ends the run.** An approval is a state, not
+   a finish line: an approved PR can go stale behind its base, conflict, lose
+   its approval to a push, or pick up another review round before anyone
+   presses merge. The shepherd keeps polling through all of it.
 
 ## Arguments
 
 | Argument | Default | Meaning |
 |---|---|---|
 | `[PR number]` | current branch's PR | Which PR to tend. |
-| `--deadline-days N` | `7` | Give up this many days after the start marker. The marker's own deadline wins on a restart, so a run started with one horizon is not shortened by a restart that used the default. |
+| `--deadline-days N` | `7` | Run this many days after the start marker, or until the PR is merged, whichever comes first. The marker's own deadline wins on a restart, so a run started with one horizon is not shortened by a restart that used the default. |
 | `--interval S` | `1200` | Seconds between polls while nothing is happening. Never below 60 after a push. |
 | `--tick` | off | Run exactly one cycle and exit. For driving the loop from outside (`/loop 20m /pr-shepherd 635 --tick`) or for checking what it would do. |
 | `--merge [method]` | off | Merge once a **human** has approved and everything is settled, under `/pr-land`'s gates. Machine approvals never satisfy this. |
@@ -99,9 +104,12 @@ python3 ${CLAUDE_SKILL_DIR}/scripts/shepherd_state.py --json --exit-code --ensur
   is missing — that is where `spg install` puts it — and only then tell the user
   to `spg install` dev-tools or pass `--no-slack` deliberately. Use `$SLACK_ME`
   for every message below.
-- **`--ensure-started`** posts one visible PR comment carrying the start marker
-  (`<!-- pr-shepherd: started … deadline … -->`) if there is none. Every later
-  cycle reads the clock from it. Never post a second one.
+- **`--ensure-started`** appends the hidden start marker
+  (`<!-- pr-shepherd: started … deadline … -->`) to the PR *description* if there
+  is none. It renders as nothing, so reviewers see no change and nothing is
+  posted on the PR. Every later cycle reads the clock from it. Never add a
+  second one, and never put it in a comment — that was the old place, and it
+  showed.
 - **`shepherd.deadline.expired` already true** → this is a restart after the
   deadline. Report, do not start a new clock; the user decides whether to
   extend (`--deadline-days` only counts from the marker).
@@ -140,8 +148,8 @@ adds a `shepherd` block:
 - **`work.reRequest`** — who to re-request, non-empty only when settled.
 - **`reviewers`** — human approvals, who asked for changes, who is currently
   requested, and `machineApprovals` kept separate because they are not sign-off.
-- **`summary.status`** — `actionable` · `waiting` · `settled` · `done` ·
-  `expired` · `closed`.
+- **`summary.status`** — `actionable` · `waiting` · `settled` · `approved` ·
+  `expired` · `merged` · `closed`. Only the last three end the run.
 
 Threads come **unfiltered** (resolved out, answered in). Do not pass
 `--unanswered` thinking: a thread you answered and left open is work.
@@ -282,6 +290,23 @@ for a person: poll at `--interval`, and say nothing until something changes. A
 new review, a new reply, a new push to the base, or the deadline is what ends
 the wait.
 
+**After a human approves (`approved`), keep polling the same way.** The run ends
+when the PR is merged (by you under `--merge`, or by anyone) or when the deadline
+passes — not at the approval. What can still happen, and what to do:
+
+- **A new review round or reply** — an ordinary cycle; the threads get answered
+  and closed as before, and whoever asked for changes is re-requested.
+- **`merge.behind`** — GitHub reports this only when branch protection requires
+  the branch to be up to date, so merge the base forward. Expect a push to
+  dismiss stale approvals in repos that have that rule: `approved` flips back
+  and the re-request logic asks the approver again. Do **not** merge the base
+  forward on an approved PR that is merely *not* behind — that throws away an
+  approval for nothing.
+- **`merge.conflicted`** — a **Conflicts** cycle, approval or not.
+- **Checks re-run red** (a flaky or a scheduled job) — fix or re-run as usual.
+- **Nothing** — poll at `--interval` and stay quiet. Day after day of quiet is
+  the expected shape of this phase.
+
 Under `--tick`, stop after step 6 and print the report instead of waiting.
 
 ## Review sources
@@ -313,7 +338,7 @@ What to expect:
   companion PR, link it.
 - **Its approval is not an approval.** `pr-gate: auto-approve` reviews say
   "please get another engineer to review it properly". The snapshot files them
-  under `machineApprovals`; `done` and `--merge` ignore them.
+  under `machineApprovals`; `approved` and `--merge` ignore them.
 - **Its round summary can carry findings.** Lines outside the diff cannot take
   a review comment, so they are listed in the review body under *On lines
   outside the diff*. The snapshot surfaces them as `outsideDiff`; answer them in
@@ -377,7 +402,8 @@ One message per event, never a heartbeat:
 | `ASK` | the PR, the thread link, the single question, what you will do meanwhile |
 | conflict needing judgment | the conflicted paths and what each side changed |
 | settled and re-requested | counts, who was re-requested, whether a semantic merge happened |
-| done | human approved (by whom) or merged (with `--merge`) |
+| approved | a human approved (by whom); that the run continues until merge |
+| merged | who merged it, or that `--merge` did |
 | hostile state | push rejected, auth expired, infra failure — and that you stopped |
 | **gave up** | the deadline, the state of the PR, every open thread and unanswered question, what you would do next |
 
@@ -394,8 +420,8 @@ merge, re-read the PR to confirm it merged, leave the branch alone.
 
 | Stop | Meaning |
 |---|---|
-| **Done** | Settled and a human has approved (or merged, with `--merge`). Slack it. Success. |
-| **Closed** | Someone closed or merged the PR by hand. Report, no Slack unless `--merge` was set. |
+| **Merged** | The PR is merged — by `--merge`, or by anyone. Slack it. Success. |
+| **Closed** | Someone closed the PR without merging. Report and Slack; nothing to tend. |
 | **Deadline** | `summary.status == expired`. Final report, the give-up Slack, stop. Do not start a new clock. |
 | **Hostile state** | Push rejected after a failed fast-forward, expired auth, infra failure. Slack, stop. |
 | **`--tick`** | One cycle done. Report what happened and what the next cycle would do. |
@@ -405,6 +431,11 @@ An `ASK` is **not** a stop. The thread stays open, the question is in Slack, and
 the loop keeps working everything else and polling until the answer arrives (as
 a reply on the thread from you, or an instruction in the terminal) or the
 deadline passes.
+
+An **approval** is not a stop either, and neither is `settled`. With no `--merge`
+the shepherd cannot finish the PR itself; it tends it until someone does, or
+until the deadline, and the give-up report then says "approved by X on <date>,
+never merged" — which is the fact the user needs.
 
 ## Final report
 

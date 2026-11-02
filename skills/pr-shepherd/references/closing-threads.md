@@ -145,7 +145,7 @@ gh api graphql -f query='
   }' -f tid="$THREAD_ID"
 ```
 
-A PR comment (outside-diff rounds, the round summary, the start marker):
+A PR comment (outside-diff rounds, the round summary):
 
 ```bash
 gh pr comment "$PR" --body-file reply.md

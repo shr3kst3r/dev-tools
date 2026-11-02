@@ -375,6 +375,10 @@ Markdown (`*bold*`, `<url|text>`); see the `slack-me` skill.
 
 ## Related skills
 
+- **`/pr-shepherd`** — this loop with a week-long horizon: resolves declined
+  human threads instead of leaving them open, answers review bots that post from
+  a person's account, follows stacked PRs, re-requests review once settled, and
+  Slacks you when it needs a decision or gives up.
 - **`/azdo-pr`** — one-shot azdo build triage. This loop delegates every azdo
   failure to it. It commits locally; the push is this loop's.
 - **`/pr-notebook`**, **`/azdo-then-notebook`** — verify a data-pipeline PR by

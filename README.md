@@ -342,12 +342,20 @@ skills/
   adr-rpi/SKILL.md       # Research → Plan → Implement, backed by ADRs
   adr-format/SKILL.md    # ADR format + significance bar; preloaded into subagents
   pr-land/SKILL.md       # drive a PR to green: checks, review feedback, replies
+  pr-shepherd/SKILL.md   # tend a PR for days: close every thread, re-request review
   knowledge-base-article/SKILL.md  # write a structured KBA into docs/
   topic-intro/SKILL.md   # research and write a primer on a new topic
 agents/
   adr-implementer.md     # implement phase of adr-rpi
   adr-reviewer.md        # review-and-resolve phase of adr-rpi
 ```
+
+`pr-shepherd` is `pr-land` with a week-long horizon: it closes every review
+thread with a fix or an evidence-backed reply (human threads included), answers
+review bots that post from a person's account round after round, merges a moving
+base forward, re-requests review once everything is addressed, and Slacks you
+when a finding needs your call or when it gives up. Its clock lives in a marker
+comment on the PR, so a restarted session resumes where it left off.
 
 The last two are writing skills rather than workflow ones.
 `knowledge-base-article` classifies a topic as how-to / conceptual /

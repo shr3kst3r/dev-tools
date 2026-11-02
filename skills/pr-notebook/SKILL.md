@@ -42,12 +42,15 @@ gh --version
 databricks --version
 databricks auth describe --profile "$PROFILE"
 aws sts get-caller-identity --profile "$AWS_ECR_PROFILE"
-command -v slack-me dbtools
+command -v dbtools
+command -v slack-me || ls "$HOME/bin/slack-me"   # spg publishes it to ~/bin
 gh pr view --json number,headRefName,headRepository,url,title
 ```
 
 Stop on any failure and say what to fix. A missing `slack-me` is a warning, not a
-stop — the run proceeds and the summary prints to the terminal. A missing PR
+stop — the run proceeds and the summary prints to the terminal — but check
+`~/bin/slack-me` before calling it missing, and use that path if `command -v`
+came up empty. A missing PR
 means this skill does not apply: point the user at the `databricks-tools` skill
 (`dbtools submit` / `dbtools follow-run`) instead. A missing `~/.dev-tools.env`
 is a stop: say to copy `dev-tools.env.example` from the `dev-tools` repo.

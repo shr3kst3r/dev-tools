@@ -60,7 +60,7 @@ Three rules shape everything below:
 | `--checks-only` | off | Ignore review threads; only chase failing checks. |
 | `--comments-only` | off | Ignore checks; only work the review threads. |
 | `--merge [method]` | off | Merge the PR once it is genuinely green (see **Merging**). Method is `squash` (default), `merge`, or `rebase`. Without this flag the loop never merges. |
-| `--slack` | off | Send a `slack-me` summary when the loop ends. |
+| `--slack` | off | Send a `slack-me` summary when the loop ends (`slack-me` on `$PATH`, else `~/bin/slack-me`). |
 
 ## Phase 0 — Preflight, once
 
@@ -371,7 +371,9 @@ Left open: 1 human thread (a reviewer disagrees with the decline)
 ```
 
 With `--slack`, send the same thing through `slack-me` — Slack mrkdwn, not
-Markdown (`*bold*`, `<url|text>`); see the `slack-me` skill.
+Markdown (`*bold*`, `<url|text>`); see the `slack-me` skill. `spg install`
+publishes it to `~/bin/slack-me`, which is often not on an agent shell's
+`$PATH`, so fall back to that path before reporting it missing.
 
 ## Related skills
 

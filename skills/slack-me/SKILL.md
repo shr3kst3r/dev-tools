@@ -8,8 +8,20 @@ allowed-tools: [Bash]
 # /slack-me — ping the user on Slack
 
 A tiny CLI that posts a message to the user's own Slack via an incoming webhook.
-In this repo run it as `uv run slack-me ...` (or `just slack-me ...`); if
-published via spg, plain `slack-me ...` works anywhere on `$PATH`.
+In this repo run it as `uv run slack-me ...` (or `just slack-me ...`). Published
+via spg, it lives at **`~/bin/slack-me`** — plain `slack-me ...` works when
+`~/bin` is on `$PATH`, which an agent's shell often does not have. So resolve it
+once, and do not conclude it is missing because `command -v` came up empty:
+
+```bash
+SLACK_ME="$(command -v slack-me || true)"
+[ -n "$SLACK_ME" ] || [ ! -x "$HOME/bin/slack-me" ] || SLACK_ME="$HOME/bin/slack-me"
+[ -n "$SLACK_ME" ] || echo "slack-me not found: run \`spg install\` in dev-tools"
+"$SLACK_ME" "<message>"
+```
+
+Every skill below that pings Slack uses `$SLACK_ME` resolved this way; the
+commands are written as `slack-me` for brevity.
 
 ## Agent rules
 

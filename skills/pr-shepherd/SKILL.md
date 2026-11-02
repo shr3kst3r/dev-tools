@@ -86,14 +86,19 @@ HEAD, unrelated uncommitted changes, diverged from `origin`, base branch checked
 out, `--merge` on a draft. Plus:
 
 ```bash
-slack-me --help >/dev/null || echo "NO SLACK"         # unless --no-slack
+# slack-me is published to ~/bin, which is often not on an agent shell's PATH.
+SLACK_ME="$(command -v slack-me || true)"
+[ -n "$SLACK_ME" ] || [ ! -x "$HOME/bin/slack-me" ] || SLACK_ME="$HOME/bin/slack-me"
+[ -n "$SLACK_ME" ] || echo "NO SLACK"                  # a stop, unless --no-slack
 python3 ${CLAUDE_SKILL_DIR}/scripts/shepherd_state.py --json --exit-code --ensure-started \
   > /tmp/pr-shepherd-snapshot.json; echo "exit=$?"
 ```
 
 - **No `slack-me` and no `--no-slack`** → stop. A shepherd that cannot reach you
-  will sit on an `ASK` for a week. Tell the user to `spg install` dev-tools or
-  pass `--no-slack` deliberately.
+  will sit on an `ASK` for a week. Look in `~/bin/slack-me` before concluding it
+  is missing — that is where `spg install` puts it — and only then tell the user
+  to `spg install` dev-tools or pass `--no-slack` deliberately. Use `$SLACK_ME`
+  for every message below.
 - **`--ensure-started`** posts one visible PR comment carrying the start marker
   (`<!-- pr-shepherd: started … deadline … -->`) if there is none. Every later
   cycle reads the clock from it. Never post a second one.
@@ -363,8 +368,9 @@ paper over.
 
 ## Telling you
 
-Slack, through `slack-me`, in mrkdwn (`*bold*`, `<url|text>`; see the
-`slack-me` skill). One message per event, never a heartbeat:
+Slack, through `$SLACK_ME` as resolved in preflight (`slack-me` on `$PATH`, else
+`~/bin/slack-me`), in mrkdwn (`*bold*`, `<url|text>`; see the `slack-me` skill).
+One message per event, never a heartbeat:
 
 | Event | Message carries |
 |---|---|

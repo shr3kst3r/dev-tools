@@ -6,7 +6,8 @@ SKILL.md.
 ## Slack, via the slack-me CLI
 
 ```bash
-slack-me "$(cat <<'EOF'
+SLACK_ME="$(command -v slack-me || echo "$HOME/bin/slack-me")"   # spg publishes it to ~/bin
+"$SLACK_ME" "$(cat <<'EOF'
 <message>
 EOF
 )"

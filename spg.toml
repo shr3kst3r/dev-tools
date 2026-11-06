@@ -83,8 +83,8 @@ args = [
 
 # --- links: publish this repo's Claude Code and agent configs ----------------
 #
-# Skills (to both ~/.claude/skills/ and ~/.agents/skills/), subagents, and the
-# status line script.
+# Skills (to both ~/.claude/skills/ and ~/.agents/skills/) and subagents. The
+# Claude Code status line lives in the dotfiles repo, not here.
 #
 # `spg install` / `sync` creates these symlinks (and `uninstall` removes them),
 # so the skills work in every session rather than only when the shell is inside
@@ -213,12 +213,3 @@ description = "adr-rpi review phase subagent (Opus, xhigh effort) — adr-rpi ca
 source = "agents/pr-feedback-judge.md"
 target = "~/.claude/agents/pr-feedback-judge.md"
 description = "pr-land / pr-shepherd review-feedback adjudicator (Opus, high effort) — verifies each bot/human finding before either loop changes code"
-
-# Not a skill or an agent: the status line is a script Claude Code shells out to
-# on every render. The link only puts the file where settings.json expects it —
-# `statusLine.command` still has to point at it once per machine (see README).
-
-[links.statusline]
-source = "statusline/statusline.sh"
-target = "~/.claude/statusline.sh"
-description = "Claude Code status line: cwd + git, model/tokens/cost, context grid, 5h & 7d rate limits"

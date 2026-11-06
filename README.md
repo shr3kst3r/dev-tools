@@ -2,7 +2,7 @@
 
 Personal developer tools: live terminal dashboards for the systems I spend the
 day waiting on — GitHub PRs, Airflow, Azure DevOps Pipelines — alongside the
-agent skills, subagents, and status line I work with. **One uv
+agent skills and subagents I work with. **One uv
 project, one tool per directory** under `tools/`, all configured from a single
 `pyproject.toml`.
 
@@ -52,7 +52,6 @@ skills/
   slack-me/SKILL.md      # agent skills, one directory per skill
 agents/
   adr-implementer.md     # subagent definitions
-statusline/statusline.sh # the Claude Code status line
 docs/adrs/               # architecture decision records
 tests/                   # test suite for all tools
 ```
@@ -448,53 +447,6 @@ python3 skills/adr-rpi/scripts/adr_chain.py docs/adrs --validate  # check supers
 
 Those scripts are stdlib-only so they run in any repo the skill is pointed at,
 with no venv. Full docs, invariants, and model routing: `skills/adr-rpi/README.md`.
-
-## Status line
-
-`statusline/statusline.sh` is the status line Claude Code renders under the
-prompt. It reads the session JSON on stdin and prints up to six lines — the last
-two appear only when there is something to report:
-
-```
-~/src/project
-Opus │ 58,120 tok │ $0.1534 │ 3m5s │ +42 -7
-⛁ ⛁ ⛁ ⛁ ⛁ ⛀ ⛶ ⛶ ⛶ ⛶   claude-opus-4-5 · 56.0K/200.0K tokens (28%)
-⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ in: 2.0K (cache ↩53.0K ↗1.0K)  ⛀ out: 500  ⛶ free: 144.0K
-plugins(4): codex, gopls-lsp, op-dev, pyright-lsp │ mcps(3): context7, linear, playwright
-5h: ██░░░░░░░░ 23% ↻26805d2h │ 7d: ██████░░░░ 61% ↻26805d2h
-```
-
-Directory with `~` collapsed, plus branch, dirty flags (`!` modified, `?`
-untracked, `+` staged) and ahead/behind (`↑N`/`↓M`); model, session tokens, cost
-(green under $0.25, orange under $1, red above), duration, lines changed; then a
-2×10 context grid where each cell is 5% of the window — `⛁` input including
-cache, `⛀` output, `⛶` free — beside the exact counts; enabled plugins and MCP
-servers; and the 5-hour and 7-day rate limits with a countdown to each reset.
-
-Rate limits come from `.rate_limits` in the session JSON when Claude Code sends
-it. When it doesn't, the script falls back to the OAuth usage endpoint using the
-token in the macOS keychain, caching the response for five minutes — and skips
-the request outright if that token has already expired, rather than burning
-`--max-time` on a guaranteed 401 every render.
-
-It's bash, not a Python tool under `tools/`, because it runs on *every* render:
-an interpreter start per turn would be felt. `jq` is the one requirement. The
-render must never fail, so an unparseable payload degrades to an empty object and
-every lookup falls back to a default instead of tripping `set -e`.
-
-```bash
-just statusline                    # preview the render from statusline/sample.json
-just test tests/test_statusline.py # run it for real against fixture payloads
-```
-
-`spg install` links the script to `~/.claude/statusline.sh`. Pointing Claude Code
-at it is a one-time, per-machine step — `spg` makes links, it doesn't edit your
-settings:
-
-```bash
-jq '. + {statusLine: {type: "command", command: "~/.claude/statusline.sh"}}' \
-  ~/.claude/settings.json > /tmp/s.json && mv /tmp/s.json ~/.claude/settings.json
-```
 
 ## Adding a tool
 

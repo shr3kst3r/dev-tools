@@ -4,12 +4,13 @@
 
 # ADR index
 
-7 active · 0 superseded
+8 active · 0 superseded
 
 ## Active
 
 | ADR | Title | Status | Components | Ticket | Date |
 | --- | --- | --- | --- | --- | --- |
+| [2026-11-06-status-line-moves-to-dotfiles](2026-11-06-status-line-moves-to-dotfiles.md) | Move the Claude Code status line to the dotfiles repo | Proposed | statusline, spg-links, repo-boundary | — | 2026-11-06 |
 | [2026-08-11-my-issues-copies-the-my-prs-shell](2026-08-11-my-issues-copies-the-my-prs-shell.md) | Give `my-issues` its own copy of the dashboard shell, and share only pr-watch's generic layer | Accepted | my-issues, my-prs, tool-boundaries | #5 | 2026-08-11 |
 | [2026-08-11-issues-get-no-attention-dot](2026-08-11-issues-get-no-attention-dot.md) | Sort `my-issues` by recency alone and ship no attention dot | Accepted | my-issues | #5 | 2026-08-11 |
 | [2026-08-11-claude-config-collapses-into-dev-tools](2026-08-11-claude-config-collapses-into-dev-tools.md) | Collapse the global Claude Code config into this repo, keeping the status line as bash | Proposed | statusline, spg-links, skills, repo-boundary | — | 2026-08-11 |

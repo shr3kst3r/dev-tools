@@ -39,6 +39,8 @@ Usage:
     shepherd_state.py --pr 635 --repo owner/name
     shepherd_state.py --ensure-started      # post the start marker if missing
     shepherd_state.py --deadline-days 7     # how long before it gives up
+    shepherd_state.py --interval 1200       # poll interval; sets the status line sheep's lifetime
+    shepherd_state.py --lower-sheep         # take the sheep down (user cancelled, --no-push stop)
     shepherd_state.py --exit-code           # 0 settled/approved/merged · 1 actionable
                                             # 2 waiting · 3 error · 4 deadline passed
     shepherd_state.py --parse-file p.json --now 2026-11-03T00:00:00Z \\
@@ -49,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -73,6 +76,21 @@ EXIT_ERROR = 3
 EXIT_EXPIRED = 4
 
 DEFAULT_DEADLINE_DAYS = 7
+DEFAULT_INTERVAL = 1200
+
+# The status line sheep. The dotfiles status line draws a walking sheep while
+# ~/.claude/pr-shepherd/<session id>.running holds "<PR> <expires epoch>" with
+# the expiry still ahead. This script refreshes it on every live snapshot, so
+# the sheep tracks the loop without the skill having to remember a side step,
+# and a loop started from an older copy of SKILL.md (which keeps polling this
+# file from disk) picks it up too.
+SHEEP_DIR = Path.home() / ".claude" / "pr-shepherd"
+SHEEP_SESSION_ENV = "CLAUDE_CODE_SESSION_ID"
+# Slack on top of the poll interval, so the marker outlives a wait plus the
+# cycle of work that follows it.
+SHEEP_GRACE_SECONDS = 900
+# Statuses that end a run: the sheep comes down with them.
+_SHEEP_LOWER = {"merged", "closed", "expired"}
 
 MARKER_RE = re.compile(
     r"<!--\s*pr-shepherd:\s*started\s+(?P<started>\S+?)(?:\s+deadline\s+(?P<deadline>\S+?))?\s*-->"
@@ -442,6 +460,39 @@ def exit_code_for(view: dict[str, Any]) -> int:
 # --- rendering ----------------------------------------------------------------
 
 
+# --- status line sheep ------------------------------------------------------------
+
+
+def sheep_line(status: str, pr: int | None, now_epoch: int, interval: int) -> str | None:
+    """The marker's content for this snapshot, or None when the sheep comes down."""
+    if status in _SHEEP_LOWER or not pr:
+        return None
+    return f"{pr} {now_epoch + max(interval, 60) + SHEEP_GRACE_SECONDS}\n"
+
+
+def sheep_path(session_id: str | None, directory: Path | None = None) -> Path | None:
+    """Where this session's marker lives; None without a usable session id."""
+    if not session_id or not re.fullmatch(r"[A-Za-z0-9._-]+", session_id) or session_id.startswith("."):
+        return None
+    return (directory or SHEEP_DIR) / f"{session_id}.running"
+
+
+def update_sheep(path: Path | None, line: str | None) -> None:
+    """Raise (write) or lower (remove) the marker. Cosmetic: never raises."""
+    if path is None:
+        return
+    try:
+        if line is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(line, encoding="utf-8")
+            tmp.replace(path)
+    except OSError:
+        pass
+
+
 def render(view: dict[str, Any]) -> str:
     shep = view["shepherd"]
     lines = [ps.render(view), ""]
@@ -556,11 +607,27 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="append the hidden start marker to the PR description if there is none (once)",
     )
+    ap.add_argument(
+        "--interval",
+        type=int,
+        default=DEFAULT_INTERVAL,
+        help=f"the loop's poll interval in seconds; sets how long the status line sheep lives (default {DEFAULT_INTERVAL})",
+    )
+    ap.add_argument(
+        "--lower-sheep",
+        action="store_true",
+        help="remove this session's status line sheep and exit (for stops the snapshot can't see)",
+    )
     ap.add_argument("--parse-file", help="parse a saved GraphQL payload instead of querying")
     ap.add_argument("--now", help="ISO-8601 'now' for offline runs (default: the clock)")
     ap.add_argument("--default-branch", help="repo default branch for offline runs")
     ap.add_argument("--base-pr", help="JSON for the PR open against the base branch, for offline runs")
     args = ap.parse_args(argv)
+
+    sheep = sheep_path(os.environ.get(SHEEP_SESSION_ENV))
+    if args.lower_sheep:
+        update_sheep(sheep, None)
+        return EXIT_SETTLED
 
     now = parse_iso(args.now) if args.now else datetime.now(UTC)
     if now is None:
@@ -604,6 +671,12 @@ def main(argv: list[str] | None = None) -> int:
     except (RuntimeError, ValueError, OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
         print(f"shepherd_state: {exc}", file=sys.stderr)
         return EXIT_ERROR
+
+    if not args.parse_file:
+        update_sheep(
+            sheep,
+            sheep_line(view["shepherd"]["summary"]["status"], view["pr"].get("number"), int(now.timestamp()), args.interval),
+        )
 
     print(json.dumps(view, indent=2) if args.json else render(view))
     return exit_code_for(view) if args.exit_code else EXIT_SETTLED

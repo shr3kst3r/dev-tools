@@ -116,50 +116,45 @@ python3 ${CLAUDE_SKILL_DIR}/scripts/shepherd_state.py --json --exit-code --ensur
 - **`shepherd.stack.stacked`** → note the PR below (`stack.basePr`) in the plan;
   it changes how findings and conflicts are read (see **Stacked PRs**).
 
-Once preflight passes, raise the sheep (see **Status line marker**), then state
-the plan: deadline, stack, failing checks, conflict state, threads to
+The preflight snapshot also raises the status line sheep (see **Status line
+marker**). Then state the plan: deadline, stack, failing checks, conflict state, threads to
 answer / to close by source, outside-diff findings unanswered, who is requested
 and who asked for changes. `TodoWrite` one item per thread, finding, and check.
 
 ## Status line marker
 
 While the shepherd runs, the Claude Code status line shows a sheep (🐑) walking
-next to the PR number. The skill can't draw on the UI itself. It keeps a marker
-file current, and the status line script (owned by the dotfiles repo, linked to
+next to the PR number. The skill can't draw on the UI itself. A marker file
+drives it, and the status line script (owned by the dotfiles repo, linked to
 `~/.claude/statusline.sh`) renders the sheep while the marker is live.
+
+**`shepherd_state.py` keeps the marker for you.** Every live snapshot (not
+`--parse-file`) rewrites it, and a merged, closed, or expired snapshot removes
+it. There is no separate step to remember. Pass `--interval <S>` on every call
+when the run's interval isn't the default 1200, so the marker outlives the wait.
 
 **The contract** (the status line script relies on it, so keep it stable):
 
 - Path: `~/.claude/pr-shepherd/<session id>.running`, one file per Claude Code
-  session, so the sheep appears only in the session doing the herding. Two
-  sessions in the same repo don't share it.
-- Content: one line, `<PR number> <expires epoch seconds>`.
+  session, so the sheep appears only in the session doing the herding. The
+  script takes the id from `$CLAUDE_CODE_SESSION_ID`, which Claude Code sets in
+  every Bash tool call. Without it, the script writes no marker.
+- Content: one line, `<PR number> <expires epoch seconds>`. The expiry is the
+  snapshot time plus `--interval` plus 15 minutes.
 - The status line shows the sheep only while `now < expires`. A run that
   crashes or gets killed loses the sheep on its own and needs no cleanup.
 
-**Raise it / heartbeat.** Do this once preflight passes, then again at the top
-of every cycle and before every wait. Use the current `--interval`, so the
-marker always outlives the wait plus a cycle's work:
+**Lower it by hand** on the stops the snapshot can't see: hostile state,
+`--no-push`, and when the user cancels the run.
 
 ```bash
-mkdir -p ~/.claude/pr-shepherd
-find ~/.claude/pr-shepherd -name '*.running' -mtime +8 -delete 2>/dev/null   # old crashes
-printf '%s %s\n' "<PR number>" "$(( $(date +%s) + <interval> + 900 ))" \
-  > ~/.claude/pr-shepherd/${CLAUDE_SESSION_ID}.running
+python3 ${CLAUDE_SKILL_DIR}/scripts/shepherd_state.py --lower-sheep
 ```
 
-**Lower it** on every stop in **Stopping** except `--tick`: merged, closed,
-deadline, hostile state, `--no-push`, and when the user cancels the run.
+Under `--tick`, leave it. A `/loop` driving ticks keeps the sheep up between
+ticks, and a one-off tick's sheep expires on its own.
 
-```bash
-rm -f ~/.claude/pr-shepherd/${CLAUDE_SESSION_ID}.running
-```
-
-Under `--tick`, leave the marker in place unless the tick hit a terminal stop
-(merged, closed, deadline). A `/loop` driving ticks then keeps the sheep up
-between ticks, and a one-off tick's sheep expires on its own.
-
-The marker is cosmetic. If writing it fails, carry on; never stop a run over it.
+The marker is cosmetic. The script never fails a snapshot over it.
 
 ## The cycle
 
@@ -317,8 +312,8 @@ should review this?".
 ### 7. Wait, then loop
 
 **At least 60 seconds after a push**, then `--interval` between polls, in the
-background so the conversation is free. Refresh the status line marker before
-each wait:
+background so the conversation is free. Each snapshot refreshes the status line
+marker:
 
 ```bash
 sleep 60 && python3 ${CLAUDE_SKILL_DIR}/scripts/shepherd_state.py --json --exit-code
@@ -469,8 +464,9 @@ merge, re-read the PR to confirm it merged, leave the branch alone.
 | **`--tick`** | One cycle done. Report what happened and what the next cycle would do. |
 | **`--no-push`** | Commits local. Report and stop. |
 
-Every stop except `--tick` lowers the status line marker (see **Status line
-marker**).
+The snapshot lowers the status line marker on merged, closed, and deadline
+stops. Hostile state, `--no-push`, and a user cancel lower it with
+`--lower-sheep` (see **Status line marker**).
 
 An `ASK` is **not** a stop. The thread stays open, the question is in Slack, and
 the loop keeps working everything else and polling until the answer arrives (as

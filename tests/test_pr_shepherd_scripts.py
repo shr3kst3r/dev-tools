@@ -564,3 +564,74 @@ def test_render_names_the_work_and_the_stack():
     assert "[important] pkg/spec.py:379" in text
     assert "144.0h left" in text
     assert "status: ACTIONABLE" in text
+
+
+# --- status line sheep ----------------------------------------------------------
+
+
+def test_sheep_line_lives_past_the_interval_and_comes_down_on_a_terminal_status():
+    assert ss.sheep_line("waiting", 649, 1_000, 1200) == f"649 {1_000 + 1200 + ss.SHEEP_GRACE_SECONDS}\n"
+    # A tiny interval still outlives the 60-second post-push wait.
+    assert ss.sheep_line("actionable", 649, 0, 5) == f"649 {60 + ss.SHEEP_GRACE_SECONDS}\n"
+    for status in ("merged", "closed", "expired"):
+        assert ss.sheep_line(status, 649, 1_000, 1200) is None
+    assert ss.sheep_line("waiting", None, 1_000, 1200) is None
+
+
+def test_sheep_path_needs_a_plain_session_id(tmp_path):
+    assert ss.sheep_path("74bef2a2-451c", tmp_path) == tmp_path / "74bef2a2-451c.running"
+    # Unset, empty, or path-shaped ids never produce a marker (an empty one
+    # would write a hidden ".running" no status line ever reads).
+    for bad in (None, "", "../x", "a/b", ".hidden"):
+        assert ss.sheep_path(bad, tmp_path) is None
+
+
+def test_update_sheep_raises_and_lowers_and_never_raises(tmp_path):
+    path = tmp_path / "nested" / "s1.running"
+    ss.update_sheep(path, "649 99\n")
+    assert path.read_text() == "649 99\n"
+    assert not list(path.parent.glob("*.tmp"))
+    ss.update_sheep(path, None)
+    assert not path.exists()
+    ss.update_sheep(path, None)  # already down
+    ss.update_sheep(None, "649 99\n")  # no session: nothing to do
+    blocker = tmp_path / "file"
+    blocker.write_text("")
+    ss.update_sheep(blocker / "s1.running", "649 99\n")  # unwritable: swallowed
+
+
+def _live(monkeypatch, tmp_path, payload):
+    monkeypatch.setattr(ss, "SHEEP_DIR", tmp_path)
+    monkeypatch.setenv(ss.SHEEP_SESSION_ENV, "s1")
+    monkeypatch.setattr(ss.ps, "detect_repo", lambda: ("o", "r"))
+    monkeypatch.setattr(ss.ps, "detect_pr", lambda: 649)
+    monkeypatch.setattr(ss.ps, "fetch_payload", lambda owner, name, pr: payload)
+    monkeypatch.setattr(ss, "detect_default_branch", lambda owner, name: "main")
+    return tmp_path / "s1.running"
+
+
+def test_a_live_snapshot_raises_the_sheep_and_a_merge_lowers_it(monkeypatch, tmp_path, capsys):
+    marker = _live(monkeypatch, tmp_path, _payload())
+    ss.main(["--json", "--now", "2026-11-03T12:00:00Z", "--interval", "600"])
+    assert marker.read_text() == f"649 {int(NOW.timestamp()) + 600 + ss.SHEEP_GRACE_SECONDS}\n"
+
+    _live(monkeypatch, tmp_path, _payload(state="MERGED"))
+    ss.main(["--json", "--now", "2026-11-03T12:00:00Z"])
+    assert not marker.exists()
+
+
+def test_lower_sheep_removes_the_marker_without_querying(monkeypatch, tmp_path):
+    marker = _live(monkeypatch, tmp_path, _payload())
+    marker.write_text("649 99999999999\n")
+    monkeypatch.setattr(ss.ps, "fetch_payload", lambda *a: (_ for _ in ()).throw(AssertionError("queried")))
+    assert ss.main(["--lower-sheep"]) == ss.EXIT_SETTLED
+    assert not marker.exists()
+
+
+def test_offline_runs_leave_the_sheep_alone(monkeypatch, tmp_path):
+    monkeypatch.setattr(ss, "SHEEP_DIR", tmp_path)
+    monkeypatch.setenv(ss.SHEEP_SESSION_ENV, "s1")
+    payload = tmp_path / "p.json"
+    payload.write_text(json.dumps(_payload()), encoding="utf-8")
+    ss.main(["--parse-file", str(payload)])
+    assert not (tmp_path / "s1.running").exists()

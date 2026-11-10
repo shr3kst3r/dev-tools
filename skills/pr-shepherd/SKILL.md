@@ -116,9 +116,50 @@ python3 ${CLAUDE_SKILL_DIR}/scripts/shepherd_state.py --json --exit-code --ensur
 - **`shepherd.stack.stacked`** → note the PR below (`stack.basePr`) in the plan;
   it changes how findings and conflicts are read (see **Stacked PRs**).
 
-Then state the plan: deadline, stack, failing checks, conflict state, threads to
+Once preflight passes, raise the sheep (see **Status line marker**), then state
+the plan: deadline, stack, failing checks, conflict state, threads to
 answer / to close by source, outside-diff findings unanswered, who is requested
 and who asked for changes. `TodoWrite` one item per thread, finding, and check.
+
+## Status line marker
+
+While the shepherd runs, the Claude Code status line shows a sheep (🐑) walking
+next to the PR number. The skill can't draw on the UI itself. It keeps a marker
+file current, and the status line script (owned by the dotfiles repo, linked to
+`~/.claude/statusline.sh`) renders the sheep while the marker is live.
+
+**The contract** (the status line script relies on it, so keep it stable):
+
+- Path: `~/.claude/pr-shepherd/<session id>.running`, one file per Claude Code
+  session, so the sheep appears only in the session doing the herding. Two
+  sessions in the same repo don't share it.
+- Content: one line, `<PR number> <expires epoch seconds>`.
+- The status line shows the sheep only while `now < expires`. A run that
+  crashes or gets killed loses the sheep on its own and needs no cleanup.
+
+**Raise it / heartbeat.** Do this once preflight passes, then again at the top
+of every cycle and before every wait. Use the current `--interval`, so the
+marker always outlives the wait plus a cycle's work:
+
+```bash
+mkdir -p ~/.claude/pr-shepherd
+find ~/.claude/pr-shepherd -name '*.running' -mtime +8 -delete 2>/dev/null   # old crashes
+printf '%s %s\n' "<PR number>" "$(( $(date +%s) + <interval> + 900 ))" \
+  > ~/.claude/pr-shepherd/${CLAUDE_SESSION_ID}.running
+```
+
+**Lower it** on every stop in **Stopping** except `--tick`: merged, closed,
+deadline, hostile state, `--no-push`, and when the user cancels the run.
+
+```bash
+rm -f ~/.claude/pr-shepherd/${CLAUDE_SESSION_ID}.running
+```
+
+Under `--tick`, leave the marker in place unless the tick hit a terminal stop
+(merged, closed, deadline). A `/loop` driving ticks then keeps the sheep up
+between ticks, and a one-off tick's sheep expires on its own.
+
+The marker is cosmetic. If writing it fails, carry on; never stop a run over it.
 
 ## The cycle
 
@@ -276,7 +317,8 @@ should review this?".
 ### 7. Wait, then loop
 
 **At least 60 seconds after a push**, then `--interval` between polls, in the
-background so the conversation is free:
+background so the conversation is free. Refresh the status line marker before
+each wait:
 
 ```bash
 sleep 60 && python3 ${CLAUDE_SKILL_DIR}/scripts/shepherd_state.py --json --exit-code
@@ -427,6 +469,9 @@ merge, re-read the PR to confirm it merged, leave the branch alone.
 | **`--tick`** | One cycle done. Report what happened and what the next cycle would do. |
 | **`--no-push`** | Commits local. Report and stop. |
 
+Every stop except `--tick` lowers the status line marker (see **Status line
+marker**).
+
 An `ASK` is **not** a stop. The thread stays open, the question is in Slack, and
 the loop keeps working everything else and polling until the answer arrives (as
 a reply on the thread from you, or an instruction in the terminal) or the
@@ -455,7 +500,7 @@ Threads:  31 seen → 0 open
   closed    2   (answered by hand earlier, never resolved)
 Outside the diff: rounds 1, 6 answered (comment per round)
 
-Review:   re-requested slegare on 2026-11-04 after round 7 · waiting 31h
+Review:   re-requested alice on 2026-11-04 after round 7 · waiting 31h
 Asked you: 1 — should a zero weight mean "ignore" or "hold"? (thread on translate.py:255)
 Pushed:   6 commits · Merged: no (--merge not set)
 ```
